@@ -6,7 +6,7 @@ import { Label } from "@/components/ui/label";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { useSettingsStore } from "@/stores/settings.store";
-import { testOSS, selectFolder } from "@/lib/ipc-client";
+import { testOSS, testTencentS3, selectFolder } from "@/lib/ipc-client";
 import { showToast } from "@/components/ui/toast";
 import type { AppSettings } from "@shared/types";
 
@@ -14,6 +14,10 @@ export default function Settings() {
   const { settings, loading, loadSettings, saveSettings } = useSettingsStore();
   const [local, setLocal] = useState<AppSettings>(settings);
   const [ossTestResult, setOssTestResult] = useState<{
+    ok: boolean;
+    error?: string;
+  } | null>(null);
+  const [tencentTestResult, setTencentTestResult] = useState<{
     ok: boolean;
     error?: string;
   } | null>(null);
@@ -63,6 +67,12 @@ export default function Settings() {
     const result = await testOSS(local.oss);
     setOssTestResult(result);
   }, [local.oss]);
+
+  const handleTestTencent = useCallback(async () => {
+    setTencentTestResult(null);
+    const result = await testTencentS3(local.tencentS3);
+    setTencentTestResult(result);
+  }, [local.tencentS3]);
 
   const handleAddScanDir = useCallback(async () => {
     const dir = await selectFolder();
@@ -136,7 +146,10 @@ export default function Settings() {
         </CardHeader>
         <CardContent className="space-y-4">
           <div>
-            <Label>扫描目录</Label>
+            <Label>数据根目录</Label>
+            <p className="text-xs text-muted-foreground mt-1">
+              根目录下仅识别 YYYY-MM-DD 日期目录，并上传其直接焊接子目录
+            </p>
             <div className="flex flex-wrap gap-2 mt-2">
               {local.scan.directories.map((dir) => (
                 <Badge key={dir} variant="secondary" className="gap-1 pr-1">
@@ -296,6 +309,29 @@ export default function Settings() {
           <CardTitle className="text-base">上传配置</CardTitle>
         </CardHeader>
         <CardContent className="space-y-4">
+          <div>
+            <Label>上传目标</Label>
+            <select
+              value={local.cloud.targetMode}
+              onChange={(e) =>
+                setLocal((p) => ({
+                  ...p,
+                  cloud: {
+                    ...p.cloud,
+                    targetMode: e.target.value as AppSettings["cloud"]["targetMode"],
+                  },
+                }))
+              }
+              className="mt-1 w-full max-w-xs rounded-md border border-input bg-background px-3 py-2 text-sm"
+            >
+              <option value="aliyun">仅上传阿里云</option>
+              <option value="tencent">仅上传腾讯云</option>
+              <option value="both">同时上传阿里云和腾讯云</option>
+            </select>
+            <p className="text-xs text-muted-foreground mt-1">
+              只影响之后创建的任务；已有任务保持创建时的上传目标
+            </p>
+          </div>
           <div className="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-5 gap-4">
             <div>
               <Label>最大并发任务数</Label>
@@ -552,6 +588,145 @@ export default function Settings() {
               />
             </div>
           </div>
+        </CardContent>
+      </Card>
+
+      {/* 腾讯云 TurboS3 配置 */}
+      <Card>
+        <CardHeader>
+          <div className="flex items-center justify-between">
+            <div>
+              <CardTitle className="text-base">腾讯云 TurboS3</CardTitle>
+              <p className="text-xs text-muted-foreground mt-1">
+                S3 兼容接口，使用 V4 签名和 path-style 请求
+              </p>
+            </div>
+            <div className="flex items-center gap-2">
+              {tencentTestResult && (
+                <span
+                  className={`text-xs ${
+                    tencentTestResult.ok ? "text-green-600" : "text-destructive"
+                  }`}
+                >
+                  {tencentTestResult.ok
+                    ? "连接成功"
+                    : `失败: ${tencentTestResult.error}`}
+                </span>
+              )}
+              <Button variant="outline" size="sm" onClick={handleTestTencent}>
+                <TestTube className="h-3 w-3 mr-1" />
+                测试连接
+              </Button>
+            </div>
+          </div>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          <div className="grid grid-cols-2 gap-4">
+            <div>
+              <Label>Endpoint</Label>
+              <Input
+                value={local.tencentS3.endpoint}
+                onChange={(e) =>
+                  setLocal((p) => ({
+                    ...p,
+                    tencentS3: { ...p.tencentS3, endpoint: e.target.value },
+                  }))
+                }
+                className="mt-1"
+                placeholder="https://turbos3.tencentcfs.com"
+              />
+            </div>
+            <div>
+              <Label>Region</Label>
+              <Input
+                value={local.tencentS3.region}
+                onChange={(e) =>
+                  setLocal((p) => ({
+                    ...p,
+                    tencentS3: { ...p.tencentS3, region: e.target.value },
+                  }))
+                }
+                className="mt-1"
+                placeholder="us-east-1"
+              />
+            </div>
+            <div>
+              <Label>Bucket</Label>
+              <Input
+                value={local.tencentS3.bucket}
+                onChange={(e) =>
+                  setLocal((p) => ({
+                    ...p,
+                    tencentS3: { ...p.tencentS3, bucket: e.target.value },
+                  }))
+                }
+                className="mt-1"
+              />
+            </div>
+            <div>
+              <Label>前缀 (Prefix)</Label>
+              <Input
+                value={local.tencentS3.prefix}
+                onChange={(e) =>
+                  setLocal((p) => ({
+                    ...p,
+                    tencentS3: { ...p.tencentS3, prefix: e.target.value },
+                  }))
+                }
+                className="mt-1"
+                placeholder="upload/<user-id>/"
+              />
+            </div>
+            <div>
+              <Label>AccessKey ID</Label>
+              <Input
+                value={local.tencentS3.accessKeyId}
+                onChange={(e) =>
+                  setLocal((p) => ({
+                    ...p,
+                    tencentS3: { ...p.tencentS3, accessKeyId: e.target.value },
+                  }))
+                }
+                className="mt-1"
+              />
+            </div>
+            <div>
+              <Label>AccessKey Secret</Label>
+              <Input
+                type="password"
+                value={local.tencentS3.accessKeySecret}
+                onChange={(e) =>
+                  setLocal((p) => ({
+                    ...p,
+                    tencentS3: {
+                      ...p.tencentS3,
+                      accessKeySecret: e.target.value,
+                    },
+                  }))
+                }
+                className="mt-1"
+              />
+            </div>
+          </div>
+          <label className="flex items-start gap-2 text-sm">
+            <input
+              type="checkbox"
+              checked={local.tencentS3.allowInsecureTls}
+              onChange={(e) =>
+                setLocal((p) => ({
+                  ...p,
+                  tencentS3: {
+                    ...p.tencentS3,
+                    allowInsecureTls: e.target.checked,
+                  },
+                }))
+              }
+              className="rounded mt-0.5"
+            />
+            <span>
+              允许不安全 TLS（仅在现场 TurboS3 使用无法验证的自签名证书时开启）
+            </span>
+          </label>
         </CardContent>
       </Card>
 

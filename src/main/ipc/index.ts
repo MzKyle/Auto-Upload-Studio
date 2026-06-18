@@ -7,12 +7,19 @@ import { getScannerService } from '../services/scanner.service'
 import { getTaskQueueService } from '../services/task-queue.service'
 import { getSSHRsyncService } from '../services/ssh-rsync.service'
 import { getOSSUploadService } from '../services/oss-upload.service'
+import { getTencentS3UploadService } from '../services/tencent-s3-upload.service'
+import { getCloudUploadService } from '../services/cloud-upload.service'
 import { getCleanupService } from '../services/cleanup.service'
+import { getDayFolderRepo } from '../db/day-folder.repo'
+import { getDayFolderService } from '../services/day-folder.service'
 import { getMainWindow, createAnnotationWindow } from '../index'
 import { getDb } from '../db/database'
 import { getDataCollectService } from '../services/data-collect.service'
+import { getTaskDestinationRepo } from '../db/task-destination.repo'
 import { v4 as uuid } from 'uuid'
-import type { AppSettings, HistoryQuery, TaskStatus, SSHMachine, SSHMachineInput, RsyncProgress, TransferMode, DiskUsageInfo, ScanConfig } from '@shared/types'
+import type { AppSettings, CloudProvider, HistoryQuery, TaskStatus, SSHMachine, SSHMachineInput, RsyncProgress, TransferMode, DiskUsageInfo, ScanConfig, DayFolderListQuery } from '@shared/types'
+import { getUploadTargetSnapshot, providersForMode } from '@shared/cloud-upload'
+import { resolveDirectoryUploadRelativePath } from '@shared/day-folder'
 import { basename, normalize, extname, parse as pathParse, format as pathFormat, relative, join } from 'path'
 import { existsSync, readFileSync, writeFileSync } from 'fs'
 import { statfs } from 'fs/promises'
@@ -59,13 +66,16 @@ export function registerAllIpc(): void {
   ipcMain.handle(IPC.TASK_ADD_FOLDER, (_event, args: { folderPath: string }) => {
     const taskRepo = getTaskRepo()
     const settingsRepo = getSettingsRepo()
-    const ossSettings = settingsRepo.get<AppSettings['oss']>('oss')
-    const prefix = ossSettings?.prefix || ''
+    const snapshot = getUploadTargetSnapshot(settingsRepo.getAll())
     const folderName = basename(args.folderPath)
+    const uploadRelativePath = resolveDirectoryUploadRelativePath(args.folderPath)
     return taskRepo.create({
       folderPath: args.folderPath,
       folderName,
-      ossPrefix: prefix,
+      ossPrefix: snapshot.prefixes.aliyun,
+      uploadTargetMode: snapshot.mode,
+      destinationPrefixes: snapshot.prefixes,
+      uploadRelativePath,
       sourceType: 'manual'
     })
   })
@@ -73,22 +83,28 @@ export function registerAllIpc(): void {
   ipcMain.handle(IPC.TASK_PAUSE, (_event, args: { taskId: string }) => {
     getTaskQueueService().cancelRunningTask(args.taskId)
     getTaskRepo().updateStatus(args.taskId, 'paused')
+    getTaskDestinationRepo().updateIncompleteStatuses(args.taskId, 'paused')
+    getDayFolderService().refreshForTask(args.taskId)
     broadcastStatusChange(args.taskId, 'paused')
   })
 
   ipcMain.handle(IPC.TASK_RESUME, (_event, args: { taskId: string }) => {
-    getTaskRepo().updateStatus(args.taskId, 'pending')
+    getTaskRepo().retry(args.taskId)
+    getDayFolderService().refreshForTask(args.taskId)
     broadcastStatusChange(args.taskId, 'pending')
   })
 
   ipcMain.handle(IPC.TASK_CANCEL, (_event, args: { taskId: string }) => {
     getTaskQueueService().cancelRunningTask(args.taskId)
     getTaskRepo().updateStatus(args.taskId, 'failed', '用户取消')
+    getTaskDestinationRepo().updateIncompleteStatuses(args.taskId, 'failed', '用户取消')
+    getDayFolderService().refreshForTask(args.taskId)
     broadcastStatusChange(args.taskId, 'failed')
   })
 
-  ipcMain.handle(IPC.TASK_RETRY, (_event, args: { taskId: string }) => {
-    getTaskRepo().updateStatus(args.taskId, 'pending')
+  ipcMain.handle(IPC.TASK_RETRY, (_event, args: { taskId: string; provider?: CloudProvider }) => {
+    getTaskRepo().retry(args.taskId, args.provider)
+    getDayFolderService().refreshForTask(args.taskId)
     broadcastStatusChange(args.taskId, 'pending')
   })
 
@@ -109,6 +125,15 @@ export function registerAllIpc(): void {
     getScannerService().stop()
   })
 
+  // ---- 日期目录汇总 ----
+  ipcMain.handle(IPC.DAY_FOLDER_LIST, (_event, query?: DayFolderListQuery) => {
+    return getDayFolderRepo().list(query)
+  })
+
+  ipcMain.handle(IPC.DAY_FOLDER_DELETE, (_event, args: { id: string }) => {
+    getDayFolderRepo().deleteCompleted(args.id)
+  })
+
   // ---- 设置 ----
   ipcMain.handle(IPC.SETTINGS_GET_ALL, () => {
     return getSettingsRepo().getAll()
@@ -125,6 +150,13 @@ export function registerAllIpc(): void {
   ipcMain.handle(IPC.SETTINGS_TEST_OSS, async (_event, config: AppSettings['oss']) => {
     return getOSSUploadService().testConnection(config)
   })
+
+  ipcMain.handle(
+    IPC.SETTINGS_TEST_TENCENT_S3,
+    async (_event, config: AppSettings['tencentS3']) => {
+      return getTencentS3UploadService().testConnection(config)
+    }
+  )
 
   // ---- SSH 机器 CRUD ----
   ipcMain.handle(IPC.SSH_LIST_MACHINES, () => {
@@ -185,27 +217,41 @@ export function registerAllIpc(): void {
       // rsync 完成后自动注册本地目录为上传任务
       const taskRepo = getTaskRepo()
       const settingsRepo = getSettingsRepo()
-      const ossSettings = settingsRepo.get<AppSettings['oss']>('oss')
-      const prefix = ossSettings?.prefix || ''
+      const snapshot = getUploadTargetSnapshot(settingsRepo.getAll())
       const localDir = normalize(machine.localDir).replace(/[\\/]+$/, '')
+      const uploadRelativePath = resolveDirectoryUploadRelativePath(
+        machine.remoteDir,
+        localDir
+      )
       const existing = taskRepo.getByFolderPath(localDir)
       if (!existing || existing.status === 'completed' || existing.status === 'failed') {
         taskRepo.create({
           folderPath: localDir,
           folderName: basename(localDir),
-          ossPrefix: prefix,
+          ossPrefix: snapshot.prefixes.aliyun,
+          uploadTargetMode: snapshot.mode,
+          destinationPrefixes: snapshot.prefixes,
+          uploadRelativePath,
           sourceType: 'rsync',
           sourceMachineId: machine.id
         })
         log.info('rsync 完成, 自动创建上传任务:', localDir)
+      } else if (existing.uploadRelativePath !== uploadRelativePath) {
+        taskRepo.updateUploadRelativePath(existing.id, uploadRelativePath)
       }
 
       // 写入标记文件，防止 scanner 重复做稳定性检查
       writeTmpUpload(localDir, {
-        version: 1,
+        version: 2,
         createdAt: new Date().toISOString(),
         folderPath: localDir,
-        metadata: { source: 'rsync', machineId: machine.id }
+        metadata: {
+          source: 'rsync',
+          machineId: machine.id,
+          uploadRelativePath,
+          uploadTargetMode: snapshot.mode,
+          destinationPrefixes: snapshot.prefixes
+        }
       })
     } catch (err) {
       log.error('rsync 失败:', err)
@@ -224,6 +270,7 @@ export function registerAllIpc(): void {
 
   ipcMain.handle(IPC.HISTORY_CLEAR, (_event, args?: { before?: string }) => {
     getHistoryRepo().clear(args?.before)
+    getDayFolderRepo().clearCompleted(args?.before)
   })
 
   ipcMain.handle(IPC.HISTORY_DELETE, (_event, args: { id: string }) => {
@@ -258,18 +305,13 @@ export function registerAllIpc(): void {
     if (!row) throw new Error('机器不存在')
     const machine = rowToSSHMachine(row)
     const password = (row.encrypted_password as string) || undefined
-    const settingsRepo = getSettingsRepo()
-    const ossConfig = settingsRepo.get<AppSettings['oss']>('oss')
-    if (!ossConfig || !ossConfig.accessKeyId) {
-      throw new Error('OSS 未配置')
-    }
+    const settings = getSettingsRepo().getAll()
 
     try {
-      await getSSHRsyncService().sftpStreamToOSS(
+      const result = await getSSHRsyncService().sftpStreamToCloud(
         machine,
         password,
-        getOSSUploadService(),
-        ossConfig,
+        settings,
         (progress) => {
           for (const win of BrowserWindow.getAllWindows()) {
             win.webContents.send(IPC.SFTP_PROGRESS, progress)
@@ -277,6 +319,7 @@ export function registerAllIpc(): void {
         }
       )
       db.prepare('UPDATE ssh_machines SET last_sync_at = ? WHERE id = ?').run(new Date().toISOString(), args.machineId)
+      return result
     } catch (err) {
       log.error('SFTP 直传失败:', err)
       throw err
@@ -393,65 +436,77 @@ export function registerAllIpc(): void {
 
   ipcMain.handle(IPC.ANNOTATION_UPLOAD_OSS, async (_event, args: { imagePath: string; pngPath: string; jsonPath: string }) => {
     const taskRepo = getTaskRepo()
-    const settingsRepo = getSettingsRepo()
-    const ossService = getOSSUploadService()
-
-    // 1. Get OSS config
-    const ossConfig = settingsRepo.get<AppSettings['oss']>('oss')
-    if (!ossConfig || !ossConfig.accessKeyId) {
-      return { ok: false, error: 'OSS 未配置' }
-    }
-    ossService.configure(ossConfig)
-
-    // 2. Find the task that contains this image
+    const settings = getSettingsRepo().getAll()
     const task = taskRepo.findTaskContainingFile(args.imagePath)
-    let pngOssKey: string
-    let jsonOssKey: string
+    const pngBuffer = readFileSync(args.pngPath)
+    const jsonBuffer = readFileSync(args.jsonPath)
+    const results = []
 
-    if (task) {
-      // Compute relative path of the original image within the task folder
-      const relPath = relative(task.folderPath, args.imagePath).replace(/\\/g, '/')
-      const relParsed = pathParse(relPath)
-      const relBase = pathFormat({ dir: relParsed.dir, name: relParsed.name, ext: '' })
+    for (const provider of providersForMode(settings.cloud.targetMode)) {
+      const validationError = getCloudUploadService().validateProvider(provider, settings)
+      if (validationError) {
+        results.push({ provider, ok: false, error: validationError })
+        continue
+      }
 
-      // Build OSS keys: same prefix structure as the original upload
-      const prefix = task.ossPrefix || ossConfig.prefix || ''
-      const folder = task.folderName
-      const basePath = [prefix, folder, relBase].filter(Boolean).join('/').replace(/\/+/g, '/')
+      const taskDestination = task?.destinations.find(
+        (destination) => destination.provider === provider
+      )
+      const configPrefix =
+        provider === 'aliyun' ? settings.oss.prefix : settings.tencentS3.prefix
+      const prefix = taskDestination?.prefix || configPrefix || ''
+      let basePath: string
 
-      pngOssKey = basePath + '_annotation.png'
-      jsonOssKey = basePath + '_annotation.json'
+      if (task) {
+        const relPath = relative(task.folderPath, args.imagePath).replace(/\\/g, '/')
+        const relParsed = pathParse(relPath)
+        const relBase = pathFormat({
+          dir: relParsed.dir,
+          name: relParsed.name,
+          ext: ''
+        })
+        basePath = [
+          prefix,
+          task.uploadRelativePath || task.folderName,
+          relBase
+        ].filter(Boolean).join('/').replace(/\/+/g, '/')
+      } else {
+        const image = pathParse(args.imagePath)
+        basePath = [prefix, image.name]
+          .filter(Boolean)
+          .join('/')
+          .replace(/\/+/g, '/')
+      }
 
-      log.info('[Annotation] Matched task:', task.id, 'folderPath:', task.folderPath)
-    } else {
-      // No matching task — use OSS prefix + original image filename
-      const prefix = ossConfig.prefix || ''
-      const imgParsed = pathParse(args.imagePath)
-      const basePath = [prefix, imgParsed.name].filter(Boolean).join('/').replace(/\/+/g, '/')
-
-      pngOssKey = basePath + '_annotation.png'
-      jsonOssKey = basePath + '_annotation.json'
-
-      log.info('[Annotation] No matching task found, using config prefix')
+      const pngKey = `${basePath}_annotation.png`
+      const jsonKey = `${basePath}_annotation.json`
+      let uploader: Awaited<ReturnType<ReturnType<typeof getCloudUploadService>['createTaskUploader']>> | null = null
+      try {
+        uploader = await getCloudUploadService().createTaskUploader(
+          provider,
+          settings,
+          settings.upload.multipartThreshold
+        )
+        await Promise.all([
+          uploader.uploadBuffer(pngBuffer, pngKey),
+          uploader.uploadBuffer(jsonBuffer, jsonKey)
+        ])
+        results.push({ provider, ok: true, keys: [pngKey, jsonKey] })
+      } catch (err) {
+        log.error(`[Annotation] ${provider} upload failed:`, err)
+        results.push({
+          provider,
+          ok: false,
+          error: err instanceof Error ? err.message : String(err)
+        })
+      } finally {
+        uploader?.dispose()
+      }
     }
 
-    log.info('[Annotation] Uploading PNG to:', pngOssKey)
-    log.info('[Annotation] Uploading JSON to:', jsonOssKey)
-
-    try {
-      const pngBuffer = readFileSync(args.pngPath)
-      const jsonBuffer = readFileSync(args.jsonPath)
-
-      await Promise.all([
-        ossService.uploadBuffer(pngBuffer, pngOssKey),
-        ossService.uploadBuffer(jsonBuffer, jsonOssKey),
-      ])
-
-      log.info('[Annotation] OSS upload completed')
-      return { ok: true, pngOssKey, jsonOssKey }
-    } catch (err) {
-      log.error('[Annotation] OSS upload failed:', err)
-      return { ok: false, error: String(err) }
+    return {
+      ok: results.every((result) => result.ok),
+      results
     }
   })
 }

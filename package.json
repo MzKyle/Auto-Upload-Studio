@@ -1,6 +1,6 @@
 {
   "name": "electron-uploader",
-  "version": "2.0.1",
+  "version": "2.0.2",
   "description": "数据采集文件夹上传工具",
   "author": {
     "name": "WeldingTeam",
@@ -16,13 +16,17 @@
     "typecheck:node": "tsc --noEmit -p tsconfig.node.json",
     "typecheck:web": "tsc --noEmit -p tsconfig.web.json",
     "typecheck": "npm run typecheck:node && npm run typecheck:web",
+    "test": "tsx --test tests/*.test.ts",
     "lint": "eslint .",
-    "build:linux": "electron-vite build && rm -rf node_modules/cpu-features && electron-builder --linux --x64 && npx electron-rebuild -f -w better-sqlite3",
+    "build:linux": "electron-vite build && rm -rf node_modules/cpu-features && electron-rebuild -f -w better-sqlite3 -v 33.4.11 && electron-builder --linux --x64 && npm rebuild better-sqlite3",
     "build:win": "electron-vite build && electron-builder --win --x64 && npx electron-rebuild -f -w better-sqlite3",
     "build:all": "electron-vite build && electron-builder --linux --win --x64 && npx electron-rebuild -f -w better-sqlite3",
     "postinstall": "electron-builder install-app-deps"
   },
   "dependencies": {
+    "@aws-sdk/client-s3": "^3.1071.0",
+    "@aws-sdk/lib-storage": "^3.1071.0",
+    "@smithy/node-http-handler": "^4.8.1",
     "ali-oss": "^6.21.0",
     "better-sqlite3": "^11.7.0",
     "chokidar": "^4.0.3",
@@ -58,6 +62,7 @@
     "postcss": "^8.4.49",
     "tailwind-merge": "^3.0.0",
     "tailwindcss": "^3.4.17",
+    "tsx": "^4.22.4",
     "typescript": "^5.7.3",
     "vite": "^6.0.7"
   }

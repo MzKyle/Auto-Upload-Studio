@@ -28,7 +28,7 @@ graph LR
 | --- | --- | --- |
 | 手动添加文件夹 | IPC `task:add-folder` | 直接创建 `sourceType=manual` 任务 |
 | rsync 拉取 | `SSHRsyncService.startRsync` | 拉取完成后创建 `sourceType=rsync` 任务 |
-| SFTP 直传 | `SSHRsyncService.sftpStreamToOSS` | 不创建普通任务，直接上传 OSS |
+| SFTP 直传 | `SSHRsyncService.sftpStreamToCloud` | 不创建普通任务，按当前模式直传云端 |
 | 数采分析 | `DataCollectService` | 扫描器发现目录后提取元信息并广播 |
 | 图片标注 | `AnnotationApp` + IPC | 导出 PNG/JSON 并上传 OSS |
 | 自动清理 | `CleanupService` | 任务完成后按保留天数删除本地目录 |

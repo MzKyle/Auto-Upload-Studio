@@ -1,6 +1,7 @@
 import { createReadStream } from 'fs'
 import log from 'electron-log'
 import type { AppSettings } from '@shared/types'
+import type { CloudTaskUploader } from './cloud-upload.types'
 
 // ali-oss 类型
 interface OSSClient {
@@ -63,6 +64,40 @@ export class OSSUploadService {
     }) as unknown as OSSClient
   }
 
+  async createTaskUploader(
+    config: AppSettings['oss'],
+    multipartThreshold?: number
+  ): Promise<CloudTaskUploader> {
+    this.configure(config, multipartThreshold)
+    const client = await this.createTaskClient()
+    const threshold = multipartThreshold || this.multipartThreshold
+    return {
+      provider: 'aliyun',
+      uploadFile: (
+        filePath,
+        objectKey,
+        fileSize,
+        onProgress,
+        signal
+      ) => this.uploadFileWithClient(
+        client,
+        filePath,
+        objectKey,
+        fileSize,
+        threshold,
+        onProgress,
+        signal
+      ).then((key) => ({ objectKey: key })),
+      uploadBuffer: async (buffer, objectKey, signal) => {
+        if (signal?.aborted) throw new DOMException('Upload aborted', 'AbortError')
+        await client.put(objectKey, buffer)
+        return objectKey
+      },
+      abort: () => client.cancel(),
+      dispose: () => {}
+    }
+  }
+
   /**
    * 上传单个文件到 OSS
    * @param filePath 本地文件绝对路径
@@ -86,8 +121,31 @@ export class OSSUploadService {
     }
 
     const client = taskClient || (await this.getClient())
+    return this.uploadFileWithClient(
+      client,
+      filePath,
+      ossKey,
+      fileSize,
+      this.multipartThreshold,
+      onProgress,
+      signal
+    )
+  }
 
-    if (fileSize > this.multipartThreshold) {
+  private async uploadFileWithClient(
+    client: OSSClient,
+    filePath: string,
+    ossKey: string,
+    fileSize: number,
+    multipartThreshold: number,
+    onProgress?: (fraction: number) => void,
+    signal?: AbortSignal
+  ): Promise<string> {
+    if (signal?.aborted) {
+      throw new DOMException('Upload aborted', 'AbortError')
+    }
+
+    if (fileSize > multipartThreshold) {
       // 分片上传
       try {
         const partSize = this.getPartSizeForMultipart(fileSize)

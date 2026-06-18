@@ -1,23 +1,44 @@
 import { useEffect, useState, useCallback } from "react";
-import { Trash2 } from "lucide-react";
+import { RotateCcw, Trash2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { formatBytes, formatDuration } from "@/lib/utils";
-import { fetchHistory, clearHistory, deleteHistoryItem } from "@/lib/ipc-client";
-import type { HistoryItem } from "@shared/types";
+import {
+  fetchHistory,
+  clearHistory,
+  deleteHistoryItem,
+  fetchDayFolders,
+  deleteDayFolderHistory,
+  retryTask,
+} from "@/lib/ipc-client";
+import type {
+  CloudProvider,
+  DayFolderSummary,
+  HistoryItem,
+} from "@shared/types";
+import { DayFolderCard } from "@/components/DayFolderCard";
 
 export default function History() {
   const [items, setItems] = useState<HistoryItem[]>([]);
   const [total, setTotal] = useState(0);
   const [page, setPage] = useState(1);
   const [deletingId, setDeletingId] = useState<string | null>(null);
+  const [dayFolders, setDayFolders] = useState<DayFolderSummary[]>([]);
+  const [provider, setProvider] = useState<CloudProvider>("aliyun");
   const pageSize = 20;
 
   const load = useCallback(async () => {
-    const result = await fetchHistory({ page, pageSize });
+    const result = await fetchHistory({ page, pageSize, provider });
     setItems(result.items);
     setTotal(result.total);
-  }, [page]);
+    setDayFolders(
+      await fetchDayFolders({
+        status: "completed",
+        includeCompleted: true,
+        limit: 100,
+      })
+    );
+  }, [page, provider]);
 
   useEffect(() => {
     load();
@@ -27,6 +48,21 @@ export default function History() {
     await clearHistory();
     load();
   }, [load]);
+
+  const handleDeleteDayFolder = useCallback(
+    async (item: DayFolderSummary) => {
+      const ok = window.confirm(`确认删除日期目录汇总「${item.date}」吗？`);
+      if (!ok) return;
+      setDeletingId(item.id);
+      try {
+        await deleteDayFolderHistory(item.id);
+        await load();
+      } finally {
+        setDeletingId(null);
+      }
+    },
+    [load]
+  );
 
   const handleDeleteItem = useCallback(
     async (item: HistoryItem) => {
@@ -48,6 +84,14 @@ export default function History() {
     [items.length, load, page]
   );
 
+  const handleRetry = useCallback(
+    async (item: HistoryItem) => {
+      await retryTask(item.id, item.provider);
+      await load();
+    },
+    [load]
+  );
+
   const totalPages = Math.ceil(total / pageSize);
 
   return (
@@ -58,12 +102,55 @@ export default function History() {
           variant="outline"
           size="sm"
           onClick={handleClear}
-          disabled={items.length === 0}
+          disabled={items.length === 0 && dayFolders.length === 0}
         >
           <Trash2 className="h-4 w-4 mr-1" />
           清空历史
         </Button>
       </div>
+
+      <div className="inline-flex rounded-md border p-1 bg-muted/30">
+        {(["aliyun", "tencent"] as CloudProvider[]).map((item) => (
+          <Button
+            key={item}
+            variant={provider === item ? "default" : "ghost"}
+            size="sm"
+            onClick={() => {
+              setProvider(item);
+              setPage(1);
+            }}
+          >
+            {item === "aliyun" ? "阿里云" : "腾讯云"}
+          </Button>
+        ))}
+      </div>
+
+      {dayFolders.length > 0 && (
+        <section>
+          <h2 className="text-sm font-semibold text-muted-foreground mb-3">
+            已完成日期目录
+          </h2>
+          {dayFolders.map((item) => (
+            <div key={item.id} className="relative">
+              <DayFolderCard dayFolder={item} />
+              <Button
+                variant="ghost"
+                size="sm"
+                className="absolute right-3 bottom-3 text-destructive hover:text-destructive"
+                onClick={() => handleDeleteDayFolder(item)}
+                disabled={deletingId === item.id}
+              >
+                <Trash2 className="h-4 w-4 mr-1" />
+                删除汇总
+              </Button>
+            </div>
+          ))}
+        </section>
+      )}
+
+      <h2 className="text-sm font-semibold text-muted-foreground">
+        单次焊接任务
+      </h2>
 
       {items.length === 0 ? (
         <div className="text-sm text-muted-foreground text-center py-12 border rounded-lg border-dashed">
@@ -105,6 +192,16 @@ export default function History() {
                     {new Date(item.completedAt).toLocaleString("zh-CN")}
                   </td>
                   <td className="p-3">
+                    {item.status === "failed" && (
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        onClick={() => handleRetry(item)}
+                      >
+                        <RotateCcw className="h-4 w-4 mr-1" />
+                        重试此云端
+                      </Button>
+                    )}
                     <Button
                       variant="ghost"
                       size="sm"

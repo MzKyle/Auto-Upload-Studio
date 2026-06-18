@@ -25,7 +25,7 @@
   <a href="docs/">完整文档</a>
 </p>
 
-面向工业数据采集场景的 Electron 桌面应用，支持自动扫描文件夹、任务化上传阿里云 OSS、断点恢复、远程机器同步、历史管理、自动清理和图片标注导出。
+面向工业数据采集场景的 Electron 桌面应用，支持自动扫描文件夹、任务化上传阿里云 OSS 与腾讯云 TurboS3、断点恢复、远程机器同步、历史管理、自动清理和图片标注导出。
 
 这个项目适合用于采集机数据归档、焊接/视觉数据上传、批次目录同步、内网设备数据拉取等场景。它的重点不是单次手动上传，而是把“目录发现 -> 稳定性检查 -> 任务调度 -> 并发上传 -> 状态留档 -> 失败恢复”做成一条可观察、可恢复的桌面工作流。
 
@@ -36,13 +36,14 @@
 - 支持手动添加任务、暂停、恢复、取消和失败重试
 - 支持上传时间窗口，可配置开始时间、结束时间和跨天窗口
 - 三层并发控制：任务并发、单任务文件并发、全局文件上传并发
-- 阿里云 OSS 上传，支持小文件普通上传和大文件分片上传
+- 支持仅阿里云、仅腾讯云 TurboS3、阿里与腾讯双云上传
+- 两个云端独立记录文件进度、错误和重试状态；双云均完成后任务才完成
 - 文件过滤规则：白名单、黑名单、正则排除、后缀过滤
-- SSH 远程机器管理，支持连接测试、`rsync` 拉取和 SFTP 直传 OSS
+- SSH 远程机器管理，支持连接测试、`rsync` 拉取和 SFTP 直传当前云端
 - SQLite 本地持久化，保留任务、文件、设置、远程机器和历史状态
 - 自动清理已完成的本地目录，支持按来源和保留天数控制
 - 数采模式，可提取焊接采集目录中的相机、信号、机器人状态和标注元信息
-- 独立图片标注窗口，支持导出 PNG + JSON 并上传 OSS
+- 独立图片标注窗口，支持导出 PNG + JSON 并上传到当前云端
 - 安全的 Electron 进程模型：`contextIsolation=true`，渲染进程通过 preload IPC 访问主进程能力
 
 ## 系统架构
@@ -67,7 +68,7 @@ flowchart LR
     Scanner["ScannerService<br/>目录扫描 / 稳定性检查"]
     Queue["TaskQueueService<br/>时间窗口 / 任务并发"]
     Runner["TaskRunnerService<br/>文件过滤 / 断点恢复"]
-    OSS["OSSUploadService<br/>普通上传 / 分片上传"]
+    OSS["CloudUploadService<br/>阿里 OSS / 腾讯 TurboS3"]
     SSH["SSHRsyncService<br/>rsync / SFTP"]
     DataCollect["DataCollectService<br/>数采元信息"]
     Cleanup["CleanupService<br/>自动清理"]
@@ -75,8 +76,8 @@ flowchart LR
 
   subgraph Storage["Storage"]
     SQLite[("SQLite<br/>uploader.db")]
-    Marker["任务标记文件<br/>tmp_upload.json<br/>process_task.json"]
-    Cloud[("Aliyun OSS")]
+    Marker["任务标记文件<br/>tmp_upload.json<br/>process_task.json<br/>day_upload.json"]
+    Cloud[("Aliyun OSS / Tencent TurboS3")]
   end
 
   Dashboard --> IPCClient
@@ -103,7 +104,7 @@ flowchart LR
   OSS --> Cloud
 ```
 
-核心链路是：扫描器发现稳定目录后创建任务，队列按时间窗口和并发限制启动任务，执行器过滤文件并上传 OSS，同时把任务状态写入 SQLite 和目录标记文件。
+核心链路是：扫描器发现稳定目录后创建任务并锁定云端目标，队列按时间窗口和并发限制启动任务，执行器过滤文件并按云端独立上传，同时把逻辑任务和各云端状态写入 SQLite 与目录标记文件。
 
 ## 技术栈
 
@@ -114,7 +115,7 @@ flowchart LR
 | 前端 | React + React Router + Zustand |
 | 样式 | TailwindCSS |
 | 数据库 | SQLite / better-sqlite3 |
-| 对象存储 | ali-oss |
+| 对象存储 | ali-oss、AWS SDK v3 S3 client |
 | 远程传输 | ssh2 / rsync / SFTP |
 | 标注画布 | Konva / react-konva |
 | 打包 | electron-builder |
@@ -141,7 +142,7 @@ flowchart LR
 - Node.js 18+，建议 Node.js 20 LTS
 - npm 9+
 - Linux 或 Windows
-- 阿里云 OSS Bucket 及可写入的 AccessKey
+- 阿里云 OSS Bucket 及可写入的 AccessKey，或腾讯云 TurboS3 Endpoint、Bucket 和 AK/SK
 - 可选：`rsync`，用于远程机器拉取
 - 可选：`sshpass`，用于 rsync 密码认证场景
 
@@ -161,9 +162,9 @@ npm run dev
 
 启动后进入“设置”页完成基础配置：
 
-1. 填写 OSS `Endpoint`、`Region`、`Bucket`、`AccessKey ID`、`AccessKey Secret`。
-2. 点击“测试连接”，确认 Bucket 可访问。
-3. 添加扫描目录。扫描目录应是批次文件夹的父目录。
+1. 选择“仅阿里云”“仅腾讯云”或“双云上传”。
+2. 填写启用云端的 Endpoint、Region、Bucket、AK/SK 和 Prefix，并分别测试连接。
+3. 添加数据根目录。根目录下应按 `YYYY-MM-DD/焊接子目录` 组织数据。
 4. 根据网络和机器性能调整上传并发。
 5. 如不需要上传时间限制，可关闭开始时间和结束时间。
 6. 返回“任务面板”，点击“触发扫描”或等待自动扫描。
@@ -173,6 +174,7 @@ npm run dev
 ```bash
 npm run dev              # 启动开发环境
 npm run typecheck        # TypeScript 类型检查
+npm test                 # 日期目录与路径规则测试
 npm run lint             # ESLint 检查
 npm run build            # 构建主进程和渲染进程
 npm run preview          # 预览构建结果
@@ -210,21 +212,25 @@ Windows 产物由 `electron-builder` 根据 `electron-builder.yml` 生成。
 
 ### 本地自动上传
 
-配置扫描目录后，应用会扫描该目录下的子目录。每个子目录会在稳定性检查通过后成为一个上传任务。
+配置数据根目录后，应用只识别其下名称有效的 `YYYY-MM-DD` 日期目录。
+日期目录中的每个直接子目录会在稳定性检查通过后成为一个独立上传任务。
 
 ```text
 /data/upload-root/
-  batch-001/
-    camera1/0001.jpg
-    meta.json
+  2026-06-18/
+    04-39-04/
+      camera1/0001.jpg
+      meta.json
 ```
 
-如果 OSS prefix 为 `upload/`，上传后的对象路径类似：
+每个云端使用各自 Prefix。如果 Prefix 为 `upload/`，上传后的对象路径类似：
 
 ```text
-upload/batch-001/camera1/0001.jpg
-upload/batch-001/meta.json
+upload/2026-06-18/04-39-04/camera1/0001.jpg
+upload/2026-06-18/04-39-04/meta.json
 ```
+
+当天的每个焊接子目录上传完成后会保留自己的任务标记。双云任务必须两端都完成。系统日期跨天且该日期目录下所有焊接任务均完成后，会在日期目录写入 `day_upload.json`。如果封账后又出现迟到焊接目录，系统会撤销该标记，补传后重新封账。
 
 ### 上传时间窗口
 
@@ -242,11 +248,11 @@ upload/batch-001/meta.json
 | 模式 | 说明 | 推荐场景 |
 | --- | --- | --- |
 | rsync | 先拉取到本地目录，再自动创建上传任务 | 大批量文件、超大文件、需要断点能力 |
-| SFTP | 通过 SFTP 读取远程文件并直接上传 OSS | 文件较小、不希望本地落盘 |
+| SFTP | 通过 SFTP 读取远程文件并上传到当前选择的云端 | 文件较小、不希望本地落盘 |
 
 ### 标注导出
 
-任务面板可打开独立标注窗口。标注结果会导出为 PNG 和 JSON，并可上传到 OSS。如果原图属于某个上传任务，标注结果会尽量沿用原任务的 OSS 路径结构。
+任务面板可打开独立标注窗口。标注结果会导出为 PNG 和 JSON，并上传到当前选择的云端。如果原图属于某个上传任务，标注结果会尽量沿用原任务的对象路径结构。
 
 ## 数据与日志
 
@@ -255,6 +261,7 @@ upload/batch-001/meta.json
 - 任务标记文件：
   - `tmp_upload.json`：目录已被扫描器登记
   - `process_task.json`：上传过程和文件状态
+  - `day_upload.json`：日期目录中所有焊接子目录均已上传完成
 
 ## 文档
 
@@ -283,7 +290,7 @@ http://127.0.0.1:4173/
 
 结束时间只限制新任务启动。已经处于上传中的任务会继续执行，直到完成、失败、暂停或取消。
 
-### OSS 测试连接失败怎么办？
+### 云端测试连接失败怎么办？
 
 优先检查：
 
@@ -291,7 +298,7 @@ http://127.0.0.1:4173/
 - `Bucket` 是否正确
 - AK/SK 是否有效
 - RAM 权限是否允许访问目标 Bucket
-- 当前网络和 DNS 是否能访问 OSS
+- 当前网络和 DNS 是否能访问对应对象存储
 
 ### Linux 打包时 better-sqlite3 报错怎么办？
 

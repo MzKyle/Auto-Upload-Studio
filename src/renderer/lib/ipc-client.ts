@@ -1,7 +1,8 @@
 import { IPC } from '@shared/ipc-channels'
 import type {
   Task, TaskStatus, AppSettings, HistoryQuery, HistoryResult,
-  SSHMachine, SSHMachineInput, ScannerStatus, DataCollectInfo, DiskUsageInfo
+  SSHMachine, SSHMachineInput, ScannerStatus, DataCollectInfo, DiskUsageInfo,
+  DayFolderSummary, DayFolderListQuery, CloudProvider, MultiCloudOperationResult
 } from '@shared/types'
 
 const api = window.api
@@ -31,8 +32,17 @@ export async function cancelTask(taskId: string): Promise<void> {
   await api.invoke(IPC.TASK_CANCEL, { taskId })
 }
 
-export async function retryTask(taskId: string): Promise<void> {
-  await api.invoke(IPC.TASK_RETRY, { taskId })
+export async function retryTask(taskId: string, provider?: CloudProvider): Promise<void> {
+  await api.invoke(IPC.TASK_RETRY, { taskId, provider })
+}
+
+// ---- 日期目录汇总 ----
+export async function fetchDayFolders(query?: DayFolderListQuery): Promise<DayFolderSummary[]> {
+  return (await api.invoke(IPC.DAY_FOLDER_LIST, query)) as DayFolderSummary[]
+}
+
+export async function deleteDayFolderHistory(id: string): Promise<void> {
+  await api.invoke(IPC.DAY_FOLDER_DELETE, { id })
 }
 
 // ---- 扫描器 ----
@@ -65,6 +75,10 @@ export async function testOSS(config: AppSettings['oss']): Promise<{ ok: boolean
   return (await api.invoke(IPC.SETTINGS_TEST_OSS, config)) as { ok: boolean; error?: string }
 }
 
+export async function testTencentS3(config: AppSettings['tencentS3']): Promise<{ ok: boolean; error?: string }> {
+  return (await api.invoke(IPC.SETTINGS_TEST_TENCENT_S3, config)) as { ok: boolean; error?: string }
+}
+
 // ---- SSH ----
 export async function fetchSSHMachines(): Promise<SSHMachine[]> {
   return (await api.invoke(IPC.SSH_LIST_MACHINES)) as SSHMachine[]
@@ -94,8 +108,8 @@ export async function stopRsync(machineId: string): Promise<void> {
   await api.invoke(IPC.RSYNC_STOP, { machineId })
 }
 
-export async function startSftp(machineId: string): Promise<void> {
-  await api.invoke(IPC.SFTP_START, { machineId })
+export async function startSftp(machineId: string): Promise<MultiCloudOperationResult> {
+  return (await api.invoke(IPC.SFTP_START, { machineId })) as MultiCloudOperationResult
 }
 
 export async function stopSftp(machineId: string): Promise<void> {
@@ -151,6 +165,6 @@ export async function saveAnnotationExport(dataUrl: string, jsonString: string, 
   return (await api.invoke(IPC.ANNOTATION_SAVE_EXPORT, { dataUrl, jsonString, defaultBaseName })) as { pngPath: string; jsonPath: string } | null
 }
 
-export async function uploadAnnotationToOSS(imagePath: string, pngPath: string, jsonPath: string): Promise<{ ok: boolean; pngOssKey?: string; jsonOssKey?: string; error?: string }> {
-  return (await api.invoke(IPC.ANNOTATION_UPLOAD_OSS, { imagePath, pngPath, jsonPath })) as { ok: boolean; pngOssKey?: string; jsonOssKey?: string; error?: string }
+export async function uploadAnnotationToOSS(imagePath: string, pngPath: string, jsonPath: string): Promise<MultiCloudOperationResult> {
+  return (await api.invoke(IPC.ANNOTATION_UPLOAD_OSS, { imagePath, pngPath, jsonPath })) as MultiCloudOperationResult
 }

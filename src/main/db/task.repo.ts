@@ -1,7 +1,15 @@
 import { getDb } from './database'
 import { v4 as uuid } from 'uuid'
 import { normalize } from 'path'
-import type { Task, TaskFile, TaskStatus, SourceType } from '@shared/types'
+import type {
+  CloudProvider,
+  Task,
+  TaskFile,
+  TaskStatus,
+  SourceType,
+  UploadTargetMode
+} from '@shared/types'
+import { getTaskDestinationRepo } from './task-destination.repo'
 
 function normalizeFolderPath(p: string): string {
   return normalize(p).replace(/[\\/]+$/, '')
@@ -18,6 +26,10 @@ function rowToTask(row: Record<string, unknown>): Task {
     totalBytes: row.total_bytes as number,
     uploadedBytes: row.uploaded_bytes as number,
     ossPrefix: (row.oss_prefix as string) || '',
+    uploadTargetMode: (row.upload_target_mode as UploadTargetMode) || 'aliyun',
+    destinations: getTaskDestinationRepo().listByTask(row.id as string),
+    dayFolderId: (row.day_folder_id as string) || null,
+    uploadRelativePath: (row.upload_relative_path as string) || (row.folder_name as string),
     errorMessage: (row.error_message as string) || null,
     sourceType: row.source_type as SourceType,
     sourceMachineId: (row.source_machine_id as string) || null,
@@ -82,6 +94,10 @@ export class TaskRepo {
     folderPath: string
     folderName: string
     ossPrefix?: string
+    uploadTargetMode?: UploadTargetMode
+    destinationPrefixes?: Partial<Record<CloudProvider, string>>
+    dayFolderId?: string
+    uploadRelativePath?: string
     sourceType?: SourceType
     sourceMachineId?: string
   }): Task {
@@ -90,10 +106,53 @@ export class TaskRepo {
     const now = new Date().toISOString()
     const normalizedPath = normalizeFolderPath(params.folderPath)
     db.prepare(
-      `INSERT INTO tasks (id, folder_path, folder_name, status, oss_prefix, source_type, source_machine_id, created_at, updated_at)
-       VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?)`
-    ).run(id, normalizedPath, params.folderName, params.ossPrefix || '', params.sourceType || 'local', params.sourceMachineId || null, now, now)
+      `INSERT INTO tasks (
+        id, folder_path, folder_name, status, oss_prefix, upload_target_mode,
+        day_folder_id, upload_relative_path, source_type, source_machine_id,
+        created_at, updated_at
+      ) VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(
+      id,
+      normalizedPath,
+      params.folderName,
+      params.ossPrefix || '',
+      params.uploadTargetMode || 'aliyun',
+      params.dayFolderId || null,
+      params.uploadRelativePath || params.folderName,
+      params.sourceType || 'local',
+      params.sourceMachineId || null,
+      now,
+      now
+    )
+    getTaskDestinationRepo().ensureForTask(
+      id,
+      params.uploadTargetMode || 'aliyun',
+      params.destinationPrefixes || { aliyun: params.ossPrefix || '' }
+    )
     return this.getById(id)!
+  }
+
+  updateDayFolderMetadata(id: string, dayFolderId: string, uploadRelativePath: string): void {
+    getDb().prepare(
+      `UPDATE tasks
+       SET day_folder_id = ?, upload_relative_path = ?, updated_at = ?
+       WHERE id = ?`
+    ).run(dayFolderId, uploadRelativePath, new Date().toISOString(), id)
+  }
+
+  updateUploadRelativePath(id: string, uploadRelativePath: string): void {
+    getDb().prepare(
+      `UPDATE tasks
+       SET upload_relative_path = ?, updated_at = ?
+       WHERE id = ?`
+    ).run(uploadRelativePath, new Date().toISOString(), id)
+  }
+
+  listByDayFolder(dayFolderId: string): Task[] {
+    const rows = getDb().prepare(
+      'SELECT * FROM tasks WHERE day_folder_id = ? ORDER BY created_at DESC'
+    ).all(dayFolderId) as Record<string, unknown>[]
+    return rows.map(rowToTask)
   }
 
   updateStatus(id: string, status: TaskStatus, errorMessage?: string): void {
@@ -101,8 +160,13 @@ export class TaskRepo {
     const now = new Date().toISOString()
     const completedAt = (status === 'completed' || status === 'failed') ? now : null
     db.prepare(
-      'UPDATE tasks SET status = ?, error_message = ?, updated_at = ?, completed_at = COALESCE(?, completed_at) WHERE id = ?'
+      'UPDATE tasks SET status = ?, error_message = ?, updated_at = ?, completed_at = ? WHERE id = ?'
     ).run(status, errorMessage || null, now, completedAt, id)
+  }
+
+  retry(id: string, provider?: CloudProvider): void {
+    getTaskDestinationRepo().resetFailed(id, provider)
+    this.updateStatus(id, 'pending')
   }
 
   updateProgress(id: string, uploadedFiles: number, uploadedBytes: number): void {
@@ -173,7 +237,11 @@ export class TaskRepo {
     const db = getDb()
     const cutoff = new Date(Date.now() - retentionDays * 86400000).toISOString()
     return (db.prepare(
-      `SELECT * FROM tasks WHERE status = 'completed' AND source_type IN ('local', 'rsync') AND completed_at IS NOT NULL AND completed_at < ? ORDER BY completed_at ASC`
+      `SELECT * FROM tasks
+       WHERE status = 'completed'
+         AND (source_type = 'rsync' OR (source_type = 'local' AND day_folder_id IS NULL))
+         AND completed_at IS NOT NULL AND completed_at < ?
+       ORDER BY completed_at ASC`
     ).all(cutoff) as Record<string, unknown>[]).map(rowToTask)
   }
 }

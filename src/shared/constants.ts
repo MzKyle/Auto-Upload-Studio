@@ -17,6 +17,9 @@ export const DEFAULT_SETTINGS = {
     startAfterTime: '20:30',
     endBeforeTime: '23:59'
   },
+  cloud: {
+    targetMode: 'aliyun' as const
+  },
   oss: {
     endpoint: '',
     bucket: '',
@@ -24,6 +27,15 @@ export const DEFAULT_SETTINGS = {
     prefix: '',
     accessKeyId: '',
     accessKeySecret: ''
+  },
+  tencentS3: {
+    endpoint: '',
+    bucket: '',
+    region: '',
+    prefix: '',
+    accessKeyId: '',
+    accessKeySecret: '',
+    allowInsecureTls: false
   },
   filter: {
     whitelist: [],
@@ -56,7 +68,8 @@ export const DEFAULT_SETTINGS = {
 
 export const MARKER_FILES = {
   TMP_UPLOAD: 'tmp_upload.json',
-  PROCESS_TASK: 'process_task.json'
+  PROCESS_TASK: 'process_task.json',
+  DAY_UPLOAD: 'day_upload.json'
 } as const
 
 export const TASK_STATUS_LABELS: Record<string, string> = {
@@ -67,3 +80,15 @@ export const TASK_STATUS_LABELS: Record<string, string> = {
   failed: '失败',
   paused: '已暂停'
 }
+
+export const DAY_FOLDER_STATUS_LABELS: Record<string, string> = {
+  collecting: '采集中',
+  processing: '处理中',
+  blocked: '有阻塞',
+  completed: '已完成'
+}
+
+export const CLOUD_PROVIDER_LABELS = {
+  aliyun: '阿里云',
+  tencent: '腾讯云'
+} as const

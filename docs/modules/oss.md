@@ -1,8 +1,13 @@
-# OSS 上传服务
+# 双云上传服务
 
 ## 职责
 
-`OSSUploadService` 封装了阿里云 OSS 的连接、测试和上传能力。执行器不直接依赖 `ali-oss` 细节，而是通过服务完成：
+上传层由统一的 `CloudUploadService` 调度两个适配器：
+
+- `OSSUploadService`：阿里云 OSS
+- `TencentS3UploadService`：腾讯云 TurboS3/CFS 的 S3 兼容接口
+
+执行器不直接依赖具体 SDK，并统一完成：
 
 - 读取 OSS 配置并创建 client
 - 测试 Bucket 可访问性
@@ -11,7 +16,13 @@
 - Buffer 上传，用于 SFTP 直传和标注结果
 - 任务级 client 创建和取消
 
-## 连接配置
+## 上传模式与完成规则
+
+设置支持 `aliyun`、`tencent`、`both`。任务创建时锁定目标模式和两端 Prefix，后续修改设置只影响新任务。
+
+双云模式下，每个文件和任务分别保存两端状态；两端都成功后逻辑文件和任务才完成。部分失败时重试只处理失败云端，成功端不会重传。
+
+## 阿里云连接配置
 
 需要的字段：
 
@@ -43,10 +54,21 @@ list({ max-keys: 1 })
 示例：
 
 ```text
-upload/batch_001/camera1/001.jpg
+upload/2026-06-18/04-39-04/camera1/001.jpg
 ```
 
 实现中会把 Windows 反斜杠统一替换为 `/`，保证 OSS 对象路径稳定。
+
+腾讯与阿里分别使用自己的 Prefix，但都追加相同的 `日期/焊接目录/文件相对路径`。
+
+## 腾讯云 TurboS3
+
+腾讯配置包括 Endpoint、Region、Bucket、Prefix、AccessKey ID、AccessKey Secret 和“不安全 TLS”开关。
+
+- 使用 AWS SDK v3、S3 V4 签名和 path-style 请求。
+- 默认验证 TLS 证书。
+- 仅当现场服务使用无法验证的自签名证书时开启“不安全 TLS”；该设置只作用于腾讯客户端。
+- 不内置参考脚本中的 Bucket、用户 ID 映射或明文凭据。
 
 ## 普通上传与分片上传
 
@@ -74,7 +96,7 @@ upload/batch_001/camera1/001.jpg
 - SFTP 直传：远程文件通过 SFTP 读到内存后上传
 - 标注上传：本地导出的 PNG 和 JSON 读成 Buffer 后上传
 
-当前 Buffer 上传不走大文件分片逻辑，因此超大文件建议走普通任务上传。
+SFTP 和标注上传遵循当前上传模式并返回分云结果，但不写入任务历史。
 
 ## 常见失败原因
 

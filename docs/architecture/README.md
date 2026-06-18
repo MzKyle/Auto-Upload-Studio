@@ -32,7 +32,7 @@ graph TB
 
     subgraph Storage["本地和云端"]
       DB["SQLite uploader.db"]
-      Marker["tmp_upload.json<br/>process_task.json"]
+      Marker["tmp_upload.json<br/>process_task.json<br/>day_upload.json"]
       Cloud["Aliyun OSS Bucket"]
     end
 
@@ -84,7 +84,7 @@ graph TB
 | 类型 | 位置 | 内容 |
 | --- | --- | --- |
 | SQLite | Electron `userData/uploader.db` | 任务、文件、设置、远程机器、历史查询基础数据 |
-| 标记文件 | 任务目录内部 | `tmp_upload.json` 记录目录已发现，`process_task.json` 记录上传过程 |
+| 标记文件 | 焊接/日期目录内部 | 子目录标记记录任务过程，`day_upload.json` 记录整日完成 |
 
 SQLite 负责应用级查询和断点恢复；标记文件负责让任务目录自己带有处理痕迹，避免扫描器重复把同一目录当成新目录。
 

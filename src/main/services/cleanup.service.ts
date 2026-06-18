@@ -1,6 +1,7 @@
 import { existsSync, rmSync } from 'fs'
 import log from 'electron-log'
 import { getTaskRepo } from '../db/task.repo'
+import { getDayFolderRepo } from '../db/day-folder.repo'
 import { getSettingsRepo } from '../db/settings.repo'
 import type { CleanupConfig } from '@shared/types'
 
@@ -57,13 +58,34 @@ export class CleanupService {
 
       const retentionDays = this.normalizeRetentionDays(config)
       const taskRepo = getTaskRepo()
+      const dayFolderRepo = getDayFolderRepo()
       const tasks = taskRepo.getCompletedForCleanup(retentionDays)
+      const dayFolders = dayFolderRepo.getCompletedForCleanup(retentionDays)
 
-      if (tasks.length === 0) return
+      if (tasks.length === 0 && dayFolders.length === 0) return
 
-      log.info(`自动清理: 发现 ${tasks.length} 个可清理任务 (保留天数: ${retentionDays})`)
+      log.info(
+        `自动清理: 发现 ${dayFolders.length} 个日期目录和 ${tasks.length} 个独立任务可清理 ` +
+        `(保留天数: ${retentionDays})`
+      )
 
       let cleaned = 0
+      for (const dayFolder of dayFolders) {
+        try {
+          if (!existsSync(dayFolder.folderPath)) {
+            continue
+          }
+          rmSync(dayFolder.folderPath, { recursive: true, force: true })
+          cleaned++
+          log.info(
+            `自动清理: 已删除日期目录 ${dayFolder.folderPath} ` +
+            `(日期目录ID: ${dayFolder.id}, 完成于: ${dayFolder.completedAt})`
+          )
+        } catch (err) {
+          log.error(`自动清理日期目录失败: ${dayFolder.folderPath}`, err)
+        }
+      }
+
       for (const task of tasks) {
         try {
           if (!existsSync(task.folderPath)) {

@@ -1,4 +1,13 @@
-import { app, BrowserWindow, shell, globalShortcut, Tray, Menu, nativeImage } from 'electron'
+import {
+  app,
+  BrowserWindow,
+  shell,
+  globalShortcut,
+  Tray,
+  Menu,
+  nativeImage,
+  dialog
+} from 'electron'
 import { join } from 'path'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
 import { registerAllIpc } from './ipc'
@@ -118,6 +127,7 @@ function startServices(): void {
   // 连接任务队列和执行器
   taskQueue.setTaskRunner(async (task, signal) => {
     await taskRunner.run(task, signal)
+    if (signal.aborted) return
 
     // 上传完成后发送 webhook
     const webhookConfig = settingsRepo.get<WebhookConfig>('webhook')
@@ -175,7 +185,7 @@ function startServices(): void {
     log.info(`发现 ${unfinished.length} 个未完成任务，重新加入队列`)
     for (const task of unfinished) {
       if (task.status === 'uploading' || task.status === 'scanning') {
-        taskRepo.updateStatus(task.id, 'pending')
+        taskRepo.retry(task.id)
       }
     }
   }
@@ -234,6 +244,14 @@ app.whenReady().then(() => {
       createWindow()
     }
   })
+}).catch((error: unknown) => {
+  const message = error instanceof Error ? error.message : String(error)
+  log.error('应用启动失败:', error)
+  dialog.showErrorBox(
+    '数据采集上传工具启动失败',
+    `${message}\n\n请查看 ~/.config/electron-uploader/logs 下的日志。`
+  )
+  app.quit()
 })
 
 app.on('window-all-closed', () => {
