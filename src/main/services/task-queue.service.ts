@@ -3,6 +3,8 @@ import log from 'electron-log'
 import { getTaskRepo } from '../db/task.repo'
 import { getSettingsRepo } from '../db/settings.repo'
 import { getCleanupService } from './cleanup.service'
+import { getDayFolderService } from './day-folder.service'
+import { getTaskDestinationRepo } from '../db/task-destination.repo'
 import type { Task, TaskStatus, UploadConfig } from '@shared/types'
 
 /**
@@ -93,6 +95,7 @@ export class TaskQueueService extends EventEmitter {
 
       if (!controller.signal.aborted) {
         taskRepo.updateStatus(task.id, 'completed')
+        getDayFolderService().refreshForTask(task.id)
         getCleanupService().scheduleCleanup()
         this.emit('task:status-change', {
           taskId: task.id,
@@ -105,6 +108,12 @@ export class TaskQueueService extends EventEmitter {
       if (!controller.signal.aborted) {
         const errMsg = err instanceof Error ? err.message : String(err)
         taskRepo.updateStatus(task.id, 'failed', errMsg)
+        getTaskDestinationRepo().updateIncompleteStatuses(
+          task.id,
+          'failed',
+          errMsg
+        )
+        getDayFolderService().refreshForTask(task.id)
         this.emit('task:status-change', {
           taskId: task.id,
           oldStatus: 'uploading',

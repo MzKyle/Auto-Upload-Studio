@@ -63,8 +63,21 @@ export default function SSHMachines() {
     async (machine: SSHMachine) => {
       try {
         if (machine.transferMode === "sftp") {
-          await startSftp(machine.id);
-          showToast("SFTP 直传完成", "success");
+          const result = await startSftp(machine.id);
+          if (result.ok) {
+            showToast("SFTP 直传完成", "success");
+          } else {
+            const errors = result.results
+              .filter((item) => !item.ok)
+              .map(
+                (item) =>
+                  `${item.provider === "aliyun" ? "阿里云" : "腾讯云"}: ${
+                    item.error || "上传失败"
+                  }`
+              )
+              .join("；");
+            showToast(`SFTP 部分失败: ${errors}`, "error");
+          }
         } else {
           await startRsync(machine.id);
           showToast("rsync 拉取完成，已自动创建上传任务", "success");
@@ -301,7 +314,7 @@ export default function SSHMachines() {
                   className="mt-1 w-full h-9 rounded-md border border-input bg-background px-3 text-sm"
                 >
                   <option value="rsync">rsync (落盘 + 自动上传)</option>
-                  <option value="sftp">SFTP (直传 OSS)</option>
+                  <option value="sftp">SFTP (直传当前云端)</option>
                 </select>
               </div>
               <div className="flex items-end">

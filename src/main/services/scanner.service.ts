@@ -1,27 +1,53 @@
 import { readdirSync, statSync, existsSync } from 'fs'
-import { join, basename } from 'path'
+import { join } from 'path'
 import { BrowserWindow } from 'electron'
 import log from 'electron-log'
 import { IPC } from '@shared/ipc-channels'
+import { buildUploadRelativePath } from '@shared/day-folder'
+import { getUploadTargetSnapshot } from '@shared/cloud-upload'
 import { getTaskRepo } from '../db/task.repo'
+import { getTaskDestinationRepo } from '../db/task-destination.repo'
+import { getDayFolderRepo } from '../db/day-folder.repo'
 import { getSettingsRepo } from '../db/settings.repo'
 import { getDataCollectService } from './data-collect.service'
-import { readTmpUpload, writeTmpUpload } from '../utils/marker-file'
-import type { TmpUploadMarker, ScanConfig, StabilityConfig, ScannerStatus, DataCollectConfig } from '@shared/types'
+import { getDayFolderService } from './day-folder.service'
+import { discoverDayDirectories } from './date-directory-discovery'
+import {
+  readProcessTask,
+  readTmpUpload,
+  writeProcessTask,
+  writeTmpUpload
+} from '../utils/marker-file'
+import type {
+  TmpUploadMarker,
+  ScanConfig,
+  StabilityConfig,
+  ScannerStatus,
+  DataCollectConfig,
+  Task,
+  UploadTargetMode,
+  CloudProvider
+} from '@shared/types'
 
 interface PendingDir {
   path: string
+  dayFolderId: string
+  dateName: string
+  folderName: string
+  uploadRelativePath: string
   checks: number
   discoveredAt: string
   lastSnapshot: Map<string, { size: number; mtimeMs: number }>
+  uploadTargetMode?: UploadTargetMode
+  destinationPrefixes?: Partial<Record<CloudProvider, string>>
 }
 
 /**
- * 目录扫描服务
- * - 定时扫描配置的目录列表
- * - 发现新子目录后进行稳定性检查
- * - 确认文件写入完成后创建 tmp_upload.json 并注册任务
- * - 广播扫描状态和结果到渲染进程
+ * 日期目录扫描服务
+ * - 配置项指向数据根目录
+ * - 根目录下只识别 YYYY-MM-DD 日期目录
+ * - 日期目录的直接子目录分别作为上传任务
+ * - 子目录稳定后注册任务，日期跨天且所有子任务完成后封账
  */
 export class ScannerService {
   private timer: ReturnType<typeof setInterval> | null = null
@@ -40,12 +66,9 @@ export class ScannerService {
     const scanConfig = settings.get<ScanConfig>('scan')
     const intervalMs = (scanConfig?.intervalSeconds || 30) * 1000
 
-    // 启动时立刻扫描一次
     this.scan()
-
     this.timer = setInterval(() => this.scan(), intervalMs)
 
-    // 稳定性检查定时器（独立于扫描周期）
     const stabilityConfig = settings.get<StabilityConfig>('stability')
     const checkInterval = stabilityConfig?.checkIntervalMs || 5000
     this.stabilityTimer = setInterval(() => this.checkStability(), checkInterval)
@@ -79,7 +102,7 @@ export class ScannerService {
     const requiredChecks = stabilityConfig?.checkCount || 3
 
     const pendingStabilityChecks: ScannerStatus['pendingStabilityChecks'] = []
-    for (const [, pending] of this.pendingDirs) {
+    for (const pending of this.pendingDirs.values()) {
       pendingStabilityChecks.push({
         path: pending.path,
         checks: pending.checks,
@@ -98,7 +121,6 @@ export class ScannerService {
     }
   }
 
-  /** 手动触发一次扫描 */
   triggerScan(): void {
     this.scan()
   }
@@ -108,73 +130,148 @@ export class ScannerService {
     const scanConfig = settings.get<ScanConfig>('scan')
     const directories = scanConfig?.directories || []
     const intervalMs = (scanConfig?.intervalSeconds || 30) * 1000
+    const seenChildPaths = new Set<string>()
 
     let scannedDirs = 0
     let newDirsFound = 0
     let existingDirs = 0
 
-    for (const dir of directories) {
-      if (!existsSync(dir)) {
-        log.warn('扫描目录不存在:', dir)
+    for (const rootDir of directories) {
+      if (!existsSync(rootDir)) {
+        log.warn('扫描根目录不存在:', rootDir)
         continue
       }
-      const result = this.scanDirectory(dir)
+      const result = this.scanRootDirectory(rootDir, seenChildPaths)
       scannedDirs += result.scanned
       newDirsFound += result.newFound
       existingDirs += result.existing
     }
 
+    for (const pendingPath of this.pendingDirs.keys()) {
+      if (!seenChildPaths.has(pendingPath)) {
+        this.pendingDirs.delete(pendingPath)
+      }
+    }
+
     this.lastScanAt = new Date().toISOString()
     this.nextScanAt = new Date(Date.now() + intervalMs).toISOString()
-
     this.lastScanResults = {
       scannedDirs,
       newDirsFound,
       existingDirs,
       timestamp: this.lastScanAt
     }
-
     this.broadcastStatus()
   }
 
-  private scanDirectory(parentDir: string): { scanned: number; newFound: number; existing: number } {
+  private scanRootDirectory(
+    rootDir: string,
+    seenChildPaths: Set<string>
+  ): { scanned: number; newFound: number; existing: number } {
     let scanned = 0
     let newFound = 0
     let existing = 0
 
     try {
-      const entries = readdirSync(parentDir, { withFileTypes: true })
-      for (const entry of entries) {
-        if (!entry.isDirectory()) continue
-        if (entry.name.startsWith('.')) continue
+      const dayDirectories = discoverDayDirectories(rootDir)
+      for (const dayDirectory of dayDirectories) {
+        const result = this.scanDayDirectory(
+          dayDirectory.folderPath,
+          dayDirectory.dateName,
+          dayDirectory.childFolderNames,
+          seenChildPaths
+        )
+        scanned += result.scanned
+        newFound += result.newFound
+        existing += result.existing
+      }
+    } catch (err) {
+      log.error('扫描数据根目录失败:', rootDir, err)
+    }
+
+    return { scanned, newFound, existing }
+  }
+
+  private scanDayDirectory(
+    dayFolderPath: string,
+    dateName: string,
+    discoveredChildNames: string[],
+    seenChildPaths: Set<string>
+  ): { scanned: number; newFound: number; existing: number } {
+    const dayFolder = getDayFolderRepo().ensure(dayFolderPath, dateName)
+    const childNames: string[] = []
+    let scanned = 0
+    let newFound = 0
+    let existing = 0
+
+    try {
+      for (const childName of discoveredChildNames) {
+        const childPath = join(dayFolderPath, childName)
+        const uploadRelativePath = buildUploadRelativePath(dateName, childName)
+        childNames.push(childName)
+        seenChildPaths.add(childPath)
         scanned++
 
-        const subDirPath = join(parentDir, entry.name)
-
-        // 已有标记文件 → 检查是否已注册任务
-        const existingMarker = readTmpUpload(subDirPath)
-        if (existingMarker) {
-          this.ensureTaskRegistered(subDirPath, entry.name)
+        const existingTask = getTaskRepo().getByFolderPath(childPath)
+        if (existingTask) {
+          this.attachTaskToDayFolder(existingTask, dayFolder.id, uploadRelativePath)
+          this.pendingDirs.delete(childPath)
           existing++
           continue
         }
 
-        // 新发现的目录 → 加入稳定性检查队列
-        if (!this.pendingDirs.has(subDirPath)) {
-          log.info('发现新目录, 加入稳定性检查:', subDirPath)
-          this.pendingDirs.set(subDirPath, {
-            path: subDirPath,
+        const processMarker = readProcessTask(childPath)
+        if (processMarker?.status === 'completed') {
+          this.registerLegacyCompletedDir(
+            childPath,
+            childName,
+            dayFolder.id,
+            dateName,
+            processMarker,
+            readTmpUpload(childPath)
+          )
+          existing++
+          continue
+        }
+
+        const tmpMarker = readTmpUpload(childPath)
+        if (tmpMarker) {
+          this.registerNewDir({
+            path: childPath,
+            dayFolderId: dayFolder.id,
+            dateName,
+            folderName: childName,
+            uploadRelativePath,
+            checks: 0,
+            discoveredAt: tmpMarker.createdAt || new Date().toISOString(),
+            lastSnapshot: new Map(),
+            uploadTargetMode: tmpMarker.metadata.uploadTargetMode,
+            destinationPrefixes: tmpMarker.metadata.destinationPrefixes
+          })
+          existing++
+          continue
+        }
+
+        if (!this.pendingDirs.has(childPath)) {
+          log.info('发现新焊接目录, 加入稳定性检查:', childPath)
+          this.pendingDirs.set(childPath, {
+            path: childPath,
+            dayFolderId: dayFolder.id,
+            dateName,
+            folderName: childName,
+            uploadRelativePath,
             checks: 0,
             discoveredAt: new Date().toISOString(),
-            lastSnapshot: this.snapshotDir(subDirPath)
+            lastSnapshot: this.snapshotDir(childPath)
           })
           newFound++
         }
       }
     } catch (err) {
-      log.error('扫描目录失败:', parentDir, err)
+      log.error('扫描日期目录失败:', dayFolderPath, err)
     }
 
+    getDayFolderService().refresh(dayFolder.id, childNames)
     return { scanned, newFound, existing }
   }
 
@@ -187,15 +284,22 @@ export class ScannerService {
     let changed = false
 
     for (const [dirPath, pending] of this.pendingDirs) {
+      if (!existsSync(dirPath)) {
+        this.pendingDirs.delete(dirPath)
+        getDayFolderService().refresh(pending.dayFolderId)
+        changed = true
+        continue
+      }
+
       const currentSnapshot = this.snapshotDir(dirPath)
       const isStable = this.compareSnapshots(pending.lastSnapshot, currentSnapshot)
 
       if (isStable) {
         pending.checks++
-        log.info(`目录稳定性检查 ${pending.checks}/${requiredChecks}:`, dirPath)
+        log.info(`焊接目录稳定性检查 ${pending.checks}/${requiredChecks}:`, dirPath)
 
         if (pending.checks >= requiredChecks) {
-          this.registerNewDir(dirPath)
+          this.registerNewDir(pending)
           this.pendingDirs.delete(dirPath)
         }
         changed = true
@@ -211,58 +315,195 @@ export class ScannerService {
     }
   }
 
-  private registerNewDir(dirPath: string): void {
-    const folderName = basename(dirPath)
-
+  private registerNewDir(pending: PendingDir): Task {
+    const settings = getSettingsRepo().getAll()
+    const snapshot =
+      pending.uploadTargetMode && pending.destinationPrefixes
+        ? {
+            mode: pending.uploadTargetMode,
+            prefixes: {
+              aliyun: pending.destinationPrefixes.aliyun || '',
+              tencent: pending.destinationPrefixes.tencent || ''
+            }
+          }
+        : getUploadTargetSnapshot(settings)
     const marker: TmpUploadMarker = {
-      version: 1,
+      version: 2,
       createdAt: new Date().toISOString(),
-      folderPath: dirPath,
-      metadata: { source: 'local' }
+      folderPath: pending.path,
+      metadata: {
+        source: 'local',
+        dayFolderId: pending.dayFolderId,
+        date: pending.dateName,
+        uploadRelativePath: pending.uploadRelativePath,
+        uploadTargetMode: snapshot.mode,
+        destinationPrefixes: snapshot.prefixes
+      }
     }
 
-    writeTmpUpload(dirPath, marker)
-    this.ensureTaskRegistered(dirPath, folderName)
-    log.info('新目录已注册为上传任务:', dirPath)
+    writeTmpUpload(pending.path, marker)
+    const task = this.ensureTaskRegistered(
+      pending.path,
+      pending.folderName,
+      pending.dayFolderId,
+      pending.uploadRelativePath,
+      snapshot
+    )
+    log.info('焊接目录已注册为上传任务:', pending.path)
+    this.collectDataInfo(pending.path)
+    getDayFolderService().refresh(pending.dayFolderId)
+    return task
+  }
 
-    // 如果数采模式启用，自动采集元信息
-    const settings = getSettingsRepo()
-    const dataCollectConfig = settings.get<DataCollectConfig>('dataCollect')
-    if (dataCollectConfig?.enabled) {
-      try {
-        const dcService = getDataCollectService()
-        const info = dcService.collectDataInfo(dirPath)
-        if (info) {
-          // 推送数采结果到渲染进程
-          for (const win of BrowserWindow.getAllWindows()) {
-            win.webContents.send(IPC.DATA_COLLECT_RESULT, info)
-          }
-        }
-      } catch (err) {
-        log.warn('数采分析失败:', dirPath, err)
+  private registerLegacyCompletedDir(
+    dirPath: string,
+    folderName: string,
+    dayFolderId: string,
+    dateName: string,
+    processMarker: NonNullable<ReturnType<typeof readProcessTask>>,
+    tmpMarker: ReturnType<typeof readTmpUpload>
+  ): void {
+    const legacyUploadRelativePath = folderName
+    const markerProviders = Object.keys(processMarker.destinations || {}) as CloudProvider[]
+    const mode = processMarker.uploadTargetMode || (
+      markerProviders.includes('tencent') && markerProviders.includes('aliyun')
+        ? 'both'
+        : markerProviders.includes('tencent')
+          ? 'tencent'
+          : 'aliyun'
+    )
+    const currentSettings = getSettingsRepo().getAll()
+    const prefixes = {
+      aliyun:
+        tmpMarker?.metadata.destinationPrefixes?.aliyun ||
+        currentSettings.oss.prefix ||
+        '',
+      tencent:
+        tmpMarker?.metadata.destinationPrefixes?.tencent ||
+        currentSettings.tencentS3.prefix ||
+        ''
+    }
+    const task = this.ensureTaskRegistered(
+      dirPath,
+      folderName,
+      dayFolderId,
+      legacyUploadRelativePath,
+      {
+        mode,
+        prefixes
       }
+    )
+    const taskRepo = getTaskRepo()
+    taskRepo.setTotals(task.id, processMarker.totalFiles, 0)
+    taskRepo.updateProgress(task.id, processMarker.uploadedFiles, 0)
+    taskRepo.updateStatus(task.id, 'completed')
+    for (const destination of getTaskDestinationRepo().listByTask(task.id)) {
+      const marker = processMarker.destinations?.[destination.provider]
+      getTaskDestinationRepo().setTotals(
+        task.id,
+        destination.provider,
+        marker?.totalFiles ?? processMarker.totalFiles,
+        0
+      )
+      getTaskDestinationRepo().updateProgress(
+        task.id,
+        destination.provider,
+        marker?.uploadedFiles ?? processMarker.uploadedFiles,
+        0
+      )
+      getTaskDestinationRepo().updateStatus(
+        task.id,
+        destination.provider,
+        'completed'
+      )
+    }
+
+    writeTmpUpload(dirPath, {
+      version: 2,
+      createdAt: new Date().toISOString(),
+      folderPath: dirPath,
+      metadata: {
+        source: 'local',
+        dayFolderId,
+        date: dateName,
+        uploadRelativePath: legacyUploadRelativePath,
+        uploadTargetMode: mode,
+        destinationPrefixes: prefixes
+      }
+    })
+    writeProcessTask(dirPath, {
+      ...processMarker,
+      taskId: task.id,
+      status: 'completed',
+      lastUpdated: new Date().toISOString()
+    })
+    getDayFolderService().refresh(dayFolderId)
+    log.info('信任旧完成标记并登记焊接任务:', dirPath)
+  }
+
+  private ensureTaskRegistered(
+    dirPath: string,
+    folderName: string,
+    dayFolderId: string,
+    uploadRelativePath: string,
+    targetSnapshot?: {
+      mode: UploadTargetMode
+      prefixes: Record<CloudProvider, string>
+    }
+  ): Task {
+    const taskRepo = getTaskRepo()
+    const existing = taskRepo.getByFolderPath(dirPath)
+    if (existing) {
+      this.attachTaskToDayFolder(existing, dayFolderId, uploadRelativePath)
+      return taskRepo.getById(existing.id)!
+    }
+
+    const settings = getSettingsRepo().getAll()
+    const snapshot = targetSnapshot || getUploadTargetSnapshot(settings)
+    return taskRepo.create({
+      folderPath: dirPath,
+      folderName,
+      ossPrefix: snapshot.prefixes.aliyun,
+      uploadTargetMode: snapshot.mode,
+      destinationPrefixes: snapshot.prefixes,
+      dayFolderId,
+      uploadRelativePath,
+      sourceType: 'local'
+    })
+  }
+
+  private attachTaskToDayFolder(
+    task: Task,
+    dayFolderId: string,
+    uploadRelativePath: string
+  ): void {
+    const targetUploadRelativePath =
+      task.status === 'completed' && task.uploadRelativePath === task.folderName
+        ? task.uploadRelativePath
+        : uploadRelativePath
+
+    if (
+      task.dayFolderId !== dayFolderId ||
+      task.uploadRelativePath !== targetUploadRelativePath
+    ) {
+      getTaskRepo().updateDayFolderMetadata(task.id, dayFolderId, targetUploadRelativePath)
     }
   }
 
-  private ensureTaskRegistered(dirPath: string, folderName: string): void {
-    const taskRepo = getTaskRepo()
-    const existing = taskRepo.getByFolderPath(dirPath)
-    if (!existing || existing.status === 'completed' || existing.status === 'failed') {
-      const settings = getSettingsRepo()
-      const ossPrefix = settings.get<string>('oss')
-        ? (settings.get<{ prefix: string }>('oss')?.prefix || '')
-        : ''
+  private collectDataInfo(dirPath: string): void {
+    const settings = getSettingsRepo()
+    const dataCollectConfig = settings.get<DataCollectConfig>('dataCollect')
+    if (!dataCollectConfig?.enabled) return
 
-      if (existing && (existing.status === 'completed' || existing.status === 'failed')) {
-        return
+    try {
+      const info = getDataCollectService().collectDataInfo(dirPath)
+      if (info) {
+        for (const win of BrowserWindow.getAllWindows()) {
+          win.webContents.send(IPC.DATA_COLLECT_RESULT, info)
+        }
       }
-      if (!existing) {
-        taskRepo.create({
-          folderPath: dirPath,
-          folderName,
-          ossPrefix
-        })
-      }
+    } catch (err) {
+      log.warn('数采分析失败:', dirPath, err)
     }
   }
 
@@ -273,7 +514,6 @@ export class ScannerService {
     }
   }
 
-  /** 快照目录中所有文件的 size 和 mtime */
   private snapshotDir(dirPath: string): Map<string, { size: number; mtimeMs: number }> {
     const snapshot = new Map<string, { size: number; mtimeMs: number }>()
     this.walkForSnapshot(dirPath, dirPath, snapshot)
@@ -299,12 +539,12 @@ export class ScannerService {
             const relPath = fullPath.slice(basePath.length + 1)
             snapshot.set(relPath, { size: stat.size, mtimeMs: stat.mtimeMs })
           } catch {
-            // 文件可能被删除
+            // 文件可能在快照期间被删除
           }
         }
       }
     } catch {
-      // 目录不可读
+      // 目录可能在扫描期间被删除或暂时不可读
     }
   }
 

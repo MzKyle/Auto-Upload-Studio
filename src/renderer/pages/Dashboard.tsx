@@ -5,6 +5,7 @@ import { TaskCard } from "@/components/TaskCard";
 import { DataCollectCard } from "@/components/DataCollectCard";
 import { ScanSchedulePanel } from "@/components/ScanSchedulePanel";
 import { DiskUsagePanel } from "@/components/DiskUsagePanel";
+import { DayFolderCard } from "@/components/DayFolderCard";
 import { useTaskStore } from "@/stores/task.store";
 import { useTaskProgress } from "@/hooks/useTaskProgress";
 import { showToast } from "@/components/ui/toast";
@@ -17,14 +18,22 @@ import {
   retryTask,
   triggerScan,
   fetchDataCollectList,
+  fetchDayFolders,
   openAnnotationWindow,
 } from "@/lib/ipc-client";
 import { IPC } from "@shared/ipc-channels";
-import type { DataCollectInfo } from "@shared/types";
+import type {
+  CloudProvider,
+  DataCollectInfo,
+  DayFolderSummary,
+} from "@shared/types";
+import { progressKey } from "@shared/cloud-upload";
 
 export default function Dashboard() {
   const { tasks, progress, loading, loadTasks } = useTaskStore();
   const [dataCollects, setDataCollects] = useState<DataCollectInfo[]>([]);
+  const [dayFolders, setDayFolders] = useState<DayFolderSummary[]>([]);
+  const [provider, setProvider] = useState<CloudProvider>("aliyun");
 
   useTaskProgress();
 
@@ -32,6 +41,9 @@ export default function Dashboard() {
     loadTasks();
     fetchDataCollectList()
       .then(setDataCollects)
+      .catch(() => {});
+    fetchDayFolders({ limit: 30 })
+      .then(setDayFolders)
       .catch(() => {});
   }, [loadTasks]);
 
@@ -53,6 +65,22 @@ export default function Dashboard() {
     };
   }, []);
 
+  useEffect(() => {
+    const off = window.api.on(
+      IPC.DAY_FOLDER_EVENT,
+      (_event: unknown, data: unknown) => {
+        const summary = data as DayFolderSummary;
+        setDayFolders((prev) => {
+          const next = [summary, ...prev.filter((item) => item.id !== summary.id)];
+          return next
+            .sort((a, b) => b.date.localeCompare(a.date))
+            .slice(0, 30);
+        });
+      }
+    );
+    return () => off();
+  }, []);
+
   const handleAddFolder = useCallback(async () => {
     const folder = await selectFolder();
     if (folder) {
@@ -63,7 +91,17 @@ export default function Dashboard() {
 
   const handleScan = useCallback(async () => {
     await triggerScan();
-    loadTasks();
+    await Promise.all([
+      loadTasks(),
+      fetchDayFolders({ limit: 30 }).then(setDayFolders),
+    ]);
+  }, [loadTasks]);
+
+  const handleRefresh = useCallback(async () => {
+    await Promise.all([
+      loadTasks(),
+      fetchDayFolders({ limit: 30 }).then(setDayFolders),
+    ]);
   }, [loadTasks]);
 
   const handlePause = useCallback(async (taskId: string) => {
@@ -93,20 +131,35 @@ export default function Dashboard() {
     }
   }, []);
 
-  const handleRetry = useCallback(async (taskId: string) => {
+  const handleRetry = useCallback(async (
+    taskId: string,
+    retryProvider: CloudProvider
+  ) => {
     try {
-      await retryTask(taskId);
+      await retryTask(taskId, retryProvider);
       showToast("任务已重新排队", "success");
     } catch (err) {
       showToast(`重试失败: ${err}`, "error");
     }
   }, []);
 
-  const activeTasks = tasks.filter(
-    (t) => !["completed", "failed"].includes(t.status)
+  const providerTasks = tasks.filter((task) =>
+    task.destinations.some((destination) => destination.provider === provider)
+  );
+  const destinationStatus = (task: (typeof tasks)[number]) =>
+    task.destinations.find((destination) => destination.provider === provider)
+      ?.status;
+  const activeTasks = providerTasks.filter(
+    (task) => !["completed", "failed"].includes(destinationStatus(task) || "")
   );
   const doneTasks = tasks
-    .filter((t) => ["completed", "failed"].includes(t.status))
+    .filter((task) =>
+      task.destinations.some(
+        (destination) =>
+          destination.provider === provider &&
+          ["completed", "failed"].includes(destination.status)
+      )
+    )
     .slice(0, 10);
 
   return (
@@ -135,11 +188,24 @@ export default function Dashboard() {
             variant="ghost"
             size="icon"
             className="h-9 w-9"
-            onClick={loadTasks}
+            onClick={handleRefresh}
           >
             <RefreshCw className={`h-4 w-4 ${loading ? "animate-spin" : ""}`} />
           </Button>
         </div>
+      </div>
+
+      <div className="inline-flex rounded-md border p-1 bg-muted/30">
+        {(["aliyun", "tencent"] as CloudProvider[]).map((item) => (
+          <Button
+            key={item}
+            variant={provider === item ? "default" : "ghost"}
+            size="sm"
+            onClick={() => setProvider(item)}
+          >
+            {item === "aliyun" ? "阿里云" : "腾讯云"}
+          </Button>
+        ))}
       </div>
 
       {/* 扫描计划面板 */}
@@ -147,6 +213,17 @@ export default function Dashboard() {
 
       {/* 磁盘用量 */}
       <DiskUsagePanel />
+
+      {dayFolders.length > 0 && (
+        <section>
+          <h2 className="text-sm font-semibold text-muted-foreground mb-3">
+            日期目录汇总 ({dayFolders.length})
+          </h2>
+          {dayFolders.map((dayFolder) => (
+            <DayFolderCard key={dayFolder.id} dayFolder={dayFolder} />
+          ))}
+        </section>
+      )}
 
       {/* 数据采集结果 */}
       {dataCollects.length > 0 && (
@@ -179,7 +256,8 @@ export default function Dashboard() {
             <TaskCard
               key={task.id}
               task={task}
-              progress={progress[task.id]}
+              provider={provider}
+              progress={progress[progressKey(task.id, provider)]}
               onPause={handlePause}
               onResume={handleResume}
               onCancel={handleCancel}
@@ -199,7 +277,8 @@ export default function Dashboard() {
             <TaskCard
               key={task.id}
               task={task}
-              progress={progress[task.id]}
+              provider={provider}
+              progress={progress[progressKey(task.id, provider)]}
               onPause={handlePause}
               onResume={handleResume}
               onCancel={handleCancel}

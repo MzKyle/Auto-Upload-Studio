@@ -40,7 +40,14 @@ stateDiagram-v2
 | `completed` | 文件已上传并记录 OSS key |
 | `failed` | 文件上传失败，记录错误信息 |
 
-恢复任务时，执行器会把 `uploading`、`pending` 和 `failed` 文件重新纳入待上传列表。被取消或暂停的当前文件会回退为 `pending`，避免下次恢复时被误判为失败。
+每个逻辑文件在 `task_file_destinations` 中分别保存阿里和腾讯状态。只有任务所选云端全部为 `completed`，逻辑文件才变为 `completed`。
+
+双云部分失败时：
+
+- 成功云端保持 `completed`
+- 失败云端保持 `failed`
+- 逻辑任务为 `failed`
+- 从对应云端标签页重试时只重置该云端
 
 ## 标记文件状态
 
@@ -50,8 +57,18 @@ stateDiagram-v2
 | --- | --- | --- |
 | `tmp_upload.json` | 目录稳定并被注册为任务时 | 表示该目录已被扫描器处理过 |
 | `process_task.json` | 上传过程中和结束时 | 记录任务 ID、文件状态、已上传数量、最终错误 |
+| `day_upload.json` | 日期跨天且全部焊接任务完成时 | 记录日期目录汇总和全部子任务清单 |
 
 `tmp_upload.json` 主要服务扫描器去重，`process_task.json` 主要服务现场排查和上传过程观测。
+
+日期目录汇总状态为：
+
+| 状态 | 含义 |
+| --- | --- |
+| `collecting` | 当天仍可能继续产生焊接目录，或尚无子目录 |
+| `processing` | 存在待稳定、等待或上传中的焊接目录 |
+| `blocked` | 至少一个焊接任务失败或暂停 |
+| `completed` | 日期已跨天且所有已发现焊接任务完成 |
 
 ## 上传时间窗口
 

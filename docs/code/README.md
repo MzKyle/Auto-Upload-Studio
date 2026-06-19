@@ -27,14 +27,17 @@ graph LR
 | `src/main/services/scanner.service.ts` | 目录扫描和稳定性检查 | 新目录如何变成任务 |
 | `src/main/services/task-queue.service.ts` | 任务队列调度 | 时间窗口和任务并发如何生效 |
 | `src/main/services/task-runner.service.ts` | 单个任务上传执行 | 文件过滤、断点恢复、进度广播 |
-| `src/main/services/oss-upload.service.ts` | OSS 上传封装 | 连接测试、普通上传、分片上传 |
+| `src/main/services/cloud-upload.service.ts` | 双云上传入口 | 阿里/腾讯适配器选择 |
+| `src/main/services/oss-upload.service.ts` | 阿里 OSS 上传 | 连接测试、普通上传、分片上传 |
+| `src/main/services/tencent-s3-upload.service.ts` | 腾讯 TurboS3 上传 | S3 V4、path-style、TLS 策略 |
 | `src/main/services/ssh-rsync.service.ts` | 远程同步 | rsync 拉取和 SFTP 直传 |
 | `src/main/db/database.ts` | SQLite 初始化 | 表结构、WAL、迁移 |
-| `src/main/db/task.repo.ts` | 任务仓储 | 任务和文件状态读写 |
+| `src/main/db/task.repo.ts` | 任务仓储 | 逻辑任务和文件状态读写 |
+| `src/main/db/task-destination.repo.ts` | 云端状态仓储 | 分云进度、文件结果和重试 |
 | `src/preload/index.ts` | 安全桥接 | `window.api` 如何暴露 |
 | `src/renderer/App.tsx` | 前端路由入口 | 页面导航结构 |
 | `src/renderer/pages/Dashboard.tsx` | 任务面板 | 任务列表、扫描、标注入口 |
-| `src/renderer/pages/Settings.tsx` | 设置页 | 自动保存和 OSS 测试 |
+| `src/renderer/pages/Settings.tsx` | 设置页 | 上传模式和双云连接测试 |
 | `src/shared/types.ts` | 共享类型 | Task、Settings、SSH、History 类型 |
 | `src/shared/ipc-channels.ts` | IPC 通道常量 | 主进程和渲染进程的接口契约 |
 
@@ -48,7 +51,8 @@ ScannerService
   -> TaskQueueService.processQueue
   -> TaskRunnerService.run
   -> FileFilterService.scanFolder
-  -> OSSUploadService.uploadFile
+  -> CloudUploadService
+  -> OSSUploadService / TencentS3UploadService
   -> TaskRepo.updateProgress / updateStatus
 ```
 

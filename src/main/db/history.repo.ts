@@ -1,9 +1,10 @@
 import { getDb } from './database'
-import type { HistoryQuery, HistoryResult, HistoryItem } from '@shared/types'
+import type { CloudProvider, HistoryQuery, HistoryResult, HistoryItem } from '@shared/types'
 
 function rowToHistory(row: Record<string, unknown>): HistoryItem {
   return {
     id: row.id as string,
+    provider: row.provider as CloudProvider,
     folderName: row.folder_name as string,
     fileCount: row.total_files as number,
     totalBytes: row.total_bytes as number,
@@ -16,26 +17,40 @@ function rowToHistory(row: Record<string, unknown>): HistoryItem {
 export class HistoryRepo {
   list(query: HistoryQuery): HistoryResult {
     const db = getDb()
-    const { page, pageSize, status } = query
+    const { page, pageSize, status, provider } = query
     const offset = (page - 1) * pageSize
 
-    let where = "WHERE status IN ('completed', 'failed') AND completed_at IS NOT NULL"
+    let where =
+      "WHERE td.status IN ('completed', 'failed') AND td.completed_at IS NOT NULL"
     const params: unknown[] = []
+    if (provider) {
+      where += ' AND td.provider = ?'
+      params.push(provider)
+    }
     if (status) {
-      where += ' AND status = ?'
+      where += ' AND td.status = ?'
       params.push(status)
     }
 
     const countRow = db
-      .prepare(`SELECT COUNT(*) as cnt FROM tasks ${where}`)
+      .prepare(
+        `SELECT COUNT(*) as cnt
+         FROM task_destinations td
+         INNER JOIN tasks t ON t.id = td.task_id ${where}`
+      )
       .get(...params) as { cnt: number }
     const total = countRow.cnt
 
     const rows = db
       .prepare(
-        `SELECT id, folder_name, total_files, total_bytes, status, completed_at,
-         CAST((julianday(completed_at) - julianday(created_at)) * 86400 AS INTEGER) as duration_seconds
-         FROM tasks ${where} ORDER BY completed_at DESC LIMIT ? OFFSET ?`
+        `SELECT t.id, td.provider, t.folder_name, td.total_files, td.total_bytes,
+          td.status, td.completed_at,
+          CAST((julianday(td.completed_at) - julianday(td.created_at)) * 86400 AS INTEGER)
+            as duration_seconds
+         FROM task_destinations td
+         INNER JOIN tasks t ON t.id = td.task_id
+         ${where}
+         ORDER BY td.completed_at DESC LIMIT ? OFFSET ?`
       )
       .all(...params, pageSize, offset) as Record<string, unknown>[]
 

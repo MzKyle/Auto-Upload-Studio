@@ -6,8 +6,11 @@
 export type TaskStatus = 'pending' | 'scanning' | 'uploading' | 'completed' | 'failed' | 'paused'
 export type FileStatus = 'pending' | 'uploading' | 'completed' | 'failed'
 export type SourceType = 'local' | 'rsync' | 'manual'
+export type DayFolderStatus = 'collecting' | 'processing' | 'blocked' | 'completed'
 export type SSHAuthType = 'key' | 'password'
 export type TransferMode = 'rsync' | 'sftp'
+export type CloudProvider = 'aliyun' | 'tencent'
+export type UploadTargetMode = 'aliyun' | 'tencent' | 'both'
 
 export interface Task {
   id: string
@@ -19,6 +22,10 @@ export interface Task {
   totalBytes: number
   uploadedBytes: number
   ossPrefix: string
+  uploadTargetMode: UploadTargetMode
+  destinations: TaskDestination[]
+  dayFolderId: string | null
+  uploadRelativePath: string
   errorMessage: string | null
   sourceType: SourceType
   sourceMachineId: string | null
@@ -40,8 +47,38 @@ export interface TaskFile {
   updatedAt: string
 }
 
+export interface TaskDestination {
+  id: string
+  taskId: string
+  provider: CloudProvider
+  status: TaskStatus
+  prefix: string
+  totalFiles: number
+  uploadedFiles: number
+  totalBytes: number
+  uploadedBytes: number
+  errorMessage: string | null
+  createdAt: string
+  updatedAt: string
+  completedAt: string | null
+}
+
+export interface TaskFileDestination {
+  id: string
+  taskFileId: string
+  taskDestinationId: string
+  provider: CloudProvider
+  status: FileStatus
+  objectKey: string | null
+  uploadId: string | null
+  errorMessage: string | null
+  createdAt: string
+  updatedAt: string
+}
+
 export interface TaskProgress {
   taskId: string
+  provider: CloudProvider
   uploadedFiles: number
   totalFiles: number
   uploadedBytes: number
@@ -54,6 +91,36 @@ export interface TaskStatusEvent {
   taskId: string
   oldStatus: TaskStatus
   newStatus: TaskStatus
+}
+
+export interface TaskDestinationStatusEvent {
+  taskId: string
+  provider: CloudProvider
+  status: TaskStatus
+  errorMessage?: string
+}
+
+export interface DayFolderSummary {
+  id: string
+  folderPath: string
+  folderName: string
+  date: string
+  status: DayFolderStatus
+  totalChildren: number
+  completedChildren: number
+  totalFiles: number
+  uploadedFiles: number
+  totalBytes: number
+  uploadedBytes: number
+  createdAt: string
+  updatedAt: string
+  completedAt: string | null
+}
+
+export interface DayFolderListQuery {
+  status?: DayFolderStatus
+  includeCompleted?: boolean
+  limit?: number
 }
 
 // ---- SSH 机器 ----
@@ -115,6 +182,20 @@ export interface OSSConfig {
   accessKeySecret: string
 }
 
+export interface TencentS3Config {
+  endpoint: string
+  bucket: string
+  region: string
+  prefix: string
+  accessKeyId: string
+  accessKeySecret: string
+  allowInsecureTls: boolean
+}
+
+export interface CloudConfig {
+  targetMode: UploadTargetMode
+}
+
 export interface WebhookConfig {
   url: string
   headers: Record<string, string>
@@ -157,7 +238,9 @@ export interface CleanupConfig {
 export interface AppSettings {
   scan: ScanConfig
   upload: UploadConfig
+  cloud: CloudConfig
   oss: OSSConfig
+  tencentS3: TencentS3Config
   filter: FilterRules
   webhook: WebhookConfig
   hotkey: string
@@ -235,6 +318,7 @@ export interface SftpProgress {
 // ---- 历史记录 ----
 export interface HistoryItem {
   id: string
+  provider: CloudProvider
   folderName: string
   fileCount: number
   totalBytes: number
@@ -246,6 +330,7 @@ export interface HistoryItem {
 export interface HistoryQuery {
   page: number
   pageSize: number
+  provider?: CloudProvider
   status?: 'completed' | 'failed'
 }
 
@@ -262,7 +347,20 @@ export interface TmpUploadMarker {
   metadata: {
     source: SourceType
     machineId?: string
+    dayFolderId?: string
+    date?: string
+    uploadRelativePath?: string
+    uploadTargetMode?: UploadTargetMode
+    destinationPrefixes?: Partial<Record<CloudProvider, string>>
   }
+}
+
+export interface ProcessTaskDestinationMarker {
+  status: TaskStatus
+  totalFiles: number
+  uploadedFiles: number
+  files: Record<string, FileStatus>
+  error: string | null
 }
 
 export interface ProcessTaskMarker {
@@ -274,6 +372,45 @@ export interface ProcessTaskMarker {
   files: Record<string, FileStatus>
   lastUpdated: string
   error: string | null
+  uploadTargetMode?: UploadTargetMode
+  destinations?: Partial<Record<CloudProvider, ProcessTaskDestinationMarker>>
+}
+
+export interface DayUploadMarker {
+  version: number
+  dayFolderId: string
+  date: string
+  folderPath: string
+  status: 'completed'
+  totalChildren: number
+  totalFiles: number
+  uploadedFiles: number
+  totalBytes: number
+  uploadedBytes: number
+  children: Array<{
+    folderName: string
+    folderPath: string
+    taskId: string
+    completedAt: string | null
+    destinations?: Array<{
+      provider: CloudProvider
+      status: TaskStatus
+      completedAt: string | null
+    }>
+  }>
+  completedAt: string
+}
+
+export interface CloudOperationResult {
+  provider: CloudProvider
+  ok: boolean
+  keys?: string[]
+  error?: string
+}
+
+export interface MultiCloudOperationResult {
+  ok: boolean
+  results: CloudOperationResult[]
 }
 
 // ---- 磁盘用量 ----

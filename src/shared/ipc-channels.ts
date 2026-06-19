@@ -13,6 +13,12 @@ export const IPC = {
   TASK_RETRY: 'task:retry',
   TASK_PROGRESS: 'task:progress',         // push from main
   TASK_STATUS_CHANGE: 'task:status-change', // push from main
+  TASK_DESTINATION_CHANGE: 'task:destination-change',
+
+  // 日期目录汇总
+  DAY_FOLDER_LIST: 'day-folder:list',
+  DAY_FOLDER_DELETE: 'day-folder:delete',
+  DAY_FOLDER_EVENT: 'day-folder:event',
 
   // 扫描器
   SCANNER_STATUS: 'scanner:status',
@@ -30,6 +36,7 @@ export const IPC = {
   SETTINGS_GET_ALL: 'settings:get-all',
   SETTINGS_SAVE: 'settings:save',
   SETTINGS_TEST_OSS: 'settings:test-oss',
+  SETTINGS_TEST_TENCENT_S3: 'settings:test-tencent-s3',
 
   // SSH / rsync
   SSH_LIST_MACHINES: 'ssh:list-machines',

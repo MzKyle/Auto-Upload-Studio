@@ -91,7 +91,11 @@ export class FileFilterService {
       } else if (entry.isFile()) {
         const relativePath = fullPath.slice(basePath.length + 1)
         // 跳过标记文件
-        if (entry.name === 'tmp_upload.json' || entry.name === 'process_task.json') continue
+        if (
+          entry.name === 'tmp_upload.json' ||
+          entry.name === 'process_task.json' ||
+          entry.name === 'day_upload.json'
+        ) continue
         if (this.shouldInclude(relativePath)) {
           const stat = statSync(fullPath)
           results.push({ relativePath, absolutePath: fullPath, size: stat.size })

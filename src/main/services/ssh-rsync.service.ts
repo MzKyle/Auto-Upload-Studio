@@ -3,13 +3,26 @@ import { Client as SSHClient, type SFTPWrapper } from 'ssh2'
 import { readFileSync } from 'fs'
 import { join, posix } from 'path'
 import log from 'electron-log'
-import type { SSHMachine, RsyncProgress, SftpProgress, AppSettings } from '@shared/types'
-import type { OSSUploadService } from './oss-upload.service'
+import type {
+  CloudOperationResult,
+  MultiCloudOperationResult,
+  SSHMachine,
+  RsyncProgress,
+  SftpProgress,
+  AppSettings
+} from '@shared/types'
+import { providersForMode } from '@shared/cloud-upload'
+import {
+  buildOssKey,
+  resolveDirectoryUploadRelativePath
+} from '@shared/day-folder'
+import { getCloudUploadService } from './cloud-upload.service'
+import type { CloudTaskUploader } from './cloud-upload.types'
 
 /**
  * SSH + rsync / SFTP 远程传输服务
- * - rsync: 拉取到本地后自动触发 OSS 上传
- * - sftp: 流式直传到 OSS，不落盘
+ * - rsync: 拉取到本地后自动触发云端上传
+ * - sftp: 流式直传到当前选择的云端，不落盘
  */
 export class SSHRsyncService {
   private runningProcesses: Map<string, ChildProcess | SSHClient> = new Map()
@@ -123,20 +136,37 @@ export class SSHRsyncService {
   }
 
   /**
-   * SFTP 流式直传到 OSS（不落盘）
+   * SFTP 流式直传到当前选择的云端（不落盘）
    */
-  async sftpStreamToOSS(
+  async sftpStreamToCloud(
     machine: SSHMachine,
     password: string | undefined,
-    ossService: OSSUploadService,
-    ossConfig: AppSettings['oss'],
+    settings: AppSettings,
     onProgress?: (progress: SftpProgress) => void
-  ): Promise<void> {
+  ): Promise<MultiCloudOperationResult> {
     if (this.runningProcesses.has(machine.id)) {
       throw new Error('该机器已有传输进程在运行')
     }
 
-    ossService.configure(ossConfig)
+    const providers = providersForMode(settings.cloud.targetMode)
+    const uploaders = new Map<string, CloudTaskUploader>()
+    try {
+      for (const provider of providers) {
+        const validationError = getCloudUploadService().validateProvider(provider, settings)
+        if (validationError) throw new Error(validationError)
+        uploaders.set(
+          provider,
+          await getCloudUploadService().createTaskUploader(
+            provider,
+            settings,
+            settings.upload.multipartThreshold
+          )
+        )
+      }
+    } catch (err) {
+      for (const uploader of uploaders.values()) uploader.dispose()
+      throw err
+    }
 
     const client = new SSHClient()
     this.runningProcesses.set(machine.id, client)
@@ -175,19 +205,21 @@ export class SSHRsyncService {
           }
 
           try {
-            await this.sftpUploadDir(
+            const result = await this.sftpUploadDir(
               sftp,
               machine,
-              ossService,
-              ossConfig.prefix || '',
+              settings,
+              uploaders,
               onProgress
             )
             client.end()
             this.runningProcesses.delete(machine.id)
-            resolve()
+            for (const uploader of uploaders.values()) uploader.dispose()
+            resolve(result)
           } catch (uploadErr) {
             client.end()
             this.runningProcesses.delete(machine.id)
+            for (const uploader of uploaders.values()) uploader.dispose()
             reject(uploadErr)
           }
         })
@@ -200,21 +232,23 @@ export class SSHRsyncService {
   private async sftpUploadDir(
     sftp: SFTPWrapper,
     machine: SSHMachine,
-    ossService: OSSUploadService,
-    ossPrefix: string,
+    settings: AppSettings,
+    uploaders: Map<string, CloudTaskUploader>,
     onProgress?: (progress: SftpProgress) => void
-  ): Promise<void> {
+  ): Promise<MultiCloudOperationResult> {
     // 递归列出所有远程文件
     const files = await this.sftpListFiles(sftp, machine.remoteDir, machine.remoteDir)
     log.info(`SFTP 发现 ${files.length} 个文件`)
 
-    const folderName = posix.basename(machine.remoteDir)
+    const uploadRelativePath = resolveDirectoryUploadRelativePath(machine.remoteDir)
     let uploadedCount = 0
+    const providerResults = new Map<string, CloudOperationResult>()
+    for (const provider of uploaders.keys()) {
+      providerResults.set(provider, { provider: provider as CloudOperationResult['provider'], ok: true, keys: [] })
+    }
 
     for (const remoteFile of files) {
       const relativePath = remoteFile.slice(machine.remoteDir.length).replace(/^\//, '')
-      const ossKey = [ossPrefix, folderName, relativePath].filter(Boolean).join('/').replace(/\/+/g, '/')
-
       onProgress?.({
         machineId: machine.id,
         totalFiles: files.length,
@@ -223,7 +257,7 @@ export class SSHRsyncService {
         speed: ''
       })
 
-      // 通过 SFTP 流式读取并上传到 OSS
+      // 通过 SFTP 流式读取后上传到当前启用的云端
       await new Promise<void>((res, rej) => {
         const readStream = sftp.createReadStream(remoteFile)
         const chunks: Buffer[] = []
@@ -235,8 +269,35 @@ export class SSHRsyncService {
         readStream.on('end', async () => {
           try {
             const buffer = Buffer.concat(chunks)
-            await ossService.uploadBuffer(buffer, ossKey)
-            uploadedCount++
+            const active = Array.from(uploaders.entries()).filter(([provider]) => {
+              return providerResults.get(provider)?.ok
+            })
+            await Promise.all(
+              active.map(async ([provider, uploader]) => {
+                const prefix =
+                  provider === 'aliyun'
+                    ? settings.oss.prefix
+                    : settings.tencentS3.prefix
+                const objectKey = buildOssKey(
+                  prefix,
+                  uploadRelativePath,
+                  relativePath
+                )
+                try {
+                  await uploader.uploadBuffer(buffer, objectKey)
+                  providerResults.get(provider)?.keys?.push(objectKey)
+                } catch (err) {
+                  providerResults.set(provider, {
+                    provider: provider as CloudOperationResult['provider'],
+                    ok: false,
+                    error: err instanceof Error ? err.message : String(err)
+                  })
+                }
+              })
+            )
+            if (Array.from(providerResults.values()).every((result) => result.ok)) {
+              uploadedCount++
+            }
             res()
           } catch (e) {
             rej(e)
@@ -256,6 +317,11 @@ export class SSHRsyncService {
     })
 
     log.info(`SFTP 直传完成: ${uploadedCount}/${files.length} 个文件`)
+    const results = Array.from(providerResults.values())
+    return {
+      ok: results.every((result) => result.ok),
+      results
+    }
   }
 
   private sftpListFiles(sftp: SFTPWrapper, basePath: string, currentPath: string): Promise<string[]> {

@@ -41,8 +41,8 @@ JSON 文件与 PNG 同目录、同 base name。
 示例：
 
 ```text
-upload/batch_001/camera1/0001_annotation.png
-upload/batch_001/camera1/0001_annotation.json
+upload/2026-06-18/04-39-04/camera1/0001_annotation.png
+upload/2026-06-18/04-39-04/camera1/0001_annotation.json
 ```
 
 ### 原图不属于任务目录

@@ -238,7 +238,17 @@ export function AnnotationToolbar({ stageRef }: AnnotationToolbarProps) {
       if (result.ok) {
         setUploadStatus("ok");
       } else {
-        setUploadStatus(result.error || "上传失败");
+        setUploadStatus(
+          result.results
+            .filter((item) => !item.ok)
+            .map(
+              (item) =>
+                `${item.provider === "aliyun" ? "阿里云" : "腾讯云"}: ${
+                  item.error || "上传失败"
+                }`
+            )
+            .join("；") || "上传失败"
+        );
       }
     } catch (err) {
       setUploadStatus(String(err));
@@ -362,7 +372,7 @@ export function AnnotationToolbar({ stageRef }: AnnotationToolbarProps) {
             title={
               uploadStatus === "ok"
                 ? "已上传"
-                : uploadStatus || "上传标注到 OSS"
+                : uploadStatus || "上传标注到云端"
             }
           >
             {uploading ? (
@@ -370,7 +380,7 @@ export function AnnotationToolbar({ stageRef }: AnnotationToolbarProps) {
             ) : (
               <Upload className="h-4 w-4 mr-1" />
             )}
-            {uploadStatus === "ok" ? "已上传" : "上传 OSS"}
+            {uploadStatus === "ok" ? "已上传" : "上传云端"}
           </Button>
         )}
 

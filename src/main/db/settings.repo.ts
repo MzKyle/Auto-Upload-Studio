@@ -1,6 +1,8 @@
 import { getDb } from './database'
 import { DEFAULT_SETTINGS } from '@shared/constants'
 import type { AppSettings } from '@shared/types'
+import { basename, dirname, normalize } from 'path'
+import { isDateFolderName } from '@shared/day-folder'
 
 function normalizeSuffixes(suffixes: string[]): string[] {
   const normalized = suffixes
@@ -11,6 +13,19 @@ function normalizeSuffixes(suffixes: string[]): string[] {
   const unique = Array.from(new Set(normalized))
   if (!unique.includes('.csv')) unique.push('.csv')
   return unique
+}
+
+function normalizeScanDirectories(directories: string[]): string[] {
+  return Array.from(
+    new Set(
+      directories
+        .map((directory) => normalize(directory).replace(/[\\/]+$/, ''))
+        .filter(Boolean)
+        .map((directory) =>
+          isDateFolderName(basename(directory)) ? dirname(directory) : directory
+        )
+    )
+  )
 }
 
 export class SettingsRepo {
@@ -31,6 +46,16 @@ export class SettingsRepo {
       ) {
         const filter = parsed as Record<string, unknown>
         filter.suffixes = normalizeSuffixes(filter.suffixes as string[])
+      }
+      if (
+        key === 'scan' &&
+        typeof parsed === 'object' &&
+        parsed !== null &&
+        'directories' in (parsed as Record<string, unknown>) &&
+        Array.isArray((parsed as Record<string, unknown>).directories)
+      ) {
+        const scan = parsed as Record<string, unknown>
+        scan.directories = normalizeScanDirectories(scan.directories as string[])
       }
       return parsed
     } catch {
@@ -56,6 +81,19 @@ export class SettingsRepo {
         suffixes: normalizeSuffixes(filter.suffixes as string[])
       }
     }
+    if (
+      key === 'scan' &&
+      typeof value === 'object' &&
+      value !== null &&
+      'directories' in (value as Record<string, unknown>) &&
+      Array.isArray((value as Record<string, unknown>).directories)
+    ) {
+      const scan = value as Record<string, unknown>
+      persistedValue = {
+        ...scan,
+        directories: normalizeScanDirectories(scan.directories as string[])
+      }
+    }
 
     const serialized = typeof persistedValue === 'string' ? persistedValue : JSON.stringify(persistedValue)
     db.prepare(
@@ -69,7 +107,9 @@ export class SettingsRepo {
     const keys: Array<{ section: keyof AppSettings; key: string }> = [
       { section: 'scan', key: 'scan' },
       { section: 'upload', key: 'upload' },
+      { section: 'cloud', key: 'cloud' },
       { section: 'oss', key: 'oss' },
+      { section: 'tencentS3', key: 'tencentS3' },
       { section: 'filter', key: 'filter' },
       { section: 'webhook', key: 'webhook' },
       { section: 'stability', key: 'stability' },
