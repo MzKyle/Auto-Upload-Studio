@@ -1,62 +1,42 @@
 # 环境依赖
 
-## 运行环境
-
-本项目是 Electron 桌面应用，开发和打包主要依赖 Node.js 生态，同时部分功能依赖系统命令。
+## 开发与运行
 
 | 依赖 | 建议版本 | 用途 |
 | --- | --- | --- |
-| Node.js | 18+，建议 20 LTS | 安装依赖、运行 electron-vite、执行 TypeScript 构建 |
-| npm | 9+ | 包管理和脚本执行 |
-| Linux / Windows | Ubuntu、Debian、Windows 均可 | 应用运行与打包目标 |
-| 阿里云 OSS 账号 | 可写 Bucket | 上传文件、标注结果和 SFTP 直传数据 |
-| rsync | Linux 发行版包管理器安装 | 远程机器拉取模式 |
-| sshpass | 可选 | SSH 密码认证的 rsync 场景 |
+| Node.js | 18+，建议 20 LTS | electron-vite、TypeScript 和测试 |
+| npm | 9+ | 依赖和脚本 |
+| Linux / Windows | 当前支持平台 | 运行与打包 |
+| 阿里云 OSS 或腾讯 TurboS3 | 至少一个可写 Bucket | 云端归档 |
+| `rsync` | 可选 | 远程拉取 |
+| `sshpass` | 可选 | rsync 密码认证 |
 
-## OSS 信息准备
+Node.js 12 无法解析当前 TypeScript 和 `tsx` 工具链。
 
-首次使用前需要准备：
+## 云端准备
 
-- `Endpoint`，例如 `oss-cn-hangzhou.aliyuncs.com`
-- `Region`，例如 `oss-cn-hangzhou`
-- `Bucket`
-- `AccessKey ID`
-- `AccessKey Secret`
-- 可选 `Prefix`，用于把对象统一放到某个 OSS 前缀下
+阿里云需要 Region、Bucket、AK/SK，可选 Endpoint 和 Prefix。腾讯云需要 Endpoint、
+Region、Bucket、AK/SK，可选 Prefix；默认保持 TLS 校验。
 
-建议使用权限范围最小的 AK/SK，只授予目标 Bucket 的必要读写权限。连接测试会执行一次 `list` 请求，以验证当前配置确实能访问该 Bucket。
+连接测试需要列举 Bucket 的权限，实际上传还需要对象写入和分片上传权限。两个云端
+应使用彼此独立的最小权限凭据。
 
-## 远程同步准备
+## 远程同步
 
-如果需要使用远程机器页，需要额外确认：
+- 本机可访问远程 SSH 端口。
+- 密钥认证时私钥可读，远端已安装公钥。
+- rsync 模式要求本机和远端都安装 `rsync`。
+- 密码方式在 Linux 上需要 `sshpass`。
+- 本地落地目录应预留足够空间。
 
-- 本机可以访问远程机器的 SSH 端口，默认 `22`
-- 密钥认证时，本机存在私钥文件，并且远程机器已配置公钥
-- 密码认证时，Linux 上需要安装 `sshpass`
-- rsync 模式下，本机和远程机器都应安装 `rsync`
-- 远程目录和本地目录路径要填写完整，避免同步到非预期目录
-
-## 目录约定
-
-自动扫描模式以“父目录中的子目录”为任务单位。例如配置扫描目录为：
+## 数据目录
 
 ```text
-/data/upload_root
+/data/upload-root/
+  2026-06-18/
+    04-39-04/
+      file.csv
 ```
 
-应用会扫描：
-
-```text
-/data/upload_root/batch_001
-/data/upload_root/batch_002
-```
-
-每个子目录会被注册为一个上传任务。父目录本身不会作为任务上传。
-
-## 生产机建议
-
-- 为扫描目录、rsync 本地落地目录预留足够磁盘空间
-- 使用稳定网络或内网专线访问 OSS
-- 将上传时间窗口安排在网络空闲时段
-- 开启日志保留，并把异常日志纳入现场排查流程
-- 大批量文件场景下，先用小并发压测，再逐步提高并发配置
+设置中添加 `/data/upload-root`。日期目录必须是有效 `YYYY-MM-DD`，其直接子目录才
+会成为任务。

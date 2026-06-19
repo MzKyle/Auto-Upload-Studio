@@ -16,7 +16,7 @@
   - [总览](modules/README.md)
   - [目录扫描器](modules/scanner.md)
   - [任务队列与上传执行](modules/task-upload.md)
-  - [OSS 上传服务](modules/oss.md)
+  - [双云上传服务](modules/oss.md)
   - [SSH / rsync / SFTP](modules/remote-transfer.md)
   - [数采模式](modules/data-collect.md)
   - [图片标注窗口](modules/annotation.md)
@@ -30,7 +30,7 @@
 
 - **配置指南**
   - [设置总览](configuration/settings.md)
-  - [OSS 配置](configuration/oss-config.md)
+  - [云存储配置](configuration/oss-config.md)
   - [生产部署建议](configuration/production-config.md)
 
 - **接口参考**

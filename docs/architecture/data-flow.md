@@ -1,95 +1,66 @@
 # 数据流
 
-## 自动扫描上传流
+## 自动扫描与双云上传
 
 ```mermaid
 sequenceDiagram
-    participant User as 用户
-    participant UI as React 页面
-    participant Scanner as ScannerService
-    participant Queue as TaskQueueService
-    participant Runner as TaskRunnerService
-    participant DB as SQLite
-    participant OSS as Aliyun OSS
+  participant UI as Dashboard
+  participant Scanner as ScannerService
+  participant DB as SQLite
+  participant Queue as TaskQueueService
+  participant Runner as TaskRunnerService
+  participant Ali as Aliyun
+  participant Tencent as Tencent
 
-    User->>UI: 配置扫描目录与 OSS
-    UI->>Scanner: 启动或触发扫描
-    Scanner->>Scanner: 扫描父目录下子目录
-    Scanner->>Scanner: 多轮 size/mtime 稳定性检查
-    Scanner->>DB: 创建 pending 任务
-    Scanner->>Scanner: 写入 tmp_upload.json
-    Queue->>DB: 查询 pending 任务
-    Queue->>Queue: 判断上传时间窗口和并发槽位
-    Queue->>Runner: 启动任务
-    Runner->>DB: 状态改为 scanning / uploading
-    Runner->>Runner: 递归扫描并过滤文件
-    Runner->>DB: 注册 task_files
-    Runner->>OSS: 并发上传文件
-    Runner->>DB: 更新文件状态和任务进度
-    Runner->>UI: 广播 TASK_PROGRESS
-    Runner->>Scanner: 写入 process_task.json
-    Queue->>DB: 标记 completed 或 failed
+  UI->>Scanner: 触发扫描
+  Scanner->>Scanner: 发现日期/焊接目录并检查稳定性
+  Scanner->>DB: 创建 day_folder、逻辑任务和分云目标
+  Scanner->>Scanner: 写 tmp_upload.json
+  Queue->>DB: 获取 pending 任务
+  Queue->>Runner: 启动任务
+  Runner->>DB: 注册逻辑文件和分云文件目标
+  par 启用阿里云
+    Runner->>Ali: 上传未完成的阿里目标
+  and 启用腾讯云
+    Runner->>Tencent: 上传未完成的腾讯目标
+  end
+  Runner->>DB: 更新逐云和逻辑状态
+  Runner->>UI: 推送逐云进度与状态
+  Runner->>Runner: 写 process_task.json
+  Scanner->>DB: 汇总日期状态
+  Scanner->>Scanner: 跨天完成后写 day_upload.json
 ```
 
-## 远程 rsync 流
+双云部分失败时，成功目标保持完成；重试只重置指定提供方的失败状态。
 
-rsync 模式适合远程机器先把数据落到本机，再进入普通任务上传链路。
+## rsync 与 SFTP
 
 ```mermaid
-graph LR
-    Remote["远程机器目录"] --> RSYNC["rsync 拉取<br/>--partial --progress"]
-    RSYNC --> Local["本地落地目录"]
-    Local --> Marker["写 tmp_upload.json"]
-    Marker --> Task["创建 sourceType=rsync 任务"]
-    Task --> Queue["任务队列"]
-    Queue --> OSS["OSS 上传"]
+flowchart LR
+  Remote["远程目录"] --> Rsync["rsync"]
+  Rsync --> Local["本地落地目录"]
+  Local --> Task["普通上传任务"]
+  Task --> Cloud["CloudUploadService"]
+
+  Remote --> SFTP["SFTP 读取 Buffer"]
+  SFTP --> Direct["按当前模式直传云端"]
 ```
 
-rsync 完成后，应用会自动为 `localDir` 创建上传任务，并把来源记录为 `rsync`。
+`rsync` 进入普通任务链路，拥有 SQLite 状态、标记文件和历史。SFTP 返回逐云结果，
+但不创建普通任务历史。
 
-## SFTP 直传流
+## 标注上传
 
-SFTP 模式适合不希望在本地落盘的场景。服务会递归列出远程目录中的文件，通过 SFTP 读取 Buffer，然后调用 OSS Buffer 上传。
+标注 PNG/JSON 根据原图寻找最长匹配任务路径。找到任务时使用该任务对应提供方锁定的
+Prefix；未找到任务时使用当前提供方配置。操作返回逐云结果，不修改原任务状态。
 
-```mermaid
-graph LR
-    Remote["远程目录"] --> SFTP["SFTP 递归读取"]
-    SFTP --> Buffer["内存 Buffer"]
-    Buffer --> OSS["OSS put"]
-```
+## 进度事件
 
-当前实现会把单个文件读取成 Buffer 后上传，因此超大单文件场景更推荐使用 rsync 落盘上传，让 OSS 分片上传逻辑接管。
-
-## 标注上传流
-
-```mermaid
-sequenceDiagram
-    participant A as Annotation Window
-    participant IPC as 主进程 IPC
-    participant DB as TaskRepo
-    participant OSS as OSSUploadService
-
-    A->>IPC: 选择图片并读取 dataURL
-    A->>A: 绘制标注
-    A->>IPC: 导出 PNG 和 JSON
-    IPC->>IPC: 写入本地导出文件
-    A->>IPC: 上传标注结果
-    IPC->>DB: 查找包含原图的任务
-    IPC->>OSS: 上传 *_annotation.png
-    IPC->>OSS: 上传 *_annotation.json
-```
-
-如果原图属于某个任务目录，标注结果会沿用任务的 OSS 前缀和文件相对路径；如果匹配不到任务，则使用配置里的 OSS 前缀加图片名。
-
-## 进度事件流
-
-主进程通过事件向渲染窗口推送进度：
-
-| 事件 | 来源 | 内容 |
-| --- | --- | --- |
-| `task:progress` | `TaskRunnerService` | 已上传文件数、字节数、速度、当前文件 |
-| `task:status-change` | `TaskQueueService` / IPC 操作 | 任务状态变化 |
-| `scanner:event` | `ScannerService` | 扫描器运行状态、待稳定目录、最近扫描结果 |
-| `rsync:progress` | `SSHRsyncService` | rsync 百分比、速度、当前输出行 |
-| `sftp:progress` | `SSHRsyncService` | SFTP 文件总数、已传数量、当前文件 |
-| `data-collect:result` | `ScannerService` / IPC | 数采元信息 |
+| 事件 | 内容 |
+| --- | --- |
+| `task:progress` | `taskId + provider`、文件数、字节数、速度和当前文件 |
+| `task:destination-change` | 指定云端的任务状态和错误 |
+| `task:status-change` | 逻辑任务状态变化 |
+| `day-folder:event` | 日期汇总状态和统计 |
+| `scanner:event` | 扫描状态和待稳定目录 |
+| `rsync:progress` / `sftp:progress` | 远程传输进度 |
