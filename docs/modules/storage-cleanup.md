@@ -1,97 +1,35 @@
 # 历史、存储与清理
 
-## SQLite 存储
+## 历史视图
 
-应用使用 `better-sqlite3`，数据库文件为：
+历史数据来自 `task_destinations` 与逻辑任务的关联查询。页面按阿里或腾讯提供方分页
+显示完成/失败记录，并支持只重试失败的当前云端。日期汇总单独来自 `day_folders`。
 
-```text
-userData/uploader.db
-```
+逻辑任务已处于完成或失败时，删除单条云端历史会删除对应逻辑任务及其级联文件/目标
+记录；删除日期汇总只删除汇总记录。历史删除不会删除本地文件。
 
-初始化时会：
+## 设置
 
-- 启用 `journal_mode = WAL`
-- 启用外键
-- 创建 `tasks`
-- 创建 `task_files`
-- 创建 `ssh_machines`
-- 创建 `settings`
-- 为旧数据库补充 `ssh_machines.transfer_mode`
-
-## 历史记录
-
-历史记录不是单独的历史表，而是从 `tasks` 表中筛选：
-
-```text
-status IN ('completed', 'failed') AND completed_at IS NOT NULL
-```
-
-历史页展示：
-
-- 文件夹名
-- 文件数
-- 总大小
-- 从创建到完成的耗时
-- 成功/失败状态
-- 完成时间
-
-删除历史会删除对应任务，`task_files` 通过外键级联删除。
-
-## 设置存储
-
-设置按 key/value 写入 `settings` 表。每个 section 序列化为 JSON：
-
-- `scan`
-- `upload`
-- `oss`
-- `filter`
-- `webhook`
-- `stability`
-- `log`
-- `dataCollect`
-- `cleanup`
-
-读取时会与 `DEFAULT_SETTINGS` 合并，因此新增字段可以平滑获得默认值。
+设置以 section JSON 保存到 `settings` 表，包括 `cloud`、`oss`、`tencentS3`、
+`scan`、`upload`、`filter`、`stability`、`cleanup` 等。读取时与
+`DEFAULT_SETTINGS` 深度合并，使旧数据库获得新增默认字段。
 
 ## 自动清理
 
-`CleanupService` 用于释放本地磁盘空间。它只清理：
+清理服务启动 30 秒后执行一次，之后每小时执行，并可在任务完成或设置变化后重新
+调度。
 
-```text
-status = completed
-source_type IN ('local', 'rsync')
-completed_at < cutoff
-```
+清理顺序：
 
-不会清理：
+1. 查找已完成且超过保留天数的日期汇总，递归删除整个日期目录。
+2. 查找不属于日期汇总的已完成 `local` / `rsync` 任务并删除其目录。
 
-- 手动添加的任务，`sourceType=manual`
-- 失败任务
-- 未完成任务
-- 尚未超过保留天数的任务
+不会自动清理：
 
-## 清理触发时机
+- `manual` 来源任务。
+- 失败、暂停或未完成任务。
+- 双云中仍有一个目标未完成的任务。
+- 尚未超过保留天数的数据。
 
-- 应用启动后延迟 30 秒执行第一次计划清理
-- 之后每小时执行一次
-- 每个任务完成后会调度一次清理
-- 设置变更时，如果修改了清理配置，也会重新调度
-
-## 保留天数
-
-`retentionDays` 会被规范化为非负整数。
-
-| 值 | 行为 |
-| --- | --- |
-| `0` | 完成后尽快清理符合条件的目录 |
-| `7` | 默认保留 7 天 |
-| 非数字 | 回退到 7 天 |
-
-## 风险提示
-
-自动清理会递归删除任务目录。生产环境启用前应确认：
-
-- 扫描目录不是业务唯一副本
-- OSS 上传成功后对象可查
-- `sourceType=local` 和 `rsync` 的目录确实允许被清理
-- 手动添加的目录如需清理，应由用户自己管理
+`retentionDays=0` 表示完成后尽快清理；非法值回退为 7 天。启用前必须确认所有选定
+云端的归档结果可靠。

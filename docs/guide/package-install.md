@@ -1,71 +1,43 @@
 # 安装与打包
 
-## Linux 打包
+## 构建
 
 ```bash
 npm run build:linux
-```
-
-该命令会执行：
-
-1. `electron-vite build`
-2. 清理可能影响打包的 `node_modules/cpu-features`
-3. 使用 `electron-builder --linux --x64` 生成 Linux 包
-4. 重建 `better-sqlite3` 原生依赖
-
-产物会输出到：
-
-```text
-dist/
-```
-
-常见产物包括 `.deb` 和 AppImage。
-
-## Windows 打包
-
-```bash
 npm run build:win
-```
-
-如果需要同时打包 Linux 和 Windows：
-
-```bash
 npm run build:all
 ```
 
-## 安装 deb 包
+产物输出到 `dist/`。Linux 构建会处理 Electron 对应的 `better-sqlite3` 原生依赖。
 
-在 Ubuntu / Debian 系统中进入安装包所在目录：
+## Debian / Ubuntu
 
-```bash
-sudo dpkg -i electron-uploader_2.0.1_amd64.deb
-```
-
-如果出现依赖缺失：
+应用版本为 `2.0.2`，典型安装命令：
 
 ```bash
-sudo apt-get update
+sudo dpkg -i electron-uploader_2.0.2_amd64.deb
 sudo apt-get -f install -y
 ```
 
-然后再次安装。
+实际文件名以 `dist/` 产物为准。
 
 ## 安装后验证
 
-1. 从系统应用菜单启动应用。
-2. 打开“设置”页，配置 OSS 并测试连接。
-3. 添加扫描目录并触发扫描。
-4. 上传一个小目录，确认 OSS 中出现对应对象。
-5. 新增文件或新增子目录，验证后续扫描仍能继续上传。
+1. 启动应用并打开设置页。
+2. 选择上传模式，配置并测试所有启用云端。
+3. 添加包含 `YYYY-MM-DD` 日期目录的数据根目录。
+4. 创建一个新的焊接子目录并触发扫描。
+5. 确认对象路径包含日期和焊接目录。
+6. 双云模式下确认两个云端都完成后逻辑任务才完成。
 
-## better-sqlite3 打包问题
+## 原生模块问题
 
-如果 Linux 打包时报原生模块相关错误，可以先清理依赖后重装：
+确认使用 Node.js 18+，建议 20 LTS，然后重新安装依赖：
 
 ```bash
-rm -rf node_modules package-lock.json
+rm -rf node_modules
 npm install
 npm run build:linux
 ```
 
-如果仍失败，检查当前 Node 版本、Electron 版本和本机编译工具链是否匹配。
+不要为了修复构建而删除锁文件，除非明确需要重新生成依赖锁定结果。
