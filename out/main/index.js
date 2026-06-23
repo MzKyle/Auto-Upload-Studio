@@ -287,7 +287,7 @@ function initDatabase() {
   const dbPath = path.join(electron.app.getPath("userData"), "uploader.db");
   log.info("数据库路径:", dbPath);
   db = new Database(dbPath);
-  db.pragma("busy_timeout = 5000");
+  db.pragma("busy_timeout = 30000");
   db.pragma("journal_mode = WAL");
   db.pragma("foreign_keys = ON");
   log.info("开始检查数据库结构");
@@ -459,26 +459,7 @@ function runMigrations(db2) {
       log.info(`迁移: task_files 表添加 ${name} 列`);
     }
   }
-  db2.exec(`
-    UPDATE task_files
-    SET last_seen_at = COALESCE(last_seen_at, updated_at),
-        stable_count = CASE
-          WHEN stable_count = 0 AND status = 'completed' THEN 2
-          ELSE stable_count
-        END
-  `);
-  db2.exec(`
-    DELETE FROM task_files
-    WHERE rowid NOT IN (
-      SELECT MIN(rowid)
-      FROM task_files
-      GROUP BY task_id, relative_path
-    )
-  `);
-  db2.exec(`
-    CREATE UNIQUE INDEX IF NOT EXISTS idx_task_files_task_path
-    ON task_files(task_id, relative_path)
-  `);
+  ensureUniqueTaskFilePathIndex(db2);
   db2.exec(`
     CREATE INDEX IF NOT EXISTS idx_task_files_retry
     ON task_files(status, next_retry_at)
@@ -558,6 +539,43 @@ function runMigrations(db2) {
     db2.exec(`ALTER TABLE ssh_machines ADD COLUMN transfer_mode TEXT NOT NULL DEFAULT 'rsync'`);
     log.info("迁移: ssh_machines 表添加 transfer_mode 列");
   }
+}
+function ensureUniqueTaskFilePathIndex(db2) {
+  const existing = db2.prepare(
+    `SELECT 1
+     FROM sqlite_master
+     WHERE type = 'index' AND name = 'idx_task_files_task_path'`
+  ).get();
+  if (existing) return;
+  log.info("迁移: 开始创建任务文件路径索引");
+  try {
+    db2.exec(`
+      CREATE UNIQUE INDEX idx_task_files_task_path
+      ON task_files(task_id, relative_path)
+    `);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (!message.toLowerCase().includes("unique constraint failed")) {
+      throw error;
+    }
+    log.warn("迁移: 发现重复任务文件记录，开始清理");
+    const transaction = db2.transaction(() => {
+      db2.exec(`
+        DELETE FROM task_files
+        WHERE rowid NOT IN (
+          SELECT MIN(rowid)
+          FROM task_files
+          GROUP BY task_id, relative_path
+        )
+      `);
+      db2.exec(`
+        CREATE UNIQUE INDEX idx_task_files_task_path
+        ON task_files(task_id, relative_path)
+      `);
+    });
+    transaction();
+  }
+  log.info("迁移: 任务文件路径索引创建完成");
 }
 function reconcileStartupState(db2) {
   const now = (/* @__PURE__ */ new Date()).toISOString();
@@ -5029,6 +5047,7 @@ function getWebhookService() {
   return instance;
 }
 let logDir = "";
+let levelFileHookInstalled = false;
 function initLogger(config) {
   logDir = config?.directory || path.join(electron.app.getPath("userData"), "logs");
   if (!fs.existsSync(logDir)) {
@@ -5045,27 +5064,30 @@ function initLogger(config) {
   log.transports.file.level = "info";
   log.transports.file.format = "[{y}-{m}-{d} {h}:{i}:{s}.{ms}] [{level}] {text}";
   log.transports.file.maxSize = 10 * 1024 * 1024;
-  log.hooks.push((message) => {
-    if (!logDir) return message;
-    const level = message.level;
-    if (level === "error" || level === "warn") {
-      try {
-        const date = (/* @__PURE__ */ new Date()).toISOString().slice(0, 10);
-        const dir = path.join(logDir, date);
-        if (!fs.existsSync(dir)) {
-          fs.mkdirSync(dir, { recursive: true });
-        }
-        const fileName = level === "error" ? "error.log" : "warn.log";
-        const text = message.data?.map((d) => String(d)).join(" ") || "";
-        const ts = (/* @__PURE__ */ new Date()).toISOString().replace("T", " ").slice(0, 23);
-        const line = `[${ts}] [${level}] ${text}
+  if (!levelFileHookInstalled) {
+    log.hooks.push((message) => {
+      if (!logDir) return message;
+      const level = message.level;
+      if (level === "error" || level === "warn") {
+        try {
+          const date = (/* @__PURE__ */ new Date()).toISOString().slice(0, 10);
+          const dir = path.join(logDir, date);
+          if (!fs.existsSync(dir)) {
+            fs.mkdirSync(dir, { recursive: true });
+          }
+          const fileName = level === "error" ? "error.log" : "warn.log";
+          const text = message.data?.map((d) => String(d)).join(" ") || "";
+          const ts = (/* @__PURE__ */ new Date()).toISOString().replace("T", " ").slice(0, 23);
+          const line = `[${ts}] [${level}] ${text}
 `;
-        fs.appendFileSync(path.join(dir, fileName), line);
-      } catch {
+          fs.appendFileSync(path.join(dir, fileName), line);
+        } catch {
+        }
       }
-    }
-    return message;
-  });
+      return message;
+    });
+    levelFileHookInstalled = true;
+  }
   const maxDays = config?.maxDays || 30;
   cleanOldLogs(logDir, maxDays);
   log.info("日志系统初始化完成, 目录:", logDir);
@@ -5091,7 +5113,49 @@ function cleanOldLogs(dir, maxDays) {
 }
 let mainWindow = null;
 let annotationWindow = null;
+let startupWindow = null;
 let tray = null;
+const hasSingleInstanceLock = electron.app.requestSingleInstanceLock();
+if (!hasSingleInstanceLock) {
+  electron.app.quit();
+}
+electron.app.on("second-instance", () => {
+  const window = mainWindow || startupWindow;
+  if (!window || window.isDestroyed()) return;
+  if (window.isMinimized()) window.restore();
+  window.show();
+  window.focus();
+});
+async function createStartupWindow() {
+  startupWindow = new electron.BrowserWindow({
+    width: 460,
+    height: 220,
+    resizable: false,
+    minimizable: false,
+    maximizable: false,
+    show: false,
+    title: "数据采集上传工具正在启动",
+    backgroundColor: "#f8fafc",
+    webPreferences: {
+      sandbox: true,
+      contextIsolation: true,
+      nodeIntegration: false
+    }
+  });
+  startupWindow.once("ready-to-show", () => startupWindow?.show());
+  const html = `<!doctype html>
+    <html lang="zh-CN">
+      <head><meta charset="utf-8"><title>正在启动</title></head>
+      <body style="margin:0;font-family:sans-serif;background:#f8fafc;color:#0f172a">
+        <main style="height:220px;display:flex;flex-direction:column;align-items:center;justify-content:center">
+          <div style="font-size:18px;font-weight:600">数据采集上传工具正在启动</div>
+          <div style="margin-top:14px;font-size:14px;color:#475569">正在检查和升级本地数据库，请勿重复启动或强制关机。</div>
+          <div style="margin-top:8px;font-size:12px;color:#64748b">历史文件较多时首次升级可能需要几分钟。</div>
+        </main>
+      </body>
+    </html>`;
+  await startupWindow.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(html)}`);
+}
 function createWindow() {
   mainWindow = new electron.BrowserWindow({
     width: 1100,
@@ -5108,6 +5172,8 @@ function createWindow() {
     }
   });
   mainWindow.on("ready-to-show", () => {
+    startupWindow?.destroy();
+    startupWindow = null;
     mainWindow?.show();
   });
   mainWindow.on("close", (e) => {
@@ -5239,12 +5305,14 @@ function startServices() {
   getCleanupService().start();
   log.info("所有服务已启动");
 }
-electron.app.whenReady().then(() => {
+electron.app.whenReady().then(async () => {
+  if (!hasSingleInstanceLock) return;
   electronApp.setAppUserModelId("com.uploader.app");
   electron.app.on("browser-window-created", (_, window) => {
     optimizer.watchWindowShortcuts(window);
   });
   initLogger();
+  await createStartupWindow();
   initDatabase();
   const logConfig = getSettingsRepo().get("log");
   if (logConfig?.directory) {
@@ -5264,9 +5332,11 @@ electron.app.whenReady().then(() => {
 }).catch((error) => {
   const message = error instanceof Error ? error.message : String(error);
   log.error("应用启动失败:", error);
+  startupWindow?.destroy();
+  startupWindow = null;
   electron.dialog.showErrorBox(
     "数据采集上传工具启动失败",
-    `${message}
+    message.includes("database is locked") ? "数据库正在被另一个程序进程使用。请结束旧的数据采集上传工具进程后重试。" : `${message}
 
 请查看 ~/.config/electron-uploader/logs 下的日志。`
   );

@@ -5,6 +5,7 @@ import log from 'electron-log'
 import type { LogConfig } from '@shared/types'
 
 let logDir = ''
+let levelFileHookInstalled = false
 
 /**
  * 初始化日志系统
@@ -35,28 +36,31 @@ export function initLogger(config?: LogConfig): void {
   log.transports.file.maxSize = 10 * 1024 * 1024 // 10MB
 
   // 通过 hook 额外写入 error.log 和 warn.log
-  log.hooks.push((message) => {
-    if (!logDir) return message
+  if (!levelFileHookInstalled) {
+    log.hooks.push((message) => {
+      if (!logDir) return message
 
-    const level = message.level
-    if (level === 'error' || level === 'warn') {
-      try {
-        const date = new Date().toISOString().slice(0, 10)
-        const dir = join(logDir, date)
-        if (!existsSync(dir)) {
-          mkdirSync(dir, { recursive: true })
+      const level = message.level
+      if (level === 'error' || level === 'warn') {
+        try {
+          const date = new Date().toISOString().slice(0, 10)
+          const dir = join(logDir, date)
+          if (!existsSync(dir)) {
+            mkdirSync(dir, { recursive: true })
+          }
+          const fileName = level === 'error' ? 'error.log' : 'warn.log'
+          const text = message.data?.map((d: unknown) => String(d)).join(' ') || ''
+          const ts = new Date().toISOString().replace('T', ' ').slice(0, 23)
+          const line = `[${ts}] [${level}] ${text}\n`
+          appendFileSync(join(dir, fileName), line)
+        } catch {
+          // 忽略写入失败
         }
-        const fileName = level === 'error' ? 'error.log' : 'warn.log'
-        const text = message.data?.map((d: unknown) => String(d)).join(' ') || ''
-        const ts = new Date().toISOString().replace('T', ' ').slice(0, 23)
-        const line = `[${ts}] [${level}] ${text}\n`
-        appendFileSync(join(dir, fileName), line)
-      } catch {
-        // 忽略写入失败
       }
-    }
-    return message
-  })
+      return message
+    })
+    levelFileHookInstalled = true
+  }
 
   // 清理旧日志
   const maxDays = config?.maxDays || 30

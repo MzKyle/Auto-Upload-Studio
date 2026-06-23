@@ -23,7 +23,7 @@ export function initDatabase(): void {
   log.info('数据库路径:', dbPath)
 
   db = new Database(dbPath)
-  db.pragma('busy_timeout = 5000')
+  db.pragma('busy_timeout = 30000')
   db.pragma('journal_mode = WAL')
   db.pragma('foreign_keys = ON')
 
@@ -200,26 +200,7 @@ export function runMigrations(db: Database.Database): void {
       log.info(`迁移: task_files 表添加 ${name} 列`)
     }
   }
-  db.exec(`
-    UPDATE task_files
-    SET last_seen_at = COALESCE(last_seen_at, updated_at),
-        stable_count = CASE
-          WHEN stable_count = 0 AND status = 'completed' THEN 2
-          ELSE stable_count
-        END
-  `)
-  db.exec(`
-    DELETE FROM task_files
-    WHERE rowid NOT IN (
-      SELECT MIN(rowid)
-      FROM task_files
-      GROUP BY task_id, relative_path
-    )
-  `)
-  db.exec(`
-    CREATE UNIQUE INDEX IF NOT EXISTS idx_task_files_task_path
-    ON task_files(task_id, relative_path)
-  `)
+  ensureUniqueTaskFilePathIndex(db)
   db.exec(`
     CREATE INDEX IF NOT EXISTS idx_task_files_retry
     ON task_files(status, next_retry_at)
@@ -319,6 +300,46 @@ export function runMigrations(db: Database.Database): void {
     db.exec(`ALTER TABLE ssh_machines ADD COLUMN transfer_mode TEXT NOT NULL DEFAULT 'rsync'`)
     log.info('迁移: ssh_machines 表添加 transfer_mode 列')
   }
+}
+
+function ensureUniqueTaskFilePathIndex(db: Database.Database): void {
+  const existing = db.prepare(
+    `SELECT 1
+     FROM sqlite_master
+     WHERE type = 'index' AND name = 'idx_task_files_task_path'`
+  ).get()
+  if (existing) return
+
+  log.info('迁移: 开始创建任务文件路径索引')
+  try {
+    db.exec(`
+      CREATE UNIQUE INDEX idx_task_files_task_path
+      ON task_files(task_id, relative_path)
+    `)
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    if (!message.toLowerCase().includes('unique constraint failed')) {
+      throw error
+    }
+
+    log.warn('迁移: 发现重复任务文件记录，开始清理')
+    const transaction = db.transaction(() => {
+      db.exec(`
+        DELETE FROM task_files
+        WHERE rowid NOT IN (
+          SELECT MIN(rowid)
+          FROM task_files
+          GROUP BY task_id, relative_path
+        )
+      `)
+      db.exec(`
+        CREATE UNIQUE INDEX idx_task_files_task_path
+        ON task_files(task_id, relative_path)
+      `)
+    })
+    transaction()
+  }
+  log.info('迁移: 任务文件路径索引创建完成')
 }
 
 export function reconcileStartupState(db: Database.Database): void {

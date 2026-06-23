@@ -25,7 +25,52 @@ import log from 'electron-log'
 
 let mainWindow: BrowserWindow | null = null
 let annotationWindow: BrowserWindow | null = null
+let startupWindow: BrowserWindow | null = null
 let tray: Tray | null = null
+
+const hasSingleInstanceLock = app.requestSingleInstanceLock()
+if (!hasSingleInstanceLock) {
+  app.quit()
+}
+
+app.on('second-instance', () => {
+  const window = mainWindow || startupWindow
+  if (!window || window.isDestroyed()) return
+  if (window.isMinimized()) window.restore()
+  window.show()
+  window.focus()
+})
+
+async function createStartupWindow(): Promise<void> {
+  startupWindow = new BrowserWindow({
+    width: 460,
+    height: 220,
+    resizable: false,
+    minimizable: false,
+    maximizable: false,
+    show: false,
+    title: '数据采集上传工具正在启动',
+    backgroundColor: '#f8fafc',
+    webPreferences: {
+      sandbox: true,
+      contextIsolation: true,
+      nodeIntegration: false
+    }
+  })
+  startupWindow.once('ready-to-show', () => startupWindow?.show())
+  const html = `<!doctype html>
+    <html lang="zh-CN">
+      <head><meta charset="utf-8"><title>正在启动</title></head>
+      <body style="margin:0;font-family:sans-serif;background:#f8fafc;color:#0f172a">
+        <main style="height:220px;display:flex;flex-direction:column;align-items:center;justify-content:center">
+          <div style="font-size:18px;font-weight:600">数据采集上传工具正在启动</div>
+          <div style="margin-top:14px;font-size:14px;color:#475569">正在检查和升级本地数据库，请勿重复启动或强制关机。</div>
+          <div style="margin-top:8px;font-size:12px;color:#64748b">历史文件较多时首次升级可能需要几分钟。</div>
+        </main>
+      </body>
+    </html>`
+  await startupWindow.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(html)}`)
+}
 
 function createWindow(): void {
   mainWindow = new BrowserWindow({
@@ -44,6 +89,8 @@ function createWindow(): void {
   })
 
   mainWindow.on('ready-to-show', () => {
+    startupWindow?.destroy()
+    startupWindow = null
     mainWindow?.show()
   })
 
@@ -204,7 +251,8 @@ function startServices(): void {
   log.info('所有服务已启动')
 }
 
-app.whenReady().then(() => {
+app.whenReady().then(async () => {
+  if (!hasSingleInstanceLock) return
   electronApp.setAppUserModelId('com.uploader.app')
 
   app.on('browser-window-created', (_, window) => {
@@ -213,6 +261,8 @@ app.whenReady().then(() => {
 
   // 初始化日志系统（在数据库之前，使用默认配置）
   initLogger()
+
+  await createStartupWindow()
 
   // 初始化数据库
   initDatabase()
@@ -248,9 +298,13 @@ app.whenReady().then(() => {
 }).catch((error: unknown) => {
   const message = error instanceof Error ? error.message : String(error)
   log.error('应用启动失败:', error)
+  startupWindow?.destroy()
+  startupWindow = null
   dialog.showErrorBox(
     '数据采集上传工具启动失败',
-    `${message}\n\n请查看 ~/.config/electron-uploader/logs 下的日志。`
+    message.includes('database is locked')
+      ? '数据库正在被另一个程序进程使用。请结束旧的数据采集上传工具进程后重试。'
+      : `${message}\n\n请查看 ~/.config/electron-uploader/logs 下的日志。`
   )
   app.quit()
 })

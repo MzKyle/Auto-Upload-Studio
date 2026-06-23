@@ -260,3 +260,37 @@ test('startup reconciliation resumes existing sources and skips deleted sources'
   rmSync(root, { recursive: true, force: true })
   db.close()
 })
+
+test('migration removes legacy duplicate file rows before adding unique index', () => {
+  const db = createLegacyDatabase()
+  const now = new Date().toISOString()
+  db.prepare(`
+    INSERT INTO tasks (
+      id, folder_path, folder_name, status, oss_prefix, source_type,
+      created_at, updated_at
+    ) VALUES (?, ?, ?, 'pending', '', 'local', ?, ?)
+  `).run('duplicate-task', '/data/duplicate', 'duplicate', now, now)
+  const insertFile = db.prepare(`
+    INSERT INTO task_files (
+      id, task_id, relative_path, file_size, status, created_at, updated_at
+    ) VALUES (?, 'duplicate-task', 'same.jpg', 10, 'pending', ?, ?)
+  `)
+  insertFile.run('duplicate-file-1', now, now)
+  insertFile.run('duplicate-file-2', now, now)
+
+  runMigrations(db)
+
+  const count = db.prepare(
+    `SELECT COUNT(*) AS count
+     FROM task_files
+     WHERE task_id = 'duplicate-task' AND relative_path = 'same.jpg'`
+  ).get() as { count: number }
+  assert.equal(count.count, 1)
+  assert.ok(
+    db.prepare(
+      `SELECT 1 FROM sqlite_master
+       WHERE type = 'index' AND name = 'idx_task_files_task_path'`
+    ).get()
+  )
+  db.close()
+})
