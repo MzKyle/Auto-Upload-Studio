@@ -10,9 +10,9 @@ export const DEFAULT_SETTINGS = {
     intervalSeconds: 30
   },
   upload: {
-    maxConcurrentTasks: 5,
-    maxFilesPerTask: 6,
-    maxConcurrentUploads: 30,
+    maxConcurrentTasks: 4,
+    maxFilesPerTask: 12,
+    maxConcurrentUploads: 24,
     multipartThreshold: 100 * 1024 * 1024, // 100MB
     startAfterTime: '20:30',
     endBeforeTime: '23:59'
@@ -51,7 +51,7 @@ export const DEFAULT_SETTINGS = {
   hotkey: 'CommandOrControl+Shift+U',
   stability: {
     checkIntervalMs: 5000,
-    checkCount: 3
+    checkCount: 2
   },
   log: {
     directory: '',  // 空字符串表示使用默认 userData/logs
@@ -76,16 +76,20 @@ export const TASK_STATUS_LABELS: Record<string, string> = {
   pending: '等待中',
   scanning: '扫描中',
   uploading: '上传中',
+  synced: '已同步',
+  retrying: '自动重试中',
   completed: '已完成',
   failed: '失败',
-  paused: '已暂停'
+  paused: '已暂停',
+  skipped: '已跳过'
 }
 
 export const DAY_FOLDER_STATUS_LABELS: Record<string, string> = {
   collecting: '采集中',
   processing: '处理中',
   blocked: '有阻塞',
-  completed: '已完成'
+  completed: '已完成',
+  completed_with_skips: '已完成（含跳过）'
 }
 
 export const CLOUD_PROVIDER_LABELS = {

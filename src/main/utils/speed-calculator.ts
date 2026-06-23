@@ -10,9 +10,9 @@ export class SpeedCalculator {
     this.windowMs = windowMs
   }
 
-  addSample(bytes: number): void {
+  addSample(totalBytes: number): void {
     const now = Date.now()
-    this.samples.push({ time: now, bytes })
+    this.samples.push({ time: now, bytes: totalBytes })
     // 清理过期样本
     const cutoff = now - this.windowMs
     this.samples = this.samples.filter((s) => s.time >= cutoff)
@@ -30,8 +30,7 @@ export class SpeedCalculator {
     const timeDiff = (last.time - first.time) / 1000 // seconds
     if (timeDiff <= 0) return 0
 
-    const totalBytes = recent.reduce((sum, s) => sum + s.bytes, 0) - first.bytes
-    return Math.max(0, totalBytes / timeDiff)
+    return Math.max(0, (last.bytes - first.bytes) / timeDiff)
   }
 
   reset(): void {

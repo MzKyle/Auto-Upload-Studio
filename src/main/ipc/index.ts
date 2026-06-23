@@ -63,13 +63,22 @@ export function registerAllIpc(): void {
     return getTaskRepo().getById(args.taskId)
   })
 
+  ipcMain.handle(IPC.TASK_DETAIL, (_event, args: { taskId: string }) => {
+    const task = getTaskRepo().getById(args.taskId)
+    if (!task) throw new Error('任务不存在')
+    return {
+      task,
+      files: getTaskRepo().listFileDetails(args.taskId)
+    }
+  })
+
   ipcMain.handle(IPC.TASK_ADD_FOLDER, (_event, args: { folderPath: string }) => {
     const taskRepo = getTaskRepo()
     const settingsRepo = getSettingsRepo()
     const snapshot = getUploadTargetSnapshot(settingsRepo.getAll())
     const folderName = basename(args.folderPath)
     const uploadRelativePath = resolveDirectoryUploadRelativePath(args.folderPath)
-    return taskRepo.create({
+    const task = taskRepo.create({
       folderPath: args.folderPath,
       folderName,
       ossPrefix: snapshot.prefixes.aliyun,
@@ -78,6 +87,8 @@ export function registerAllIpc(): void {
       uploadRelativePath,
       sourceType: 'manual'
     })
+    getScannerService().reconcileTask(task)
+    return getTaskRepo().getById(task.id)
   })
 
   ipcMain.handle(IPC.TASK_PAUSE, (_event, args: { taskId: string }) => {
@@ -96,10 +107,27 @@ export function registerAllIpc(): void {
 
   ipcMain.handle(IPC.TASK_CANCEL, (_event, args: { taskId: string }) => {
     getTaskQueueService().cancelRunningTask(args.taskId)
-    getTaskRepo().updateStatus(args.taskId, 'failed', '用户取消')
-    getTaskDestinationRepo().updateIncompleteStatuses(args.taskId, 'failed', '用户取消')
+    getTaskRepo().skip(args.taskId, '用户跳过')
     getDayFolderService().refreshForTask(args.taskId)
-    broadcastStatusChange(args.taskId, 'failed')
+    broadcastStatusChange(args.taskId, 'skipped')
+  })
+
+  ipcMain.handle(IPC.TASK_SKIP, (_event, args: { taskId: string }) => {
+    getTaskQueueService().cancelRunningTask(args.taskId)
+    getTaskRepo().skip(args.taskId, '用户跳过')
+    getDayFolderService().refreshForTask(args.taskId)
+    broadcastStatusChange(args.taskId, 'skipped')
+  })
+
+  ipcMain.handle(IPC.TASK_RESTORE, (_event, args: { taskId: string }) => {
+    const task = getTaskRepo().getById(args.taskId)
+    if (!task) throw new Error('任务不存在')
+    if (!existsSync(task.folderPath)) throw new Error('源目录不存在，无法恢复')
+    getTaskRepo().restore(args.taskId)
+    const restored = getTaskRepo().getById(args.taskId)
+    if (restored) getScannerService().reconcileTask(restored)
+    getDayFolderService().refreshForTask(args.taskId)
+    broadcastStatusChange(args.taskId, 'scanning')
   })
 
   ipcMain.handle(IPC.TASK_RETRY, (_event, args: { taskId: string; provider?: CloudProvider }) => {
@@ -134,6 +162,31 @@ export function registerAllIpc(): void {
     getDayFolderRepo().deleteCompleted(args.id)
   })
 
+  ipcMain.handle(IPC.DAY_FOLDER_IGNORE, (_event, args: { id: string }) => {
+    const repo = getDayFolderRepo()
+    repo.setIgnored(args.id, true)
+    for (const task of repo.getChildTasks(args.id)) {
+      if (task.status === 'completed' || task.status === 'synced') continue
+      getTaskQueueService().cancelRunningTask(task.id)
+      getTaskRepo().skip(task.id, '用户忽略整个日期')
+      broadcastStatusChange(task.id, 'skipped')
+    }
+    return getDayFolderService().refresh(args.id)
+  })
+
+  ipcMain.handle(IPC.DAY_FOLDER_RESTORE, (_event, args: { id: string }) => {
+    const repo = getDayFolderRepo()
+    repo.setIgnored(args.id, false)
+    for (const task of repo.getChildTasks(args.id)) {
+      if (task.status !== 'skipped' || !existsSync(task.folderPath)) continue
+      getTaskRepo().restore(task.id)
+      const restored = getTaskRepo().getById(task.id)
+      if (restored) getScannerService().reconcileTask(restored)
+      broadcastStatusChange(task.id, 'scanning')
+    }
+    return getDayFolderService().refresh(args.id)
+  })
+
   // ---- 设置 ----
   ipcMain.handle(IPC.SETTINGS_GET_ALL, () => {
     return getSettingsRepo().getAll()
@@ -143,6 +196,10 @@ export function registerAllIpc(): void {
     getSettingsRepo().saveAll(data)
     if (data.cleanup !== undefined) {
       getCleanupService().scheduleCleanup()
+    }
+    if (data.scan !== undefined || data.stability !== undefined) {
+      getScannerService().stop()
+      getScannerService().start()
     }
     return { ok: true }
   })
@@ -225,7 +282,7 @@ export function registerAllIpc(): void {
       )
       const existing = taskRepo.getByFolderPath(localDir)
       if (!existing || existing.status === 'completed' || existing.status === 'failed') {
-        taskRepo.create({
+        const task = taskRepo.create({
           folderPath: localDir,
           folderName: basename(localDir),
           ossPrefix: snapshot.prefixes.aliyun,
@@ -235,6 +292,7 @@ export function registerAllIpc(): void {
           sourceType: 'rsync',
           sourceMachineId: machine.id
         })
+        getScannerService().reconcileTask(task)
         log.info('rsync 完成, 自动创建上传任务:', localDir)
       } else if (existing.uploadRelativePath !== uploadRelativePath) {
         taskRepo.updateUploadRelativePath(existing.id, uploadRelativePath)

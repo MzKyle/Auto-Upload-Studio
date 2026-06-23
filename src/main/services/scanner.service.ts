@@ -1,5 +1,6 @@
 import { readdirSync, statSync, existsSync } from 'fs'
 import { join } from 'path'
+import { watch, type FSWatcher } from 'chokidar'
 import { BrowserWindow } from 'electron'
 import log from 'electron-log'
 import { IPC } from '@shared/ipc-channels'
@@ -11,6 +12,8 @@ import { getDayFolderRepo } from '../db/day-folder.repo'
 import { getSettingsRepo } from '../db/settings.repo'
 import { getDataCollectService } from './data-collect.service'
 import { getDayFolderService } from './day-folder.service'
+import { getTaskQueueService } from './task-queue.service'
+import { FileFilterService } from './file-filter.service'
 import { discoverDayDirectories } from './date-directory-discovery'
 import {
   readProcessTask,
@@ -57,6 +60,9 @@ export class ScannerService {
   private nextScanAt: string | null = null
   private pendingDirs: Map<string, PendingDir> = new Map()
   private lastScanResults: ScannerStatus['lastScanResults'] = null
+  private watcher: FSWatcher | null = null
+  private reconcileTimers = new Map<string, ReturnType<typeof setTimeout>>()
+  private scanDebounceTimer: ReturnType<typeof setTimeout> | null = null
 
   start(): void {
     if (this.running) return
@@ -64,9 +70,11 @@ export class ScannerService {
 
     const settings = getSettingsRepo()
     const scanConfig = settings.get<ScanConfig>('scan')
+    const directories = scanConfig?.directories || []
     const intervalMs = (scanConfig?.intervalSeconds || 30) * 1000
 
     this.scan()
+    this.startWatcher(directories)
     this.timer = setInterval(() => this.scan(), intervalMs)
 
     const stabilityConfig = settings.get<StabilityConfig>('stability')
@@ -84,6 +92,16 @@ export class ScannerService {
     if (this.stabilityTimer) {
       clearInterval(this.stabilityTimer)
       this.stabilityTimer = null
+    }
+    if (this.watcher) {
+      void this.watcher.close()
+      this.watcher = null
+    }
+    for (const timer of this.reconcileTimers.values()) clearTimeout(timer)
+    this.reconcileTimers.clear()
+    if (this.scanDebounceTimer) {
+      clearTimeout(this.scanDebounceTimer)
+      this.scanDebounceTimer = null
     }
     this.running = false
     this.nextScanAt = null
@@ -153,6 +171,8 @@ export class ScannerService {
       }
     }
 
+    this.reconcileDeletedTasks(seenChildPaths, directories)
+
     this.lastScanAt = new Date().toISOString()
     this.nextScanAt = new Date(Date.now() + intervalMs).toISOString()
     this.lastScanResults = {
@@ -216,6 +236,20 @@ export class ScannerService {
         if (existingTask) {
           this.attachTaskToDayFolder(existingTask, dayFolder.id, uploadRelativePath)
           this.pendingDirs.delete(childPath)
+          if (
+            dayFolder.ignored &&
+            existingTask.status !== 'completed' &&
+            existingTask.status !== 'synced'
+          ) {
+            getTaskRepo().skip(existingTask.id, '用户忽略整个日期')
+            this.broadcastTaskStatus(
+              existingTask.id,
+              existingTask.status,
+              'skipped'
+            )
+          } else {
+            this.reconcileTask(getTaskRepo().getById(existingTask.id) || existingTask)
+          }
           existing++
           continue
         }
@@ -236,7 +270,7 @@ export class ScannerService {
 
         const tmpMarker = readTmpUpload(childPath)
         if (tmpMarker) {
-          this.registerNewDir({
+          const task = this.registerNewDir({
             path: childPath,
             dayFolderId: dayFolder.id,
             dateName,
@@ -248,13 +282,19 @@ export class ScannerService {
             uploadTargetMode: tmpMarker.metadata.uploadTargetMode,
             destinationPrefixes: tmpMarker.metadata.destinationPrefixes
           })
+          if (dayFolder.ignored) {
+            getTaskRepo().skip(task.id, '用户忽略整个日期')
+            this.broadcastTaskStatus(task.id, task.status, 'skipped')
+          } else {
+            this.reconcileTask(task)
+          }
           existing++
           continue
         }
 
         if (!this.pendingDirs.has(childPath)) {
-          log.info('发现新焊接目录, 加入稳定性检查:', childPath)
-          this.pendingDirs.set(childPath, {
+          log.info('发现新焊接目录, 注册持续同步任务:', childPath)
+          const pending: PendingDir = {
             path: childPath,
             dayFolderId: dayFolder.id,
             dateName,
@@ -263,7 +303,14 @@ export class ScannerService {
             checks: 0,
             discoveredAt: new Date().toISOString(),
             lastSnapshot: this.snapshotDir(childPath)
-          })
+          }
+          const task = this.registerNewDir(pending)
+          if (dayFolder.ignored) {
+            getTaskRepo().skip(task.id, '用户忽略整个日期')
+            this.broadcastTaskStatus(task.id, task.status, 'skipped')
+          } else {
+            this.reconcileTask(task)
+          }
           newFound++
         }
       }
@@ -276,43 +323,18 @@ export class ScannerService {
   }
 
   private checkStability(): void {
-    if (this.pendingDirs.size === 0) return
-
-    const settings = getSettingsRepo()
-    const stabilityConfig = settings.get<StabilityConfig>('stability')
-    const requiredChecks = stabilityConfig?.checkCount || 3
-    let changed = false
-
-    for (const [dirPath, pending] of this.pendingDirs) {
-      if (!existsSync(dirPath)) {
-        this.pendingDirs.delete(dirPath)
-        getDayFolderService().refresh(pending.dayFolderId)
-        changed = true
-        continue
-      }
-
-      const currentSnapshot = this.snapshotDir(dirPath)
-      const isStable = this.compareSnapshots(pending.lastSnapshot, currentSnapshot)
-
-      if (isStable) {
-        pending.checks++
-        log.info(`焊接目录稳定性检查 ${pending.checks}/${requiredChecks}:`, dirPath)
-
-        if (pending.checks >= requiredChecks) {
-          this.registerNewDir(pending)
-          this.pendingDirs.delete(dirPath)
-        }
-        changed = true
-      } else {
-        pending.checks = 0
-        pending.lastSnapshot = currentSnapshot
-        changed = true
+    for (const task of getTaskRepo().listByStatus()) {
+      if (
+        task.sourceType === 'local' &&
+        task.dayFolderId &&
+        task.status !== 'skipped' &&
+        task.status !== 'paused' &&
+        task.status !== 'completed'
+      ) {
+        this.reconcileTask(task)
       }
     }
-
-    if (changed) {
-      this.broadcastStatus()
-    }
+    this.broadcastStatus()
   }
 
   private registerNewDir(pending: PendingDir): Task {
@@ -353,6 +375,166 @@ export class ScannerService {
     this.collectDataInfo(pending.path)
     getDayFolderService().refresh(pending.dayFolderId)
     return task
+  }
+
+  private startWatcher(directories: string[]): void {
+    if (this.watcher) void this.watcher.close()
+    const existingDirectories = directories.filter((directory) =>
+      existsSync(directory)
+    )
+    if (existingDirectories.length === 0) return
+
+    this.watcher = watch(existingDirectories, {
+      ignoreInitial: true,
+      persistent: true,
+      awaitWriteFinish: false,
+      ignored: (path) => {
+        const normalized = path.replace(/\\/g, '/')
+        return (
+          normalized.includes('/.git/') ||
+          normalized.endsWith('/tmp_upload.json') ||
+          normalized.endsWith('/process_task.json') ||
+          normalized.endsWith('/day_upload.json')
+        )
+      }
+    })
+
+    this.watcher
+      .on('add', (path) => this.handleFileEvent(path))
+      .on('change', (path) => this.handleFileEvent(path))
+      .on('unlink', (path) => this.handleFileEvent(path))
+      .on('addDir', () => this.scheduleFullScan())
+      .on('unlinkDir', () => this.scheduleFullScan())
+      .on('error', (error) => log.warn('文件监控异常:', error))
+  }
+
+  private handleFileEvent(filePath: string): void {
+    const task = getTaskRepo().findTaskContainingFile(filePath)
+    if (!task || task.status === 'skipped') {
+      this.scheduleFullScan()
+      return
+    }
+    this.scheduleTaskReconcile(task.id)
+  }
+
+  private scheduleFullScan(): void {
+    if (this.scanDebounceTimer) clearTimeout(this.scanDebounceTimer)
+    this.scanDebounceTimer = setTimeout(() => {
+      this.scanDebounceTimer = null
+      this.scan()
+    }, 500)
+  }
+
+  private scheduleTaskReconcile(taskId: string): void {
+    const existing = this.reconcileTimers.get(taskId)
+    if (existing) clearTimeout(existing)
+    this.reconcileTimers.set(
+      taskId,
+      setTimeout(() => {
+        this.reconcileTimers.delete(taskId)
+        const task = getTaskRepo().getById(taskId)
+        if (task) this.reconcileTask(task)
+      }, 500)
+    )
+  }
+
+  reconcileTask(task: Task): void {
+    if (
+      task.status === 'skipped' ||
+      task.status === 'paused' ||
+      task.status === 'completed'
+    ) {
+      return
+    }
+    if (!existsSync(task.folderPath)) {
+      if (task.status !== 'synced') {
+        getTaskQueueService().cancelRunningTask(task.id)
+        getTaskRepo().skip(task.id, '源目录已删除')
+        getDayFolderService().refreshForTask(task.id)
+        this.broadcastTaskStatus(task.id, task.status, 'skipped')
+      }
+      return
+    }
+
+    try {
+      const settings = getSettingsRepo().getAll()
+      const files = new FileFilterService(settings.filter).scanFolder(task.folderPath)
+      const stableChecks =
+        task.sourceType === 'local' && task.dayFolderId
+          ? Math.max(2, settings.stability.checkCount || 2)
+          : 1
+      getTaskRepo().reconcileFiles(
+        task.id,
+        files.map((file) => ({
+          relativePath: file.relativePath,
+          size: file.size,
+          mtimeMs: file.mtimeMs
+        })),
+        stableChecks
+      )
+      const updated = getTaskRepo().getById(task.id)
+      if (updated && updated.status !== task.status) {
+        this.broadcastTaskStatus(task.id, task.status, updated.status)
+      }
+      getDayFolderService().refreshForTask(task.id)
+    } catch (err) {
+      if (!existsSync(task.folderPath)) {
+        getTaskQueueService().cancelRunningTask(task.id)
+        getTaskRepo().skip(task.id, '源目录已删除')
+        getDayFolderService().refreshForTask(task.id)
+        this.broadcastTaskStatus(task.id, task.status, 'skipped')
+        return
+      }
+      log.warn('持续同步校准失败:', task.folderPath, err)
+    }
+  }
+
+  private reconcileDeletedTasks(
+    seenChildPaths: Set<string>,
+    watchedDirectories: string[]
+  ): void {
+    const normalizedRoots = watchedDirectories.map((directory) =>
+      directory.replace(/[\\/]+$/, '')
+    )
+    for (const task of getTaskRepo().listByStatus()) {
+      if (task.sourceType !== 'local' || !task.dayFolderId) continue
+      if (
+        !normalizedRoots.some(
+          (root) =>
+            task.folderPath === root ||
+            task.folderPath.startsWith(`${root}/`) ||
+            task.folderPath.startsWith(`${root}\\`)
+        )
+      ) {
+        continue
+      }
+      if (seenChildPaths.has(task.folderPath) || existsSync(task.folderPath)) continue
+      if (
+        task.status === 'completed' ||
+        task.status === 'synced' ||
+        task.status === 'skipped'
+      ) {
+        continue
+      }
+      getTaskQueueService().cancelRunningTask(task.id)
+      getTaskRepo().skip(task.id, '源目录已删除')
+      getDayFolderService().refreshForTask(task.id)
+      this.broadcastTaskStatus(task.id, task.status, 'skipped')
+    }
+  }
+
+  private broadcastTaskStatus(
+    taskId: string,
+    oldStatus: Task['status'],
+    newStatus: Task['status']
+  ): void {
+    for (const win of BrowserWindow.getAllWindows()) {
+      win.webContents.send(IPC.TASK_STATUS_CHANGE, {
+        taskId,
+        oldStatus,
+        newStatus
+      })
+    }
   }
 
   private registerLegacyCompletedDir(

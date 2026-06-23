@@ -5,14 +5,22 @@ import {
   RotateCcw,
   X,
   ArrowUpFromLine,
+  ListTree,
 } from "lucide-react";
+import { useState } from "react";
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Progress } from "@/components/ui/progress";
 import { Badge } from "@/components/ui/badge";
 import { formatBytes, formatSpeed } from "@/lib/utils";
-import type { CloudProvider, Task, TaskProgress } from "@shared/types";
+import type {
+  CloudProvider,
+  Task,
+  TaskDetail,
+  TaskProgress,
+} from "@shared/types";
 import { CLOUD_PROVIDER_LABELS, TASK_STATUS_LABELS } from "@shared/constants";
+import { fetchTaskDetail } from "@/lib/ipc-client";
 
 const STATUS_VARIANT: Record<
   string,
@@ -21,9 +29,12 @@ const STATUS_VARIANT: Record<
   pending: "secondary",
   scanning: "warning",
   uploading: "default",
+  synced: "success",
+  retrying: "warning",
   completed: "success",
   failed: "destructive",
   paused: "outline",
+  skipped: "outline",
 };
 
 interface TaskCardProps {
@@ -34,6 +45,7 @@ interface TaskCardProps {
   onResume: (id: string) => void;
   onCancel: (id: string) => void;
   onRetry: (id: string, provider: CloudProvider) => void;
+  onRestore: (id: string) => void;
 }
 
 export function TaskCard({
@@ -44,7 +56,10 @@ export function TaskCard({
   onResume,
   onCancel,
   onRetry,
+  onRestore,
 }: TaskCardProps) {
+  const [detail, setDetail] = useState<TaskDetail | null>(null);
+  const [detailOpen, setDetailOpen] = useState(false);
   const destination = task.destinations.find((item) => item.provider === provider);
   if (!destination) return null;
   const status = destination.status;
@@ -54,6 +69,12 @@ export function TaskCard({
   const totalBytes = progress?.totalBytes ?? destination.totalBytes;
   const speed = progress?.speed ?? 0;
   const percent = totalFiles > 0 ? (uploadedFiles / totalFiles) * 100 : 0;
+  const loadDetail = async () => {
+    if (!detailOpen && !detail) {
+      setDetail(await fetchTaskDetail(task.id));
+    }
+    setDetailOpen((value) => !value);
+  };
 
   return (
     <Card className="mb-3">
@@ -102,14 +123,29 @@ export function TaskCard({
                 <RotateCcw className="h-3.5 w-3.5" />
               </Button>
             )}
+            {task.status === "skipped" && (
+              <Button
+                variant="ghost"
+                size="icon"
+                className="h-7 w-7"
+                title="恢复监控"
+                onClick={() => onRestore(task.id)}
+              >
+                <Play className="h-3.5 w-3.5" />
+              </Button>
+            )}
             {(task.status === "pending" ||
+              task.status === "scanning" ||
               task.status === "uploading" ||
-              task.status === "paused") && (
+              task.status === "retrying" ||
+              task.status === "paused" ||
+              task.status === "failed") && (
               <Button
                 variant="ghost"
                 size="icon"
                 className="h-7 w-7 text-destructive"
                 onClick={() => onCancel(task.id)}
+                title="跳过此工作次"
               >
                 <X className="h-3.5 w-3.5" />
               </Button>
@@ -136,6 +172,16 @@ export function TaskCard({
           )}
         </div>
 
+        {progress && (
+          <div className="text-xs text-muted-foreground mt-1 flex flex-wrap gap-3">
+            <span>排队 {progress.queuedFiles}</span>
+            <span>上传中 {progress.activeUploads}</span>
+            <span>失败 {progress.failedFiles}</span>
+            <span>跳过 {progress.skippedFiles}</span>
+            <span>本轮传输 {formatBytes(progress.transferredBytes)}</span>
+          </div>
+        )}
+
         {progress?.currentFile && status === "uploading" && (
           <div className="text-xs text-muted-foreground mt-1 truncate">
             正在上传: {progress.currentFile}
@@ -143,14 +189,60 @@ export function TaskCard({
         )}
 
         {destination.errorMessage && (
-          <div className="text-xs text-destructive mt-1 truncate">
+          <div className="text-xs text-destructive mt-1 whitespace-pre-wrap break-all">
             错误: {destination.errorMessage}
           </div>
         )}
 
-        <div className="text-xs text-muted-foreground mt-1">
-          {task.folderPath}
+        <div className="flex items-center justify-between mt-1 gap-2">
+          <div className="text-xs text-muted-foreground break-all">
+            {task.folderPath}
+          </div>
+          <Button variant="ghost" size="sm" onClick={loadDetail}>
+            <ListTree className="h-3.5 w-3.5 mr-1" />
+            {detailOpen ? "收起" : "文件详情"}
+          </Button>
         </div>
+
+        {detailOpen && detail && (
+          <div className="mt-2 max-h-56 overflow-auto rounded border text-xs">
+            {detail.files.length === 0 ? (
+              <div className="p-3 text-muted-foreground">尚未发现文件</div>
+            ) : (
+              detail.files.map((file) => {
+                const fileDestination = file.destinations.find(
+                  (item) => item.provider === provider,
+                );
+                return (
+                  <div
+                    key={`${file.id}:${provider}`}
+                    className="p-2 border-b last:border-b-0"
+                  >
+                    <div className="flex justify-between gap-3">
+                      <span className="break-all">{file.relativePath}</span>
+                      <span className="shrink-0 text-muted-foreground">
+                        {TASK_STATUS_LABELS[fileDestination?.status || file.status] ||
+                          fileDestination?.status ||
+                          file.status}
+                      </span>
+                    </div>
+                    {(fileDestination?.errorMessage || file.errorMessage) && (
+                      <div className="text-destructive mt-1 break-all">
+                        {fileDestination?.errorMessage || file.errorMessage}
+                      </div>
+                    )}
+                    {file.nextRetryAt && (
+                      <div className="text-muted-foreground mt-1">
+                        下次重试：
+                        {new Date(file.nextRetryAt).toLocaleString("zh-CN")}
+                      </div>
+                    )}
+                  </div>
+                );
+              })
+            )}
+          </div>
+        )}
       </CardContent>
     </Card>
   );

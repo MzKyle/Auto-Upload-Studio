@@ -1,6 +1,7 @@
 import Database from 'better-sqlite3'
 import { app } from 'electron'
 import { join } from 'path'
+import { existsSync } from 'fs'
 import log from 'electron-log'
 import { deriveDateScopedUploadRelativePath } from '@shared/day-folder'
 
@@ -11,6 +12,10 @@ export function getDb(): Database.Database {
     throw new Error('数据库未初始化')
   }
   return db
+}
+
+export function setDbForTests(database: Database.Database | null): void {
+  db = database
 }
 
 export function initDatabase(): void {
@@ -24,6 +29,7 @@ export function initDatabase(): void {
 
   log.info('开始检查数据库结构')
   runMigrations(db)
+  reconcileStartupState(db)
   log.info('数据库初始化完成')
 }
 
@@ -44,7 +50,8 @@ export function runMigrations(db: Database.Database): void {
       uploaded_bytes INTEGER NOT NULL DEFAULT 0,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL,
-      completed_at TEXT
+      completed_at TEXT,
+      ignored INTEGER NOT NULL DEFAULT 0
     );
 
     CREATE TABLE IF NOT EXISTS tasks (
@@ -78,6 +85,12 @@ export function runMigrations(db: Database.Database): void {
       oss_key TEXT,
       upload_id TEXT,
       error_message TEXT,
+      mtime_ms INTEGER NOT NULL DEFAULT 0,
+      last_seen_at TEXT,
+      source_status TEXT NOT NULL DEFAULT 'present',
+      stable_count INTEGER NOT NULL DEFAULT 0,
+      retry_count INTEGER NOT NULL DEFAULT 0,
+      next_retry_at TEXT,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL,
       FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE
@@ -165,6 +178,52 @@ export function runMigrations(db: Database.Database): void {
     log.info('迁移: tasks 表添加 upload_target_mode 列')
   }
   db.exec(`CREATE INDEX IF NOT EXISTS idx_tasks_day_folder_id ON tasks(day_folder_id)`)
+
+  const dayFolderColumns = db.pragma('table_info(day_folders)') as Array<{ name: string }>
+  if (!dayFolderColumns.some((c) => c.name === 'ignored')) {
+    db.exec(`ALTER TABLE day_folders ADD COLUMN ignored INTEGER NOT NULL DEFAULT 0`)
+    log.info('迁移: day_folders 表添加 ignored 列')
+  }
+
+  const taskFileColumns = db.pragma('table_info(task_files)') as Array<{ name: string }>
+  const taskFileAdditions = [
+    ['mtime_ms', `INTEGER NOT NULL DEFAULT 0`],
+    ['last_seen_at', `TEXT`],
+    ['source_status', `TEXT NOT NULL DEFAULT 'present'`],
+    ['stable_count', `INTEGER NOT NULL DEFAULT 0`],
+    ['retry_count', `INTEGER NOT NULL DEFAULT 0`],
+    ['next_retry_at', `TEXT`]
+  ] as const
+  for (const [name, definition] of taskFileAdditions) {
+    if (!taskFileColumns.some((column) => column.name === name)) {
+      db.exec(`ALTER TABLE task_files ADD COLUMN ${name} ${definition}`)
+      log.info(`迁移: task_files 表添加 ${name} 列`)
+    }
+  }
+  db.exec(`
+    UPDATE task_files
+    SET last_seen_at = COALESCE(last_seen_at, updated_at),
+        stable_count = CASE
+          WHEN stable_count = 0 AND status = 'completed' THEN 2
+          ELSE stable_count
+        END
+  `)
+  db.exec(`
+    DELETE FROM task_files
+    WHERE rowid NOT IN (
+      SELECT MIN(rowid)
+      FROM task_files
+      GROUP BY task_id, relative_path
+    )
+  `)
+  db.exec(`
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_task_files_task_path
+    ON task_files(task_id, relative_path)
+  `)
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_task_files_retry
+    ON task_files(status, next_retry_at)
+  `)
 
   const incompleteTasks = db.prepare(
     `SELECT id, folder_path, source_type, source_machine_id, upload_relative_path
@@ -260,4 +319,117 @@ export function runMigrations(db: Database.Database): void {
     db.exec(`ALTER TABLE ssh_machines ADD COLUMN transfer_mode TEXT NOT NULL DEFAULT 'rsync'`)
     log.info('迁移: ssh_machines 表添加 transfer_mode 列')
   }
+}
+
+export function reconcileStartupState(db: Database.Database): void {
+  const now = new Date().toISOString()
+  db.prepare(
+    `UPDATE task_files
+     SET status = 'pending', updated_at = ?
+     WHERE status = 'uploading'`
+  ).run(now)
+  db.prepare(
+    `UPDATE task_file_destinations
+     SET status = 'pending', updated_at = ?
+     WHERE status = 'uploading'`
+  ).run(now)
+
+  const unfinished = db.prepare(
+    `SELECT id, folder_path, source_type, status
+     FROM tasks
+     WHERE status NOT IN ('completed', 'synced', 'skipped')`
+  ).all() as Array<{
+    id: string
+    folder_path: string
+    source_type: string
+    status: string
+  }>
+
+  const resetTask = db.prepare(
+    `UPDATE tasks
+     SET status = 'pending', error_message = NULL, completed_at = NULL, updated_at = ?
+     WHERE id = ?`
+  )
+  const resetDestinations = db.prepare(
+    `UPDATE task_destinations
+     SET status = CASE
+           WHEN status IN ('completed', 'synced') THEN status
+           ELSE 'pending'
+         END,
+         error_message = NULL,
+         completed_at = CASE
+           WHEN status IN ('completed', 'synced') THEN completed_at
+           ELSE NULL
+         END,
+         updated_at = ?
+     WHERE task_id = ?`
+  )
+  const resetFiles = db.prepare(
+    `UPDATE task_files
+     SET status = CASE WHEN status = 'completed' THEN status ELSE 'pending' END,
+         error_message = NULL, retry_count = 0, next_retry_at = NULL,
+         updated_at = ?
+     WHERE task_id = ? AND source_status = 'present'`
+  )
+  const resetFileDestinations = db.prepare(
+    `UPDATE task_file_destinations
+     SET status = CASE WHEN status = 'completed' THEN status ELSE 'pending' END,
+         error_message = NULL, updated_at = ?
+     WHERE task_file_id IN (
+       SELECT id FROM task_files
+       WHERE task_id = ? AND source_status = 'present'
+     )`
+  )
+  const skipTask = db.prepare(
+    `UPDATE tasks
+     SET status = 'skipped', error_message = '源目录已删除',
+         completed_at = ?, updated_at = ?
+     WHERE id = ?`
+  )
+  const skipDestinations = db.prepare(
+    `UPDATE task_destinations
+     SET status = CASE
+           WHEN status IN ('completed', 'synced') THEN status
+           ELSE 'skipped'
+         END,
+         error_message = CASE
+           WHEN status IN ('completed', 'synced') THEN error_message
+           ELSE '源目录已删除'
+         END,
+         completed_at = COALESCE(completed_at, ?), updated_at = ?
+     WHERE task_id = ?`
+  )
+  const skipFiles = db.prepare(
+    `UPDATE task_files
+     SET source_status = 'missing',
+         status = CASE WHEN status = 'completed' THEN status ELSE 'skipped' END,
+         error_message = CASE WHEN status = 'completed' THEN error_message ELSE '源目录已删除' END,
+         next_retry_at = NULL, updated_at = ?
+     WHERE task_id = ?`
+  )
+  const skipFileDestinations = db.prepare(
+    `UPDATE task_file_destinations
+     SET status = CASE WHEN status = 'completed' THEN status ELSE 'skipped' END,
+         error_message = CASE WHEN status = 'completed' THEN error_message ELSE '源目录已删除' END,
+         updated_at = ?
+     WHERE task_file_id IN (SELECT id FROM task_files WHERE task_id = ?)`
+  )
+
+  const transaction = db.transaction(() => {
+    for (const task of unfinished) {
+      const monitorable = task.source_type === 'local' || task.source_type === 'rsync'
+      if (monitorable && !existsSync(task.folder_path)) {
+        skipTask.run(now, now, task.id)
+        skipDestinations.run(now, now, task.id)
+        skipFiles.run(now, task.id)
+        skipFileDestinations.run(now, task.id)
+        continue
+      }
+      resetTask.run(now, task.id)
+      resetDestinations.run(now, task.id)
+      resetFiles.run(now, task.id)
+      resetFileDestinations.run(now, task.id)
+    }
+  })
+  transaction()
 }

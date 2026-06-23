@@ -39,6 +39,9 @@ export function deriveLogicalFileStatus(statuses: FileStatus[]): FileStatus {
     return 'completed'
   }
   if (statuses.some((status) => status === 'failed')) return 'failed'
+  if (statuses.length > 0 && statuses.every((status) => status === 'skipped')) {
+    return 'skipped'
+  }
   if (statuses.some((status) => status === 'uploading')) return 'uploading'
   return 'pending'
 }
@@ -49,7 +52,17 @@ export function deriveTaskStatus(statuses: TaskStatus[]): TaskStatus {
   }
   if (statuses.some((status) => status === 'failed')) return 'failed'
   if (statuses.some((status) => status === 'paused')) return 'paused'
+  if (statuses.some((status) => status === 'retrying')) return 'retrying'
   if (statuses.some((status) => status === 'uploading')) return 'uploading'
   if (statuses.some((status) => status === 'scanning')) return 'scanning'
+  if (statuses.length > 0 && statuses.every((status) => status === 'skipped')) {
+    return 'skipped'
+  }
+  if (
+    statuses.length > 0 &&
+    statuses.every((status) => status === 'synced' || status === 'completed')
+  ) {
+    return 'synced'
+  }
   return 'pending'
 }

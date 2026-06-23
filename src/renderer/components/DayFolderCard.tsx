@@ -1,9 +1,10 @@
-import { CalendarDays } from "lucide-react";
+import { Ban, CalendarDays, Undo2 } from "lucide-react";
 import { Card, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Progress } from "@/components/ui/progress";
-import { formatBytes } from "@/lib/utils";
-import type { DayFolderSummary } from "@shared/types";
+import { Button } from "@/components/ui/button";
+import { formatBytes, formatSpeed } from "@/lib/utils";
+import type { DayFolderSummary, Task } from "@shared/types";
 import { DAY_FOLDER_STATUS_LABELS } from "@shared/constants";
 
 const STATUS_VARIANT: Record<
@@ -14,13 +15,28 @@ const STATUS_VARIANT: Record<
   processing: "default",
   blocked: "destructive",
   completed: "success",
+  completed_with_skips: "warning",
 };
 
-export function DayFolderCard({ dayFolder }: { dayFolder: DayFolderSummary }) {
+export function DayFolderCard({
+  dayFolder,
+  tasks = [],
+  speed = 0,
+  onIgnore,
+  onRestore,
+}: {
+  dayFolder: DayFolderSummary;
+  tasks?: Task[];
+  speed?: number;
+  onIgnore?: (id: string) => void;
+  onRestore?: (id: string) => void;
+}) {
   const percent =
     dayFolder.totalChildren > 0
       ? (dayFolder.completedChildren / dayFolder.totalChildren) * 100
       : 0;
+  const count = (statuses: Task["status"][]) =>
+    tasks.filter((task) => statuses.includes(task.status)).length;
 
   return (
     <Card className="mb-3">
@@ -33,11 +49,37 @@ export function DayFolderCard({ dayFolder }: { dayFolder: DayFolderSummary }) {
               {DAY_FOLDER_STATUS_LABELS[dayFolder.status]}
             </Badge>
           </div>
-          {dayFolder.completedAt && (
-            <span className="text-xs text-muted-foreground">
-              {new Date(dayFolder.completedAt).toLocaleString("zh-CN")}
-            </span>
-          )}
+          <div className="flex items-center gap-2">
+            {dayFolder.completedAt && (
+              <span className="text-xs text-muted-foreground">
+                {new Date(dayFolder.completedAt).toLocaleString("zh-CN")}
+              </span>
+            )}
+            {dayFolder.ignored ? (
+              onRestore && (
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => onRestore(dayFolder.id)}
+                >
+                  <Undo2 className="h-3.5 w-3.5 mr-1" />
+                  恢复日期
+                </Button>
+              )
+            ) : (
+              onIgnore && (
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="text-destructive hover:text-destructive"
+                  onClick={() => onIgnore(dayFolder.id)}
+                >
+                  <Ban className="h-3.5 w-3.5 mr-1" />
+                  忽略日期
+                </Button>
+              )
+            )}
+          </div>
         </div>
 
         <Progress value={percent} className="mb-2" />
@@ -51,6 +93,16 @@ export function DayFolderCard({ dayFolder }: { dayFolder: DayFolderSummary }) {
           <span>
             {formatBytes(dayFolder.uploadedBytes)} / {formatBytes(dayFolder.totalBytes)}
           </span>
+          {tasks.length > 0 && (
+            <>
+              <span>已同步 {count(["synced", "completed"])}</span>
+              <span>上传中 {count(["uploading", "scanning", "pending"])}</span>
+              <span>重试 {count(["retrying"])}</span>
+              <span>需处理 {count(["failed", "paused"])}</span>
+              <span>跳过 {count(["skipped"])}</span>
+            </>
+          )}
+          {speed > 0 && <span>总速度 {formatSpeed(speed)}</span>}
         </div>
         <div className="text-xs text-muted-foreground mt-1 truncate">
           {dayFolder.folderPath}

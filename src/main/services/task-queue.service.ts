@@ -15,9 +15,13 @@ import type { Task, TaskStatus, UploadConfig } from '@shared/types'
 export class TaskQueueService extends EventEmitter {
   private runningTasks: Map<string, { cancel: () => void }> = new Map()
   private processTimer: ReturnType<typeof setInterval> | null = null
-  private taskRunner: ((task: Task, signal: AbortSignal) => Promise<void>) | null = null
+  private taskRunner:
+    | ((task: Task, signal: AbortSignal) => Promise<TaskStatus>)
+    | null = null
 
-  setTaskRunner(runner: (task: Task, signal: AbortSignal) => Promise<void>): void {
+  setTaskRunner(
+    runner: (task: Task, signal: AbortSignal) => Promise<TaskStatus>
+  ): void {
     this.taskRunner = runner
   }
 
@@ -60,13 +64,13 @@ export class TaskQueueService extends EventEmitter {
     const uploadConfig = settings.get<UploadConfig>('upload')
     if (!this.isWithinUploadWindow(uploadConfig?.startAfterTime, uploadConfig?.endBeforeTime)) return
 
-    const maxConcurrent = uploadConfig?.maxConcurrentTasks || 5
+    const maxConcurrent = uploadConfig?.maxConcurrentTasks || 4
 
     const taskRepo = getTaskRepo()
     const availableSlots = maxConcurrent - this.runningTasks.size
     if (availableSlots <= 0) return
 
-    const pendingTasks = taskRepo.listByStatus('pending')
+    const pendingTasks = taskRepo.listRunnable()
     const eligibleTasks = pendingTasks.filter((task) =>
       this.isTaskEligibleForCurrentStartCycle(task, uploadConfig?.startAfterTime)
     )
@@ -91,18 +95,20 @@ export class TaskQueueService extends EventEmitter {
         newStatus: 'uploading'
       })
 
-      await this.taskRunner!(task, controller.signal)
+      const finalStatus = await this.taskRunner!(task, controller.signal)
 
       if (!controller.signal.aborted) {
-        taskRepo.updateStatus(task.id, 'completed')
+        taskRepo.updateStatus(task.id, finalStatus)
         getDayFolderService().refreshForTask(task.id)
-        getCleanupService().scheduleCleanup()
+        if (finalStatus === 'completed') {
+          getCleanupService().scheduleCleanup()
+        }
         this.emit('task:status-change', {
           taskId: task.id,
           oldStatus: 'uploading',
-          newStatus: 'completed'
+          newStatus: finalStatus
         })
-        log.info('任务完成:', task.folderPath)
+        log.info(`任务状态更新为 ${finalStatus}:`, task.folderPath)
       }
     } catch (err) {
       if (!controller.signal.aborted) {

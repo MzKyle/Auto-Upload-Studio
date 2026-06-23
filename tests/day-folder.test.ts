@@ -35,6 +35,13 @@ test('derives day folder status from all discovered child tasks', () => {
   assert.equal(determineDayFolderStatus('2026-06-17', ['completed', 'pending'], now), 'processing')
   assert.equal(determineDayFolderStatus('2026-06-17', ['completed', 'paused'], now), 'blocked')
   assert.equal(determineDayFolderStatus('2026-06-17', ['failed'], now), 'blocked')
+  assert.equal(determineDayFolderStatus('2026-06-17', ['synced', 'synced'], now), 'completed')
+  assert.equal(
+    determineDayFolderStatus('2026-06-17', ['synced', 'skipped'], now),
+    'completed_with_skips'
+  )
+  assert.equal(determineDayFolderStatus('2026-06-18', ['synced'], now), 'collecting')
+  assert.equal(determineDayFolderStatus('2026-06-17', ['retrying'], now), 'processing')
   assert.equal(determineDayFolderStatus('2026-06-17', [], now), 'collecting')
 })
 

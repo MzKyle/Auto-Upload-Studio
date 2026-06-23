@@ -17,14 +17,18 @@ export class DayFolderService {
     if (!summary) return null
 
     try {
-      if (summary.status === 'completed' && summary.completedAt) {
+      if (
+        (summary.status === 'completed' ||
+          summary.status === 'completed_with_skips') &&
+        summary.completedAt
+      ) {
         const children = repo.getChildTasks(dayFolderId)
         const marker: DayUploadMarker = {
           version: 1,
           dayFolderId: summary.id,
           date: summary.date,
           folderPath: summary.folderPath,
-          status: 'completed',
+          status: summary.status,
           totalChildren: summary.totalChildren,
           totalFiles: summary.totalFiles,
           uploadedFiles: summary.uploadedFiles,

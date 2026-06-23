@@ -39,6 +39,7 @@ function rowToRecord(row: Record<string, unknown>): DayFolderRecord {
     createdAt: row.created_at as string,
     updatedAt: row.updated_at as string,
     completedAt: (row.completed_at as string) || null,
+    ignored: Boolean(row.ignored),
     childFolders
   }
 }
@@ -80,7 +81,7 @@ export class DayFolderRepo {
       conditions.push('status = ?')
       params.push(query.status)
     } else if (query.includeCompleted === false) {
-      conditions.push("status != 'completed'")
+      conditions.push("status NOT IN ('completed', 'completed_with_skips')")
     }
 
     const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : ''
@@ -123,15 +124,22 @@ export class DayFolderRepo {
       latestByPath.get(normalizeFolderPath(join(record.folderPath, folderName))) || null
     )
     const childStatuses = childTasks.map((task) => task?.status || null)
-    const status = determineDayFolderStatus(record.date, childStatuses, now)
-    const completedChildren = childTasks.filter((task) => task?.status === 'completed').length
+    const status = record.ignored
+      ? 'completed_with_skips'
+      : determineDayFolderStatus(record.date, childStatuses, now)
+    const completedChildren = childTasks.filter(
+      (task) =>
+        task?.status === 'completed' ||
+        task?.status === 'synced' ||
+        task?.status === 'skipped'
+    ).length
     const totalFiles = childTasks.reduce((sum, task) => sum + (task?.totalFiles || 0), 0)
     const uploadedFiles = childTasks.reduce((sum, task) => sum + (task?.uploadedFiles || 0), 0)
     const totalBytes = childTasks.reduce((sum, task) => sum + (task?.totalBytes || 0), 0)
     const uploadedBytes = childTasks.reduce((sum, task) => sum + (task?.uploadedBytes || 0), 0)
     const updatedAt = new Date().toISOString()
     const completedAt =
-      status === 'completed'
+      status === 'completed' || status === 'completed_with_skips'
         ? record.completedAt || updatedAt
         : null
 
@@ -178,7 +186,8 @@ export class DayFolderRepo {
     const cutoff = new Date(Date.now() - retentionDays * 86400000).toISOString()
     const rows = getDb().prepare(
       `SELECT * FROM day_folders
-       WHERE status = 'completed' AND completed_at IS NOT NULL AND completed_at < ?
+       WHERE status IN ('completed', 'completed_with_skips')
+         AND completed_at IS NOT NULL AND completed_at < ?
        ORDER BY completed_at ASC`
     ).all(cutoff) as Record<string, unknown>[]
     return rows.map((row) => this.toSummary(rowToRecord(row)))
@@ -187,14 +196,28 @@ export class DayFolderRepo {
   clearCompleted(before?: string): void {
     const db = getDb()
     if (before) {
-      db.prepare("DELETE FROM day_folders WHERE status = 'completed' AND completed_at < ?").run(before)
+      db.prepare(
+        "DELETE FROM day_folders WHERE status IN ('completed', 'completed_with_skips') AND completed_at < ?"
+      ).run(before)
     } else {
-      db.prepare("DELETE FROM day_folders WHERE status = 'completed'").run()
+      db.prepare(
+        "DELETE FROM day_folders WHERE status IN ('completed', 'completed_with_skips')"
+      ).run()
     }
   }
 
   deleteCompleted(id: string): void {
-    getDb().prepare("DELETE FROM day_folders WHERE id = ? AND status = 'completed'").run(id)
+    getDb().prepare(
+      "DELETE FROM day_folders WHERE id = ? AND status IN ('completed', 'completed_with_skips')"
+    ).run(id)
+  }
+
+  setIgnored(id: string, ignored: boolean): void {
+    getDb().prepare(
+      `UPDATE day_folders
+       SET ignored = ?, updated_at = ?
+       WHERE id = ?`
+    ).run(ignored ? 1 : 0, new Date().toISOString(), id)
   }
 
   private getRecordById(id: string): DayFolderRecord | null {

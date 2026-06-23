@@ -31,12 +31,16 @@ export default function History() {
     const result = await fetchHistory({ page, pageSize, provider });
     setItems(result.items);
     setTotal(result.total);
+    const folders = await fetchDayFolders({
+      includeCompleted: true,
+      limit: 100,
+    });
     setDayFolders(
-      await fetchDayFolders({
-        status: "completed",
-        includeCompleted: true,
-        limit: 100,
-      })
+      folders.filter(
+        (folder) =>
+          folder.status === "completed" ||
+          folder.status === "completed_with_skips",
+      ),
     );
   }, [page, provider]);
 

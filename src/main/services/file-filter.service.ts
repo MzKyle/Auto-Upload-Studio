@@ -70,8 +70,20 @@ export class FileFilterService {
   /**
    * 递归扫描文件夹，返回过滤后的文件列表
    */
-  scanFolder(folderPath: string): Array<{ relativePath: string; absolutePath: string; size: number }> {
-    const results: Array<{ relativePath: string; absolutePath: string; size: number }> = []
+  scanFolder(
+    folderPath: string
+  ): Array<{
+    relativePath: string
+    absolutePath: string
+    size: number
+    mtimeMs: number
+  }> {
+    const results: Array<{
+      relativePath: string
+      absolutePath: string
+      size: number
+      mtimeMs: number
+    }> = []
     this.walkDir(folderPath, folderPath, results)
     return results
   }
@@ -79,7 +91,12 @@ export class FileFilterService {
   private walkDir(
     basePath: string,
     currentPath: string,
-    results: Array<{ relativePath: string; absolutePath: string; size: number }>
+    results: Array<{
+      relativePath: string
+      absolutePath: string
+      size: number
+      mtimeMs: number
+    }>
   ): void {
     const entries = readdirSync(currentPath, { withFileTypes: true })
     for (const entry of entries) {
@@ -98,7 +115,12 @@ export class FileFilterService {
         ) continue
         if (this.shouldInclude(relativePath)) {
           const stat = statSync(fullPath)
-          results.push({ relativePath, absolutePath: fullPath, size: stat.size })
+          results.push({
+            relativePath,
+            absolutePath: fullPath,
+            size: stat.size,
+            mtimeMs: stat.mtimeMs
+          })
         }
       }
     }

@@ -126,12 +126,12 @@ function startServices(): void {
 
   // 连接任务队列和执行器
   taskQueue.setTaskRunner(async (task, signal) => {
-    await taskRunner.run(task, signal)
-    if (signal.aborted) return
+    const finalStatus = await taskRunner.run(task, signal)
+    if (signal.aborted) return finalStatus
 
     // 上传完成后发送 webhook
     const webhookConfig = settingsRepo.get<WebhookConfig>('webhook')
-    if (webhookConfig?.enabled) {
+    if (webhookConfig?.enabled && finalStatus === 'completed') {
       const updatedTask = taskRepo.getById(task.id)
       if (updatedTask) {
         const createdAt = new Date(updatedTask.createdAt).getTime()
@@ -150,6 +150,7 @@ function startServices(): void {
         })
       }
     }
+    return finalStatus
   })
 
   // 监听任务失败事件发送 webhook
