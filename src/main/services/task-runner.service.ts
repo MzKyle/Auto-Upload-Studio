@@ -75,7 +75,7 @@ export class TaskRunnerService {
       task.uploadRelativePath = dateScopedUploadPath
     }
 
-    this.reconcileBeforeUpload(task, stableChecks)
+    await this.reconcileBeforeUpload(task, stableChecks)
     const destinations = destinationRepo.listByTask(task.id)
     if (destinations.length === 0) {
       throw new Error('任务没有配置任何上传目标')
@@ -225,9 +225,14 @@ export class TaskRunnerService {
     return finalStatus
   }
 
-  private reconcileBeforeUpload(task: Task, stableChecks: number): void {
+  private async reconcileBeforeUpload(
+    task: Task,
+    stableChecks: number
+  ): Promise<void> {
     const settings = getSettingsRepo().getAll()
-    const files = new FileFilterService(settings.filter).scanFolder(task.folderPath)
+    const files = await new FileFilterService(settings.filter).scanFolderAsync(
+      task.folderPath
+    )
     getTaskRepo().reconcileFiles(
       task.id,
       files.map((file) => ({

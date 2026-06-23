@@ -30,13 +30,13 @@ const log = require("electron-log");
 const uuid = require("uuid");
 const chokidar = require("chokidar");
 const events = require("events");
+const promises = require("fs/promises");
 const child_process = require("child_process");
 const ssh2 = require("ssh2");
 const https = require("https");
 const clientS3 = require("@aws-sdk/client-s3");
 const libStorage = require("@aws-sdk/lib-storage");
 const nodeHttpHandler = require("@smithy/node-http-handler");
-const promises = require("fs/promises");
 const is = {
   dev: !electron.app.isPackaged
 };
@@ -841,9 +841,52 @@ class TaskDestinationRepo {
     }));
   }
   listReadyFileTargets(taskId, requiredStableChecks, now = (/* @__PURE__ */ new Date()).toISOString()) {
-    return this.listFileTargets(taskId).filter(
-      (target) => target.status === "pending" && target.sourceStatus === "present" && target.stableCount >= requiredStableChecks && (!target.nextRetryAt || target.nextRetryAt <= now)
-    );
+    const rows = getDb().prepare(
+      `SELECT tfd.*, tf.task_id, tf.relative_path, tf.file_size,
+          tf.mtime_ms, tf.retry_count, tf.next_retry_at,
+          tf.source_status, tf.stable_count
+         FROM task_file_destinations tfd
+         INNER JOIN task_files tf ON tf.id = tfd.task_file_id
+         WHERE tf.task_id = ?
+           AND tfd.status = 'pending'
+           AND tf.source_status = 'present'
+           AND tf.stable_count >= ?
+           AND (tf.next_retry_at IS NULL OR tf.next_retry_at <= ?)
+         ORDER BY tf.created_at, tfd.provider`
+    ).all(taskId, requiredStableChecks, now);
+    return rows.map((row) => ({
+      ...rowToFileDestination(row),
+      taskId: row.task_id,
+      relativePath: row.relative_path,
+      fileSize: row.file_size,
+      mtimeMs: Number(row.mtime_ms || 0),
+      retryCount: Number(row.retry_count || 0),
+      nextRetryAt: row.next_retry_at || null,
+      sourceStatus: row.source_status || "present",
+      stableCount: Number(row.stable_count || 0)
+    }));
+  }
+  summarizeFileTargets(taskId, provider, now = (/* @__PURE__ */ new Date()).toISOString()) {
+    const row = getDb().prepare(
+      `SELECT
+         COUNT(*) AS total,
+         SUM(CASE WHEN tfd.status = 'failed' THEN 1 ELSE 0 END) AS failed,
+         SUM(CASE WHEN tfd.status = 'pending' THEN 1 ELSE 0 END) AS pending,
+         SUM(CASE
+           WHEN tfd.status = 'pending'
+            AND tf.next_retry_at IS NOT NULL
+            AND tf.next_retry_at > ?
+           THEN 1 ELSE 0 END) AS retry_waiting
+       FROM task_file_destinations tfd
+       INNER JOIN task_files tf ON tf.id = tfd.task_file_id
+       WHERE tf.task_id = ? AND tfd.provider = ?`
+    ).get(now, taskId, provider);
+    return {
+      total: row.total || 0,
+      failed: row.failed || 0,
+      pending: row.pending || 0,
+      retryWaiting: row.retry_waiting || 0
+    };
   }
   updateFileStatus(id, status, objectKey, uploadId, errorMessage) {
     const now = (/* @__PURE__ */ new Date()).toISOString();
@@ -978,6 +1021,17 @@ class TaskRepo {
       return db2.prepare("SELECT * FROM tasks WHERE status = ? ORDER BY created_at DESC").all(status).map(rowToTask);
     }
     return db2.prepare("SELECT * FROM tasks ORDER BY created_at DESC").all().map(rowToTask);
+  }
+  listContinuouslyMonitored(dateName) {
+    const rows = getDb().prepare(
+      `SELECT * FROM tasks
+       WHERE source_type = 'local'
+         AND day_folder_id IS NOT NULL
+         AND replace(upload_relative_path, '\\', '/') LIKE ?
+         AND status NOT IN ('skipped', 'paused', 'completed')
+       ORDER BY created_at ASC`
+    ).all(`${dateName}/%`);
+    return rows.map(rowToTask);
   }
   listRunnable(now = (/* @__PURE__ */ new Date()).toISOString()) {
     const rows = getDb().prepare(
@@ -1325,7 +1379,7 @@ class TaskRepo {
           updateChanged.run(file.size, file.mtimeMs, now, now, current.id);
           resetTargets.run(now, current.id);
           changed = true;
-        } else {
+        } else if (current.stableCount < Math.max(1, requiredStableChecks)) {
           updateStable.run(
             now,
             Math.max(1, requiredStableChecks),
@@ -1391,24 +1445,25 @@ class TaskRepo {
     for (const destination of getTaskDestinationRepo().listByTask(taskId)) {
       const destinationRepo = getTaskDestinationRepo();
       destinationRepo.recalculateProgress(taskId, destination.provider);
-      const targets = destinationRepo.listFileTargets(taskId, destination.provider);
-      if (targets.some((target) => target.status === "failed")) {
+      const summary = destinationRepo.summarizeFileTargets(
+        taskId,
+        destination.provider,
+        now
+      );
+      if (summary.failed > 0) {
         destinationRepo.updateStatus(
           taskId,
           destination.provider,
           "failed",
           "存在需要处理的上传失败文件"
         );
-      } else if (targets.some((target) => target.status === "pending")) {
-        const waitingForRetry = targets.some(
-          (target) => target.status === "pending" && Boolean(target.nextRetryAt && target.nextRetryAt > now)
-        );
+      } else if (summary.pending > 0) {
         destinationRepo.updateStatus(
           taskId,
           destination.provider,
-          waitingForRetry ? "retrying" : "pending"
+          summary.retryWaiting > 0 ? "retrying" : "pending"
         );
-      } else if (targets.length > 0) {
+      } else if (summary.total > 0) {
         destinationRepo.updateStatus(
           taskId,
           destination.provider,
@@ -2358,8 +2413,8 @@ class CleanupService {
   running = false;
   start() {
     if (this.timer) return;
-    this.scheduleCleanup(3e4);
-    this.timer = setInterval(() => this.cleanup(), 36e5);
+    this.scheduleCleanup(5 * 60 * 1e3);
+    this.timer = setInterval(() => void this.cleanup(), 36e5);
     log.info("自动清理服务已启动");
   }
   stop() {
@@ -2379,10 +2434,10 @@ class CleanupService {
     }
     this.pendingRun = setTimeout(() => {
       this.pendingRun = null;
-      this.cleanup();
+      void this.cleanup();
     }, Math.max(0, delayMs));
   }
-  cleanup() {
+  async cleanup() {
     if (this.running) return;
     this.running = true;
     try {
@@ -2404,7 +2459,7 @@ class CleanupService {
           if (!fs.existsSync(dayFolder.folderPath)) {
             continue;
           }
-          fs.rmSync(dayFolder.folderPath, { recursive: true, force: true });
+          await promises.rm(dayFolder.folderPath, { recursive: true, force: true });
           cleaned++;
           log.info(
             `自动清理: 已删除日期目录 ${dayFolder.folderPath} (日期目录ID: ${dayFolder.id}, 完成于: ${dayFolder.completedAt})`
@@ -2418,7 +2473,7 @@ class CleanupService {
           if (!fs.existsSync(task.folderPath)) {
             continue;
           }
-          fs.rmSync(task.folderPath, { recursive: true, force: true });
+          await promises.rm(task.folderPath, { recursive: true, force: true });
           cleaned++;
           log.info(`自动清理: 已删除 ${task.folderPath} (任务ID: ${task.id}, 完成于: ${task.completedAt})`);
         } catch (err) {
@@ -2449,16 +2504,25 @@ function getCleanupService() {
 class TaskQueueService extends events.EventEmitter {
   runningTasks = /* @__PURE__ */ new Map();
   processTimer = null;
+  initialProcessTimer = null;
   taskRunner = null;
   setTaskRunner(runner) {
     this.taskRunner = runner;
   }
   start() {
-    this.processTimer = setInterval(() => this.processQueue(), 2e3);
-    this.processQueue();
+    if (this.processTimer) return;
+    this.processTimer = setInterval(() => void this.processQueue(), 2e3);
+    this.initialProcessTimer = setTimeout(() => {
+      this.initialProcessTimer = null;
+      void this.processQueue();
+    }, 1500);
     log.info("任务队列已启动");
   }
   stop() {
+    if (this.initialProcessTimer) {
+      clearTimeout(this.initialProcessTimer);
+      this.initialProcessTimer = null;
+    }
     if (this.processTimer) {
       clearInterval(this.processTimer);
       this.processTimer = null;
@@ -2491,7 +2555,7 @@ class TaskQueueService extends events.EventEmitter {
     const eligibleTasks = pendingTasks.filter(
       (task) => this.isTaskEligibleForCurrentStartCycle(task, uploadConfig?.startAfterTime)
     );
-    const toRun = eligibleTasks.slice(0, availableSlots);
+    const toRun = eligibleTasks.slice(0, Math.min(availableSlots, 1));
     for (const task of toRun) {
       this.executeTask(task);
     }
@@ -2649,6 +2713,11 @@ class FileFilterService {
     this.walkDir(folderPath, folderPath, results);
     return results;
   }
+  async scanFolderAsync(folderPath) {
+    const results = [];
+    await this.walkDirAsync(folderPath, folderPath, results);
+    return results;
+  }
   walkDir(basePath, currentPath, results) {
     const entries = fs.readdirSync(currentPath, { withFileTypes: true });
     for (const entry of entries) {
@@ -2660,13 +2729,37 @@ class FileFilterService {
         const relativePath = fullPath.slice(basePath.length + 1);
         if (entry.name === "tmp_upload.json" || entry.name === "process_task.json" || entry.name === "day_upload.json") continue;
         if (this.shouldInclude(relativePath)) {
-          const stat = fs.statSync(fullPath);
+          const stat2 = fs.statSync(fullPath);
           results.push({
             relativePath,
             absolutePath: fullPath,
-            size: stat.size,
-            mtimeMs: stat.mtimeMs
+            size: stat2.size,
+            mtimeMs: stat2.mtimeMs
           });
+        }
+      }
+    }
+  }
+  async walkDirAsync(basePath, currentPath, results) {
+    const entries = await promises.readdir(currentPath, { withFileTypes: true });
+    for (const entry of entries) {
+      const fullPath = path.join(currentPath, entry.name);
+      if (entry.isDirectory()) {
+        if (entry.name.startsWith(".")) continue;
+        await this.walkDirAsync(basePath, fullPath, results);
+      } else if (entry.isFile()) {
+        const relativePath = fullPath.slice(basePath.length + 1);
+        if (entry.name === "tmp_upload.json" || entry.name === "process_task.json" || entry.name === "day_upload.json") continue;
+        if (!this.shouldInclude(relativePath)) continue;
+        try {
+          const fileStat = await promises.stat(fullPath);
+          results.push({
+            relativePath,
+            absolutePath: fullPath,
+            size: fileStat.size,
+            mtimeMs: fileStat.mtimeMs
+          });
+        } catch {
         }
       }
     }
@@ -2712,8 +2805,9 @@ class ScannerService {
   pendingDirs = /* @__PURE__ */ new Map();
   lastScanResults = null;
   watcher = null;
-  reconcileTimers = /* @__PURE__ */ new Map();
   scanDebounceTimer = null;
+  watcherErrorHandled = false;
+  lastWatcherWarningAt = 0;
   start() {
     if (this.running) return;
     this.running = true;
@@ -2721,9 +2815,9 @@ class ScannerService {
     const scanConfig = settings.get("scan");
     const directories = scanConfig?.directories || [];
     const intervalMs = (scanConfig?.intervalSeconds || 30) * 1e3;
-    this.scan();
     this.startWatcher(directories);
     this.timer = setInterval(() => this.scan(), intervalMs);
+    this.scheduleFullScan();
     const stabilityConfig = settings.get("stability");
     const checkInterval = stabilityConfig?.checkIntervalMs || 5e3;
     this.stabilityTimer = setInterval(() => this.checkStability(), checkInterval);
@@ -2742,8 +2836,6 @@ class ScannerService {
       void this.watcher.close();
       this.watcher = null;
     }
-    for (const timer of this.reconcileTimers.values()) clearTimeout(timer);
-    this.reconcileTimers.clear();
     if (this.scanDebounceTimer) {
       clearTimeout(this.scanDebounceTimer);
       this.scanDebounceTimer = null;
@@ -2863,8 +2955,6 @@ class ScannerService {
               existingTask.status,
               "skipped"
             );
-          } else {
-            this.reconcileTask(getTaskRepo().getById(existingTask.id) || existingTask);
           }
           existing++;
           continue;
@@ -2934,12 +3024,17 @@ class ScannerService {
     return { scanned, newFound, existing };
   }
   checkStability() {
-    for (const task of getTaskRepo().listByStatus()) {
-      if (task.sourceType === "local" && task.dayFolderId && task.status !== "skipped" && task.status !== "paused" && task.status !== "completed") {
-        this.reconcileTask(task);
-      }
+    const today = this.formatLocalDate(/* @__PURE__ */ new Date());
+    for (const task of getTaskRepo().listContinuouslyMonitored(today)) {
+      this.reconcileTask(task);
     }
     this.broadcastStatus();
+  }
+  formatLocalDate(date) {
+    const year = date.getFullYear();
+    const month = String(date.getMonth() + 1).padStart(2, "0");
+    const day = String(date.getDate()).padStart(2, "0");
+    return `${year}-${month}-${day}`;
   }
   registerNewDir(pending) {
     const settings = getSettingsRepo().getAll();
@@ -2978,6 +3073,7 @@ class ScannerService {
   }
   startWatcher(directories) {
     if (this.watcher) void this.watcher.close();
+    this.watcherErrorHandled = false;
     const existingDirectories = directories.filter(
       (directory) => fs.existsSync(directory)
     );
@@ -2986,20 +3082,15 @@ class ScannerService {
       ignoreInitial: true,
       persistent: true,
       awaitWriteFinish: false,
-      ignored: (path2) => {
+      // 只监听 根目录/日期目录/工作次目录 的目录结构。
+      // 文件变化由稳定性检查和 30 秒全量校准处理，避免大量小文件耗尽 inotify。
+      depth: 2,
+      ignored: (path2, stats) => {
         const normalized = path2.replace(/\\/g, "/");
-        return normalized.includes("/.git/") || normalized.endsWith("/tmp_upload.json") || normalized.endsWith("/process_task.json") || normalized.endsWith("/day_upload.json");
+        return stats?.isFile() === true || normalized.includes("/.git/") || normalized.endsWith("/tmp_upload.json") || normalized.endsWith("/process_task.json") || normalized.endsWith("/day_upload.json");
       }
     });
-    this.watcher.on("add", (path2) => this.handleFileEvent(path2)).on("change", (path2) => this.handleFileEvent(path2)).on("unlink", (path2) => this.handleFileEvent(path2)).on("addDir", () => this.scheduleFullScan()).on("unlinkDir", () => this.scheduleFullScan()).on("error", (error) => log.warn("文件监控异常:", error));
-  }
-  handleFileEvent(filePath) {
-    const task = getTaskRepo().findTaskContainingFile(filePath);
-    if (!task || task.status === "skipped") {
-      this.scheduleFullScan();
-      return;
-    }
-    this.scheduleTaskReconcile(task.id);
+    this.watcher.on("addDir", () => this.scheduleFullScan()).on("unlinkDir", () => this.scheduleFullScan()).on("error", (error) => this.handleWatcherError(error));
   }
   scheduleFullScan() {
     if (this.scanDebounceTimer) clearTimeout(this.scanDebounceTimer);
@@ -3008,17 +3099,25 @@ class ScannerService {
       this.scan();
     }, 500);
   }
-  scheduleTaskReconcile(taskId) {
-    const existing = this.reconcileTimers.get(taskId);
-    if (existing) clearTimeout(existing);
-    this.reconcileTimers.set(
-      taskId,
-      setTimeout(() => {
-        this.reconcileTimers.delete(taskId);
-        const task = getTaskRepo().getById(taskId);
-        if (task) this.reconcileTask(task);
-      }, 500)
-    );
+  handleWatcherError(error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const isResourceLimit = message.includes("ENOSPC") || message.includes("EMFILE") || message.includes("file watchers");
+    if (isResourceLimit && !this.watcherErrorHandled) {
+      this.watcherErrorHandled = true;
+      log.warn(
+        "目录事件监控达到系统资源上限，已关闭事件监听并回退到周期扫描:",
+        message
+      );
+      const watcher = this.watcher;
+      this.watcher = null;
+      if (watcher) void watcher.close();
+      return;
+    }
+    const now = Date.now();
+    if (now - this.lastWatcherWarningAt >= 6e4) {
+      this.lastWatcherWarningAt = now;
+      log.warn("目录事件监控异常，周期扫描仍会继续:", message);
+    }
   }
   reconcileTask(task) {
     if (task.status === "skipped" || task.status === "paused" || task.status === "completed") {
@@ -4525,7 +4624,7 @@ class TaskRunnerService {
       taskRepo.updateUploadRelativePath(task.id, dateScopedUploadPath);
       task.uploadRelativePath = dateScopedUploadPath;
     }
-    this.reconcileBeforeUpload(task, stableChecks);
+    await this.reconcileBeforeUpload(task, stableChecks);
     const destinations = destinationRepo.listByTask(task.id);
     if (destinations.length === 0) {
       throw new Error("任务没有配置任何上传目标");
@@ -4663,9 +4762,11 @@ class TaskRunnerService {
     );
     return finalStatus;
   }
-  reconcileBeforeUpload(task, stableChecks) {
+  async reconcileBeforeUpload(task, stableChecks) {
     const settings = getSettingsRepo().getAll();
-    const files = new FileFilterService(settings.filter).scanFolder(task.folderPath);
+    const files = await new FileFilterService(settings.filter).scanFolderAsync(
+      task.folderPath
+    );
     getTaskRepo().reconcileFiles(
       task.id,
       files.map((file) => ({
@@ -5048,6 +5149,8 @@ function getWebhookService() {
 }
 let logDir = "";
 let levelFileHookInstalled = false;
+const LEVEL_LOG_MAX_SIZE = 10 * 1024 * 1024;
+const LEVEL_LOG_DISCARD_SIZE = 50 * 1024 * 1024;
 function initLogger(config) {
   logDir = config?.directory || path.join(electron.app.getPath("userData"), "logs");
   if (!fs.existsSync(logDir)) {
@@ -5064,6 +5167,7 @@ function initLogger(config) {
   log.transports.file.level = "info";
   log.transports.file.format = "[{y}-{m}-{d} {h}:{i}:{s}.{ms}] [{level}] {text}";
   log.transports.file.maxSize = 10 * 1024 * 1024;
+  prepareCurrentLevelLogs();
   if (!levelFileHookInstalled) {
     log.hooks.push((message) => {
       if (!logDir) return message;
@@ -5080,7 +5184,9 @@ function initLogger(config) {
           const ts = (/* @__PURE__ */ new Date()).toISOString().replace("T", " ").slice(0, 23);
           const line = `[${ts}] [${level}] ${text}
 `;
-          fs.appendFileSync(path.join(dir, fileName), line);
+          const filePath = path.join(dir, fileName);
+          rotateLevelLog(filePath);
+          fs.appendFileSync(filePath, line);
         } catch {
         }
       }
@@ -5091,6 +5197,27 @@ function initLogger(config) {
   const maxDays = config?.maxDays || 30;
   cleanOldLogs(logDir, maxDays);
   log.info("日志系统初始化完成, 目录:", logDir);
+}
+function prepareCurrentLevelLogs() {
+  const date = (/* @__PURE__ */ new Date()).toISOString().slice(0, 10);
+  const dir = path.join(logDir, date);
+  if (!fs.existsSync(dir)) return;
+  rotateLevelLog(path.join(dir, "warn.log"));
+  rotateLevelLog(path.join(dir, "error.log"));
+}
+function rotateLevelLog(filePath) {
+  if (!fs.existsSync(filePath)) {
+    return;
+  }
+  const size = fs.statSync(filePath).size;
+  if (size < LEVEL_LOG_MAX_SIZE) return;
+  if (size >= LEVEL_LOG_DISCARD_SIZE) {
+    fs.rmSync(filePath, { force: true });
+    return;
+  }
+  const oldPath = filePath.replace(/\.log$/, ".old.log");
+  fs.rmSync(oldPath, { force: true });
+  fs.renameSync(filePath, oldPath);
 }
 function cleanOldLogs(dir, maxDays) {
   try {
@@ -5115,6 +5242,7 @@ let mainWindow = null;
 let annotationWindow = null;
 let startupWindow = null;
 let tray = null;
+let servicesStarted = false;
 const hasSingleInstanceLock = electron.app.requestSingleInstanceLock();
 if (!hasSingleInstanceLock) {
   electron.app.quit();
@@ -5175,6 +5303,16 @@ function createWindow() {
     startupWindow?.destroy();
     startupWindow = null;
     mainWindow?.show();
+    if (!servicesStarted) {
+      servicesStarted = true;
+      setTimeout(() => {
+        try {
+          startServices();
+        } catch (error) {
+          log.error("后台服务启动失败:", error);
+        }
+      }, 500);
+    }
   });
   mainWindow.on("close", (e) => {
     if (!electron.app.isQuitting) {
@@ -5292,12 +5430,7 @@ function startServices() {
   });
   const unfinished = taskRepo.getUnfinishedTasks();
   if (unfinished.length > 0) {
-    log.info(`发现 ${unfinished.length} 个未完成任务，重新加入队列`);
-    for (const task of unfinished) {
-      if (task.status === "uploading" || task.status === "scanning") {
-        taskRepo.retry(task.id);
-      }
-    }
+    log.info(`发现 ${unfinished.length} 个未完成任务，等待后台队列分批恢复`);
   }
   taskQueue.start();
   const scanner = getScannerService();
@@ -5312,6 +5445,22 @@ electron.app.whenReady().then(async () => {
     optimizer.watchWindowShortcuts(window);
   });
   initLogger();
+  process.on("uncaughtException", (error) => {
+    log.error("主进程未捕获异常:", error);
+  });
+  process.on("unhandledRejection", (reason) => {
+    log.error("主进程未处理 Promise 异常:", reason);
+  });
+  electron.app.on("render-process-gone", (_event, webContents, details) => {
+    log.error("渲染进程异常退出:", {
+      reason: details.reason,
+      exitCode: details.exitCode,
+      url: webContents.getURL()
+    });
+  });
+  electron.app.on("child-process-gone", (_event, details) => {
+    log.error("Electron 子进程异常退出:", details);
+  });
   await createStartupWindow();
   initDatabase();
   const logConfig = getSettingsRepo().get("log");
@@ -5322,8 +5471,7 @@ electron.app.whenReady().then(async () => {
   createWindow();
   createTray();
   registerHotkey();
-  startServices();
-  log.info("应用启动完成");
+  log.info("应用界面初始化完成，后台服务将在窗口显示后启动");
   electron.app.on("activate", () => {
     if (electron.BrowserWindow.getAllWindows().length === 0) {
       createWindow();

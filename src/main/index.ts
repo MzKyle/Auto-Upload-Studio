@@ -27,6 +27,7 @@ let mainWindow: BrowserWindow | null = null
 let annotationWindow: BrowserWindow | null = null
 let startupWindow: BrowserWindow | null = null
 let tray: Tray | null = null
+let servicesStarted = false
 
 const hasSingleInstanceLock = app.requestSingleInstanceLock()
 if (!hasSingleInstanceLock) {
@@ -92,6 +93,16 @@ function createWindow(): void {
     startupWindow?.destroy()
     startupWindow = null
     mainWindow?.show()
+    if (!servicesStarted) {
+      servicesStarted = true
+      setTimeout(() => {
+        try {
+          startServices()
+        } catch (error) {
+          log.error('后台服务启动失败:', error)
+        }
+      }, 500)
+    }
   })
 
   // 关闭时隐藏到托盘而不是退出
@@ -230,12 +241,7 @@ function startServices(): void {
   // 恢复未完成的任务
   const unfinished = taskRepo.getUnfinishedTasks()
   if (unfinished.length > 0) {
-    log.info(`发现 ${unfinished.length} 个未完成任务，重新加入队列`)
-    for (const task of unfinished) {
-      if (task.status === 'uploading' || task.status === 'scanning') {
-        taskRepo.retry(task.id)
-      }
-    }
+    log.info(`发现 ${unfinished.length} 个未完成任务，等待后台队列分批恢复`)
   }
 
   // 启动任务队列
@@ -261,6 +267,22 @@ app.whenReady().then(async () => {
 
   // 初始化日志系统（在数据库之前，使用默认配置）
   initLogger()
+  process.on('uncaughtException', (error) => {
+    log.error('主进程未捕获异常:', error)
+  })
+  process.on('unhandledRejection', (reason) => {
+    log.error('主进程未处理 Promise 异常:', reason)
+  })
+  app.on('render-process-gone', (_event, webContents, details) => {
+    log.error('渲染进程异常退出:', {
+      reason: details.reason,
+      exitCode: details.exitCode,
+      url: webContents.getURL()
+    })
+  })
+  app.on('child-process-gone', (_event, details) => {
+    log.error('Electron 子进程异常退出:', details)
+  })
 
   await createStartupWindow()
 
@@ -285,10 +307,7 @@ app.whenReady().then(async () => {
   // 注册全局快捷键
   registerHotkey()
 
-  // 启动后端服务
-  startServices()
-
-  log.info('应用启动完成')
+  log.info('应用界面初始化完成，后台服务将在窗口显示后启动')
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) {

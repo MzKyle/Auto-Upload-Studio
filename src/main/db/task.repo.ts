@@ -70,6 +70,18 @@ export class TaskRepo {
     return (db.prepare('SELECT * FROM tasks ORDER BY created_at DESC').all() as Record<string, unknown>[]).map(rowToTask)
   }
 
+  listContinuouslyMonitored(dateName: string): Task[] {
+    const rows = getDb().prepare(
+      `SELECT * FROM tasks
+       WHERE source_type = 'local'
+         AND day_folder_id IS NOT NULL
+         AND replace(upload_relative_path, '\\', '/') LIKE ?
+         AND status NOT IN ('skipped', 'paused', 'completed')
+       ORDER BY created_at ASC`
+    ).all(`${dateName}/%`) as Record<string, unknown>[]
+    return rows.map(rowToTask)
+  }
+
   listRunnable(now = new Date().toISOString()): Task[] {
     const rows = getDb().prepare(
       `SELECT DISTINCT t.*
@@ -475,7 +487,7 @@ export class TaskRepo {
           updateChanged.run(file.size, file.mtimeMs, now, now, current.id)
           resetTargets.run(now, current.id)
           changed = true
-        } else {
+        } else if (current.stableCount < Math.max(1, requiredStableChecks)) {
           updateStable.run(
             now,
             Math.max(1, requiredStableChecks),
@@ -544,26 +556,25 @@ export class TaskRepo {
     for (const destination of getTaskDestinationRepo().listByTask(taskId)) {
       const destinationRepo = getTaskDestinationRepo()
       destinationRepo.recalculateProgress(taskId, destination.provider)
-      const targets = destinationRepo.listFileTargets(taskId, destination.provider)
-      if (targets.some((target) => target.status === 'failed')) {
+      const summary = destinationRepo.summarizeFileTargets(
+        taskId,
+        destination.provider,
+        now
+      )
+      if (summary.failed > 0) {
         destinationRepo.updateStatus(
           taskId,
           destination.provider,
           'failed',
           '存在需要处理的上传失败文件'
         )
-      } else if (targets.some((target) => target.status === 'pending')) {
-        const waitingForRetry = targets.some(
-          (target) =>
-            target.status === 'pending' &&
-            Boolean(target.nextRetryAt && target.nextRetryAt > now)
-        )
+      } else if (summary.pending > 0) {
         destinationRepo.updateStatus(
           taskId,
           destination.provider,
-          waitingForRetry ? 'retrying' : 'pending'
+          summary.retryWaiting > 0 ? 'retrying' : 'pending'
         )
-      } else if (targets.length > 0) {
+      } else if (summary.total > 0) {
         destinationRepo.updateStatus(
           taskId,
           destination.provider,

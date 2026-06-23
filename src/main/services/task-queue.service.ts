@@ -15,6 +15,7 @@ import type { Task, TaskStatus, UploadConfig } from '@shared/types'
 export class TaskQueueService extends EventEmitter {
   private runningTasks: Map<string, { cancel: () => void }> = new Map()
   private processTimer: ReturnType<typeof setInterval> | null = null
+  private initialProcessTimer: ReturnType<typeof setTimeout> | null = null
   private taskRunner:
     | ((task: Task, signal: AbortSignal) => Promise<TaskStatus>)
     | null = null
@@ -26,14 +27,22 @@ export class TaskQueueService extends EventEmitter {
   }
 
   start(): void {
+    if (this.processTimer) return
     // 每 2 秒检查一次队列
-    this.processTimer = setInterval(() => this.processQueue(), 2000)
-    // 启动时立即处理
-    this.processQueue()
+    this.processTimer = setInterval(() => void this.processQueue(), 2000)
+    // 让主窗口先完成绘制，再恢复上传任务。
+    this.initialProcessTimer = setTimeout(() => {
+      this.initialProcessTimer = null
+      void this.processQueue()
+    }, 1500)
     log.info('任务队列已启动')
   }
 
   stop(): void {
+    if (this.initialProcessTimer) {
+      clearTimeout(this.initialProcessTimer)
+      this.initialProcessTimer = null
+    }
     if (this.processTimer) {
       clearInterval(this.processTimer)
       this.processTimer = null
@@ -74,7 +83,8 @@ export class TaskQueueService extends EventEmitter {
     const eligibleTasks = pendingTasks.filter((task) =>
       this.isTaskEligibleForCurrentStartCycle(task, uploadConfig?.startAfterTime)
     )
-    const toRun = eligibleTasks.slice(0, availableSlots)
+    // 每轮只启动一个新任务，避免多个大目录在主进程中同时做首次校准。
+    const toRun = eligibleTasks.slice(0, Math.min(availableSlots, 1))
 
     for (const task of toRun) {
       this.executeTask(task)

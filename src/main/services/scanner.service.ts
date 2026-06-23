@@ -61,8 +61,9 @@ export class ScannerService {
   private pendingDirs: Map<string, PendingDir> = new Map()
   private lastScanResults: ScannerStatus['lastScanResults'] = null
   private watcher: FSWatcher | null = null
-  private reconcileTimers = new Map<string, ReturnType<typeof setTimeout>>()
   private scanDebounceTimer: ReturnType<typeof setTimeout> | null = null
+  private watcherErrorHandled = false
+  private lastWatcherWarningAt = 0
 
   start(): void {
     if (this.running) return
@@ -73,9 +74,9 @@ export class ScannerService {
     const directories = scanConfig?.directories || []
     const intervalMs = (scanConfig?.intervalSeconds || 30) * 1000
 
-    this.scan()
     this.startWatcher(directories)
     this.timer = setInterval(() => this.scan(), intervalMs)
+    this.scheduleFullScan()
 
     const stabilityConfig = settings.get<StabilityConfig>('stability')
     const checkInterval = stabilityConfig?.checkIntervalMs || 5000
@@ -97,8 +98,6 @@ export class ScannerService {
       void this.watcher.close()
       this.watcher = null
     }
-    for (const timer of this.reconcileTimers.values()) clearTimeout(timer)
-    this.reconcileTimers.clear()
     if (this.scanDebounceTimer) {
       clearTimeout(this.scanDebounceTimer)
       this.scanDebounceTimer = null
@@ -247,8 +246,6 @@ export class ScannerService {
               existingTask.status,
               'skipped'
             )
-          } else {
-            this.reconcileTask(getTaskRepo().getById(existingTask.id) || existingTask)
           }
           existing++
           continue
@@ -323,18 +320,18 @@ export class ScannerService {
   }
 
   private checkStability(): void {
-    for (const task of getTaskRepo().listByStatus()) {
-      if (
-        task.sourceType === 'local' &&
-        task.dayFolderId &&
-        task.status !== 'skipped' &&
-        task.status !== 'paused' &&
-        task.status !== 'completed'
-      ) {
-        this.reconcileTask(task)
-      }
+    const today = this.formatLocalDate(new Date())
+    for (const task of getTaskRepo().listContinuouslyMonitored(today)) {
+      this.reconcileTask(task)
     }
     this.broadcastStatus()
+  }
+
+  private formatLocalDate(date: Date): string {
+    const year = date.getFullYear()
+    const month = String(date.getMonth() + 1).padStart(2, '0')
+    const day = String(date.getDate()).padStart(2, '0')
+    return `${year}-${month}-${day}`
   }
 
   private registerNewDir(pending: PendingDir): Task {
@@ -379,6 +376,7 @@ export class ScannerService {
 
   private startWatcher(directories: string[]): void {
     if (this.watcher) void this.watcher.close()
+    this.watcherErrorHandled = false
     const existingDirectories = directories.filter((directory) =>
       existsSync(directory)
     )
@@ -388,9 +386,13 @@ export class ScannerService {
       ignoreInitial: true,
       persistent: true,
       awaitWriteFinish: false,
-      ignored: (path) => {
+      // 只监听 根目录/日期目录/工作次目录 的目录结构。
+      // 文件变化由稳定性检查和 30 秒全量校准处理，避免大量小文件耗尽 inotify。
+      depth: 2,
+      ignored: (path, stats) => {
         const normalized = path.replace(/\\/g, '/')
         return (
+          stats?.isFile() === true ||
           normalized.includes('/.git/') ||
           normalized.endsWith('/tmp_upload.json') ||
           normalized.endsWith('/process_task.json') ||
@@ -400,21 +402,9 @@ export class ScannerService {
     })
 
     this.watcher
-      .on('add', (path) => this.handleFileEvent(path))
-      .on('change', (path) => this.handleFileEvent(path))
-      .on('unlink', (path) => this.handleFileEvent(path))
       .on('addDir', () => this.scheduleFullScan())
       .on('unlinkDir', () => this.scheduleFullScan())
-      .on('error', (error) => log.warn('文件监控异常:', error))
-  }
-
-  private handleFileEvent(filePath: string): void {
-    const task = getTaskRepo().findTaskContainingFile(filePath)
-    if (!task || task.status === 'skipped') {
-      this.scheduleFullScan()
-      return
-    }
-    this.scheduleTaskReconcile(task.id)
+      .on('error', (error) => this.handleWatcherError(error))
   }
 
   private scheduleFullScan(): void {
@@ -425,17 +415,30 @@ export class ScannerService {
     }, 500)
   }
 
-  private scheduleTaskReconcile(taskId: string): void {
-    const existing = this.reconcileTimers.get(taskId)
-    if (existing) clearTimeout(existing)
-    this.reconcileTimers.set(
-      taskId,
-      setTimeout(() => {
-        this.reconcileTimers.delete(taskId)
-        const task = getTaskRepo().getById(taskId)
-        if (task) this.reconcileTask(task)
-      }, 500)
-    )
+  private handleWatcherError(error: unknown): void {
+    const message = error instanceof Error ? error.message : String(error)
+    const isResourceLimit =
+      message.includes('ENOSPC') ||
+      message.includes('EMFILE') ||
+      message.includes('file watchers')
+
+    if (isResourceLimit && !this.watcherErrorHandled) {
+      this.watcherErrorHandled = true
+      log.warn(
+        '目录事件监控达到系统资源上限，已关闭事件监听并回退到周期扫描:',
+        message
+      )
+      const watcher = this.watcher
+      this.watcher = null
+      if (watcher) void watcher.close()
+      return
+    }
+
+    const now = Date.now()
+    if (now - this.lastWatcherWarningAt >= 60_000) {
+      this.lastWatcherWarningAt = now
+      log.warn('目录事件监控异常，周期扫描仍会继续:', message)
+    }
   }
 
   reconcileTask(task: Task): void {

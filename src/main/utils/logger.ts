@@ -1,11 +1,21 @@
 import { join } from 'path'
 import { app } from 'electron'
-import { readdirSync, statSync, rmSync, mkdirSync, existsSync, appendFileSync } from 'fs'
+import {
+  readdirSync,
+  statSync,
+  rmSync,
+  mkdirSync,
+  existsSync,
+  appendFileSync,
+  renameSync
+} from 'fs'
 import log from 'electron-log'
 import type { LogConfig } from '@shared/types'
 
 let logDir = ''
 let levelFileHookInstalled = false
+const LEVEL_LOG_MAX_SIZE = 10 * 1024 * 1024
+const LEVEL_LOG_DISCARD_SIZE = 50 * 1024 * 1024
 
 /**
  * 初始化日志系统
@@ -35,6 +45,8 @@ export function initLogger(config?: LogConfig): void {
   log.transports.file.format = '[{y}-{m}-{d} {h}:{i}:{s}.{ms}] [{level}] {text}'
   log.transports.file.maxSize = 10 * 1024 * 1024 // 10MB
 
+  prepareCurrentLevelLogs()
+
   // 通过 hook 额外写入 error.log 和 warn.log
   if (!levelFileHookInstalled) {
     log.hooks.push((message) => {
@@ -52,7 +64,9 @@ export function initLogger(config?: LogConfig): void {
           const text = message.data?.map((d: unknown) => String(d)).join(' ') || ''
           const ts = new Date().toISOString().replace('T', ' ').slice(0, 23)
           const line = `[${ts}] [${level}] ${text}\n`
-          appendFileSync(join(dir, fileName), line)
+          const filePath = join(dir, fileName)
+          rotateLevelLog(filePath)
+          appendFileSync(filePath, line)
         } catch {
           // 忽略写入失败
         }
@@ -67,6 +81,33 @@ export function initLogger(config?: LogConfig): void {
   cleanOldLogs(logDir, maxDays)
 
   log.info('日志系统初始化完成, 目录:', logDir)
+}
+
+function prepareCurrentLevelLogs(): void {
+  const date = new Date().toISOString().slice(0, 10)
+  const dir = join(logDir, date)
+  if (!existsSync(dir)) return
+
+  rotateLevelLog(join(dir, 'warn.log'))
+  rotateLevelLog(join(dir, 'error.log'))
+}
+
+function rotateLevelLog(filePath: string): void {
+  if (!existsSync(filePath)) {
+    return
+  }
+
+  const size = statSync(filePath).size
+  if (size < LEVEL_LOG_MAX_SIZE) return
+
+  if (size >= LEVEL_LOG_DISCARD_SIZE) {
+    rmSync(filePath, { force: true })
+    return
+  }
+
+  const oldPath = filePath.replace(/\.log$/, '.old.log')
+  rmSync(oldPath, { force: true })
+  renameSync(filePath, oldPath)
 }
 
 function cleanOldLogs(dir: string, maxDays: number): void {
