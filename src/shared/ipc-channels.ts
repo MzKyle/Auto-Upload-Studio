@@ -70,12 +70,5 @@ export const IPC = {
 
   // 对话框
   DIALOG_SELECT_FOLDER: 'dialog:select-folder',
-  DIALOG_SELECT_DIRECTORY: 'dialog:select-directory',
-
-  // 标注
-  ANNOTATION_OPEN_WINDOW: 'annotation:open-window',
-  ANNOTATION_SELECT_IMAGE: 'annotation:select-image',
-  ANNOTATION_READ_IMAGE: 'annotation:read-image',
-  ANNOTATION_SAVE_EXPORT: 'annotation:save-export',
-  ANNOTATION_UPLOAD_OSS: 'annotation:upload-oss'
+  DIALOG_SELECT_DIRECTORY: 'dialog:select-directory'
 } as const

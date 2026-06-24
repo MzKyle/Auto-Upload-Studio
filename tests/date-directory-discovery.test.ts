@@ -3,33 +3,44 @@ import test from 'node:test'
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
-import { discoverDayDirectories } from '../src/main/services/date-directory-discovery'
+import {
+  discoverCurrentDayDirectory,
+  isWorkDirName
+} from '../src/main/services/date-directory-discovery'
 
-test('discovers only valid date folders and their direct visible child folders', () => {
+test('discovers only the current date folder and splits work dirs from ignored dirs', async () => {
   const root = mkdtempSync(join(tmpdir(), 'uploader-scan-'))
 
   try {
-    const validDay = join(root, '2026-06-18')
-    mkdirSync(validDay)
-    mkdirSync(join(validDay, '04-39-04'))
-    mkdirSync(join(validDay, '05-06-52'))
-    mkdirSync(join(validDay, '.working'))
-    mkdirSync(join(validDay, '04-39-04', 'camera'))
-    writeFileSync(join(validDay, 'root-file.txt'), 'ignored')
+    const today = join(root, '2026-06-24')
+    mkdirSync(today)
+    mkdirSync(join(today, '04-39-04'))
+    mkdirSync(join(today, '05-06-52'))
+    mkdirSync(join(today, 'teach'))
+    mkdirSync(join(today, '.working'))
+    mkdirSync(join(today, '04-39-04', 'camera'))
+    writeFileSync(join(today, 'root-file.txt'), 'ignored')
 
-    mkdirSync(join(root, '2026-02-29'))
+    const oldDay = join(root, '2026-06-23')
+    mkdirSync(oldDay)
+    mkdirSync(join(oldDay, '20-46-05'))
     mkdirSync(join(root, 'test_data'))
-    mkdirSync(join(root, '.hidden-day'))
-    writeFileSync(join(root, '2026-06-17'), 'not a directory')
+    writeFileSync(join(root, '2026-06-22'), 'not a directory')
 
-    assert.deepEqual(discoverDayDirectories(root), [
-      {
-        dateName: '2026-06-18',
-        folderPath: validDay,
-        childFolderNames: ['04-39-04', '05-06-52']
-      }
-    ])
+    assert.deepEqual(await discoverCurrentDayDirectory(root, '2026-06-24'), {
+      dateName: '2026-06-24',
+      folderPath: today,
+      childFolderNames: ['04-39-04', '05-06-52'],
+      ignoredChildFolderNames: ['teach']
+    })
   } finally {
     rmSync(root, { recursive: true, force: true })
   }
+})
+
+test('work dir name pattern is configurable and falls back when invalid', () => {
+  assert.equal(isWorkDirName('20-46-05'), true)
+  assert.equal(isWorkDirName('teach'), false)
+  assert.equal(isWorkDirName('work-1', '^work-\\d+$'), true)
+  assert.equal(isWorkDirName('work-1', '['), false)
 })

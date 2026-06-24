@@ -241,6 +241,7 @@ export interface WebhookConfig {
 export interface ScanConfig {
   directories: string[]
   intervalSeconds: number
+  workDirNamePattern?: string
 }
 
 export interface UploadConfig {
@@ -302,6 +303,8 @@ export interface ScannerStatus {
     scannedDirs: number
     newDirsFound: number
     existingDirs: number
+    ignoredDirectories: number
+    skippedChildren: number
     timestamp: string
   } | null
 }
@@ -331,13 +334,6 @@ export interface DataCollectInfo {
   controlCmd: { speedRows: number; freqRows: number }
   pointCloudCount: number
   depthImageCount: number
-  annotation: {
-    hasXml: boolean
-    dataType: string | null
-    qualityType: string | null
-    specMin: number | null
-    specMax: number | null
-  }
   totalFileCount: number
   totalSizeBytes: number
   collectedAt: string

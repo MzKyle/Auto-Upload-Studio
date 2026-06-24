@@ -69,6 +69,9 @@ export function TaskCard({
   const totalBytes = progress?.totalBytes ?? destination.totalBytes;
   const speed = progress?.speed ?? 0;
   const percent = totalFiles > 0 ? (uploadedFiles / totalFiles) * 100 : 0;
+  const isIgnoredDirectory =
+    task.status === "skipped" && task.errorMessage === "非工作次目录";
+  const errorText = destination.errorMessage || task.errorMessage;
   const loadDetail = async () => {
     if (!detailOpen && !detail) {
       setDetail(await fetchTaskDetail(task.id));
@@ -86,7 +89,9 @@ export function TaskCard({
               {task.folderName}
             </span>
             <Badge variant={STATUS_VARIANT[status] || "secondary"}>
-              {TASK_STATUS_LABELS[status] || status}
+              {isIgnoredDirectory
+                ? "已忽略目录"
+                : TASK_STATUS_LABELS[status] || status}
             </Badge>
             <span className="text-xs text-muted-foreground">
               {CLOUD_PROVIDER_LABELS[provider]}
@@ -188,9 +193,13 @@ export function TaskCard({
           </div>
         )}
 
-        {destination.errorMessage && (
-          <div className="text-xs text-destructive mt-1 whitespace-pre-wrap break-all">
-            错误: {destination.errorMessage}
+        {errorText && (
+          <div
+            className={`text-xs mt-1 whitespace-pre-wrap break-all ${
+              isIgnoredDirectory ? "text-muted-foreground" : "text-destructive"
+            }`}
+          >
+            {isIgnoredDirectory ? "说明" : "错误"}: {errorText}
           </div>
         )}
 

@@ -1,5 +1,5 @@
 import { useEffect, useCallback, useState } from "react";
-import { FolderPlus, RefreshCw, PlayCircle, PenTool } from "lucide-react";
+import { FolderPlus, RefreshCw, PlayCircle } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { TaskCard } from "@/components/TaskCard";
 import { DataCollectCard } from "@/components/DataCollectCard";
@@ -20,7 +20,6 @@ import {
   triggerScan,
   fetchDataCollectList,
   fetchDayFolders,
-  openAnnotationWindow,
   ignoreDayFolder,
   restoreDayFolder,
 } from "@/lib/ipc-client";
@@ -184,14 +183,6 @@ export default function Dashboard() {
       <div className="flex items-center justify-between">
         <h1 className="text-xl font-bold">任务面板</h1>
         <div className="flex items-center gap-2">
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={() => openAnnotationWindow()}
-          >
-            <PenTool className="h-4 w-4 mr-1" />
-            标注
-          </Button>
           <Button variant="outline" size="sm" onClick={handleScan}>
             <PlayCircle className="h-4 w-4 mr-1" />
             触发扫描

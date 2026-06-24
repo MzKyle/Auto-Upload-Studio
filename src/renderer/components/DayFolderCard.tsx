@@ -37,6 +37,10 @@ export function DayFolderCard({
       : 0;
   const count = (statuses: Task["status"][]) =>
     tasks.filter((task) => statuses.includes(task.status)).length;
+  const ignoredDirectoryCount = tasks.filter(
+    (task) => task.status === "skipped" && task.errorMessage === "非工作次目录",
+  ).length;
+  const skippedCount = count(["skipped"]) - ignoredDirectoryCount;
 
   return (
     <Card className="mb-3">
@@ -99,7 +103,10 @@ export function DayFolderCard({
               <span>上传中 {count(["uploading", "scanning", "pending"])}</span>
               <span>重试 {count(["retrying"])}</span>
               <span>需处理 {count(["failed", "paused"])}</span>
-              <span>跳过 {count(["skipped"])}</span>
+              {ignoredDirectoryCount > 0 && (
+                <span>已忽略目录 {ignoredDirectoryCount}</span>
+              )}
+              <span>跳过 {Math.max(0, skippedCount)}</span>
             </>
           )}
           {speed > 0 && <span>总速度 {formatSpeed(speed)}</span>}

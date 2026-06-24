@@ -1,4 +1,5 @@
-import { readdirSync, statSync, existsSync } from 'fs'
+import { existsSync } from 'fs'
+import { access } from 'fs/promises'
 import { join } from 'path'
 import { watch, type FSWatcher } from 'chokidar'
 import { BrowserWindow } from 'electron'
@@ -14,7 +15,7 @@ import { getDataCollectService } from './data-collect.service'
 import { getDayFolderService } from './day-folder.service'
 import { getTaskQueueService } from './task-queue.service'
 import { FileFilterService } from './file-filter.service'
-import { discoverDayDirectories } from './date-directory-discovery'
+import { discoverCurrentDayDirectory } from './date-directory-discovery'
 import {
   readProcessTask,
   readTmpUpload,
@@ -45,6 +46,11 @@ interface PendingDir {
   destinationPrefixes?: Partial<Record<CloudProvider, string>>
 }
 
+const NON_WORK_DIR_REASON = '非工作次目录'
+const INITIAL_SCAN_DELAY_MS = 3000
+const SCAN_BATCH_SIZE = 4
+const RECONCILE_BATCH_SIZE = 2
+
 /**
  * 日期目录扫描服务
  * - 配置项指向数据根目录
@@ -64,6 +70,12 @@ export class ScannerService {
   private scanDebounceTimer: ReturnType<typeof setTimeout> | null = null
   private watcherErrorHandled = false
   private lastWatcherWarningAt = 0
+  private scanInProgress = false
+  private scanQueued = false
+  private reconcileQueue: string[] = []
+  private reconcileQueuedIds = new Set<string>()
+  private reconcileInProgress = false
+  private stabilityCursor = 0
 
   start(): void {
     if (this.running) return
@@ -75,8 +87,8 @@ export class ScannerService {
     const intervalMs = (scanConfig?.intervalSeconds || 30) * 1000
 
     this.startWatcher(directories)
-    this.timer = setInterval(() => this.scan(), intervalMs)
-    this.scheduleFullScan()
+    this.timer = setInterval(() => this.scheduleFullScan(), intervalMs)
+    this.scheduleFullScan(INITIAL_SCAN_DELAY_MS)
 
     const stabilityConfig = settings.get<StabilityConfig>('stability')
     const checkInterval = stabilityConfig?.checkIntervalMs || 5000
@@ -102,6 +114,9 @@ export class ScannerService {
       clearTimeout(this.scanDebounceTimer)
       this.scanDebounceTimer = null
     }
+    this.scanQueued = false
+    this.reconcileQueue = []
+    this.reconcileQueuedIds.clear()
     this.running = false
     this.nextScanAt = null
     log.info('扫描器已停止')
@@ -139,95 +154,140 @@ export class ScannerService {
   }
 
   triggerScan(): void {
-    this.scan()
+    this.scheduleFullScan(0)
   }
 
-  private scan(): void {
+  private async scan(): Promise<void> {
+    if (!this.running) return
+    if (this.scanInProgress) {
+      this.scanQueued = true
+      return
+    }
+
+    this.scanInProgress = true
     const settings = getSettingsRepo()
     const scanConfig = settings.get<ScanConfig>('scan')
     const directories = scanConfig?.directories || []
     const intervalMs = (scanConfig?.intervalSeconds || 30) * 1000
+    const today = this.formatLocalDate(new Date())
     const seenChildPaths = new Set<string>()
 
     let scannedDirs = 0
     let newDirsFound = 0
     let existingDirs = 0
+    let ignoredDirectories = 0
+    let skippedChildren = 0
 
-    for (const rootDir of directories) {
-      if (!existsSync(rootDir)) {
-        log.warn('扫描根目录不存在:', rootDir)
-        continue
+    try {
+      for (const rootDir of directories) {
+        if (!(await this.pathExists(rootDir))) {
+          log.warn('扫描根目录不存在:', rootDir)
+          continue
+        }
+        const result = await this.scanRootDirectory(
+          rootDir,
+          today,
+          scanConfig?.workDirNamePattern,
+          seenChildPaths
+        )
+        scannedDirs += result.scanned
+        newDirsFound += result.newFound
+        existingDirs += result.existing
+        ignoredDirectories += result.ignored
+        skippedChildren += result.skipped
+        await this.yieldToEventLoop()
       }
-      const result = this.scanRootDirectory(rootDir, seenChildPaths)
-      scannedDirs += result.scanned
-      newDirsFound += result.newFound
-      existingDirs += result.existing
-    }
 
-    for (const pendingPath of this.pendingDirs.keys()) {
-      if (!seenChildPaths.has(pendingPath)) {
-        this.pendingDirs.delete(pendingPath)
+      for (const pendingPath of this.pendingDirs.keys()) {
+        if (!seenChildPaths.has(pendingPath)) {
+          this.pendingDirs.delete(pendingPath)
+        }
+      }
+
+      await this.reconcileDeletedTasks(seenChildPaths, directories)
+
+      this.lastScanAt = new Date().toISOString()
+      this.nextScanAt = new Date(Date.now() + intervalMs).toISOString()
+      this.lastScanResults = {
+        scannedDirs,
+        newDirsFound,
+        existingDirs,
+        ignoredDirectories,
+        skippedChildren,
+        timestamp: this.lastScanAt
+      }
+      this.broadcastStatus()
+    } finally {
+      this.scanInProgress = false
+      if (this.scanQueued && this.running) {
+        this.scanQueued = false
+        this.scheduleFullScan(250)
       }
     }
-
-    this.reconcileDeletedTasks(seenChildPaths, directories)
-
-    this.lastScanAt = new Date().toISOString()
-    this.nextScanAt = new Date(Date.now() + intervalMs).toISOString()
-    this.lastScanResults = {
-      scannedDirs,
-      newDirsFound,
-      existingDirs,
-      timestamp: this.lastScanAt
-    }
-    this.broadcastStatus()
   }
 
-  private scanRootDirectory(
+  private async scanRootDirectory(
     rootDir: string,
+    today: string,
+    workDirNamePattern: string | undefined,
     seenChildPaths: Set<string>
-  ): { scanned: number; newFound: number; existing: number } {
+  ): Promise<{ scanned: number; newFound: number; existing: number; ignored: number; skipped: number }> {
     let scanned = 0
     let newFound = 0
     let existing = 0
+    let ignored = 0
+    let skipped = 0
 
     try {
-      const dayDirectories = discoverDayDirectories(rootDir)
-      for (const dayDirectory of dayDirectories) {
-        const result = this.scanDayDirectory(
+      const dayDirectory = await discoverCurrentDayDirectory(
+        rootDir,
+        today,
+        workDirNamePattern
+      )
+      if (dayDirectory) {
+        const result = await this.scanDayDirectory(
           dayDirectory.folderPath,
           dayDirectory.dateName,
           dayDirectory.childFolderNames,
+          dayDirectory.ignoredChildFolderNames,
           seenChildPaths
         )
         scanned += result.scanned
         newFound += result.newFound
         existing += result.existing
+        ignored += result.ignored
+        skipped += result.skipped
       }
     } catch (err) {
       log.error('扫描数据根目录失败:', rootDir, err)
     }
 
-    return { scanned, newFound, existing }
+    return { scanned, newFound, existing, ignored, skipped }
   }
 
-  private scanDayDirectory(
+  private async scanDayDirectory(
     dayFolderPath: string,
     dateName: string,
     discoveredChildNames: string[],
+    ignoredChildNames: string[],
     seenChildPaths: Set<string>
-  ): { scanned: number; newFound: number; existing: number } {
+  ): Promise<{ scanned: number; newFound: number; existing: number; ignored: number; skipped: number }> {
     const dayFolder = getDayFolderRepo().ensure(dayFolderPath, dateName)
-    const childNames: string[] = []
+    const childNames = Array.from(
+      new Set([...discoveredChildNames, ...ignoredChildNames])
+    ).sort()
+    const ignoredSet = new Set(ignoredChildNames)
     let scanned = 0
     let newFound = 0
     let existing = 0
+    let ignored = 0
+    let skipped = 0
 
     try {
-      for (const childName of discoveredChildNames) {
+      for (let index = 0; index < childNames.length; index++) {
+        const childName = childNames[index]
         const childPath = join(dayFolderPath, childName)
         const uploadRelativePath = buildUploadRelativePath(dateName, childName)
-        childNames.push(childName)
         seenChildPaths.add(childPath)
         scanned++
 
@@ -248,6 +308,19 @@ export class ScannerService {
             )
           }
           existing++
+          continue
+        }
+
+        if (ignoredSet.has(childName)) {
+          const task = this.registerIgnoredDir(
+            childPath,
+            childName,
+            dayFolder.id,
+            uploadRelativePath
+          )
+          this.broadcastTaskStatus(task.id, task.status, 'skipped')
+          ignored++
+          skipped++
           continue
         }
 
@@ -283,7 +356,7 @@ export class ScannerService {
             getTaskRepo().skip(task.id, '用户忽略整个日期')
             this.broadcastTaskStatus(task.id, task.status, 'skipped')
           } else {
-            this.reconcileTask(task)
+            this.queueReconcileTask(task)
           }
           existing++
           continue
@@ -299,16 +372,20 @@ export class ScannerService {
             uploadRelativePath,
             checks: 0,
             discoveredAt: new Date().toISOString(),
-            lastSnapshot: this.snapshotDir(childPath)
+            lastSnapshot: new Map()
           }
           const task = this.registerNewDir(pending)
           if (dayFolder.ignored) {
             getTaskRepo().skip(task.id, '用户忽略整个日期')
             this.broadcastTaskStatus(task.id, task.status, 'skipped')
           } else {
-            this.reconcileTask(task)
+            this.queueReconcileTask(task)
           }
           newFound++
+        }
+
+        if ((index + 1) % SCAN_BATCH_SIZE === 0) {
+          await this.yieldToEventLoop()
         }
       }
     } catch (err) {
@@ -316,13 +393,19 @@ export class ScannerService {
     }
 
     getDayFolderService().refresh(dayFolder.id, childNames)
-    return { scanned, newFound, existing }
+    return { scanned, newFound, existing, ignored, skipped }
   }
 
   private checkStability(): void {
     const today = this.formatLocalDate(new Date())
-    for (const task of getTaskRepo().listContinuouslyMonitored(today)) {
-      this.reconcileTask(task)
+    const tasks = getTaskRepo().listContinuouslyMonitored(today)
+    if (tasks.length > 0) {
+      const batchSize = Math.min(RECONCILE_BATCH_SIZE, tasks.length)
+      for (let i = 0; i < batchSize; i++) {
+        const task = tasks[(this.stabilityCursor + i) % tasks.length]
+        if (task) this.queueReconcileTask(task)
+      }
+      this.stabilityCursor = (this.stabilityCursor + batchSize) % tasks.length
     }
     this.broadcastStatus()
   }
@@ -369,9 +452,29 @@ export class ScannerService {
       snapshot
     )
     log.info('焊接目录已注册为上传任务:', pending.path)
-    this.collectDataInfo(pending.path)
+    setTimeout(() => this.collectDataInfo(pending.path), 0)
     getDayFolderService().refresh(pending.dayFolderId)
     return task
+  }
+
+  private registerIgnoredDir(
+    dirPath: string,
+    folderName: string,
+    dayFolderId: string,
+    uploadRelativePath: string
+  ): Task {
+    const task = this.ensureTaskRegistered(
+      dirPath,
+      folderName,
+      dayFolderId,
+      uploadRelativePath
+    )
+    if (task.status !== 'skipped' || task.errorMessage !== NON_WORK_DIR_REASON) {
+      getTaskRepo().skip(task.id, NON_WORK_DIR_REASON)
+      log.info('已忽略非工作次目录:', dirPath)
+    }
+    getDayFolderService().refresh(dayFolderId)
+    return getTaskRepo().getById(task.id) || task
   }
 
   private startWatcher(directories: string[]): void {
@@ -407,12 +510,12 @@ export class ScannerService {
       .on('error', (error) => this.handleWatcherError(error))
   }
 
-  private scheduleFullScan(): void {
+  private scheduleFullScan(delayMs = 500): void {
     if (this.scanDebounceTimer) clearTimeout(this.scanDebounceTimer)
     this.scanDebounceTimer = setTimeout(() => {
       this.scanDebounceTimer = null
-      this.scan()
-    }, 500)
+      void this.scan()
+    }, delayMs)
   }
 
   private handleWatcherError(error: unknown): void {
@@ -441,7 +544,32 @@ export class ScannerService {
     }
   }
 
-  reconcileTask(task: Task): void {
+  queueReconcileTask(task: Task): void {
+    if (this.reconcileQueuedIds.has(task.id)) return
+    this.reconcileQueuedIds.add(task.id)
+    this.reconcileQueue.push(task.id)
+    void this.processReconcileQueue()
+  }
+
+  private async processReconcileQueue(): Promise<void> {
+    if (this.reconcileInProgress) return
+    this.reconcileInProgress = true
+    try {
+      while (this.reconcileQueue.length > 0) {
+        const taskId = this.reconcileQueue.shift()!
+        this.reconcileQueuedIds.delete(taskId)
+        const task = getTaskRepo().getById(taskId)
+        if (task) {
+          await this.reconcileTask(task)
+        }
+        await this.yieldToEventLoop()
+      }
+    } finally {
+      this.reconcileInProgress = false
+    }
+  }
+
+  async reconcileTask(task: Task): Promise<void> {
     if (
       task.status === 'skipped' ||
       task.status === 'paused' ||
@@ -449,7 +577,7 @@ export class ScannerService {
     ) {
       return
     }
-    if (!existsSync(task.folderPath)) {
+    if (!(await this.pathExists(task.folderPath))) {
       if (task.status !== 'synced') {
         getTaskQueueService().cancelRunningTask(task.id)
         getTaskRepo().skip(task.id, '源目录已删除')
@@ -461,7 +589,7 @@ export class ScannerService {
 
     try {
       const settings = getSettingsRepo().getAll()
-      const files = new FileFilterService(settings.filter).scanFolder(task.folderPath)
+      const files = await new FileFilterService(settings.filter).scanFolderAsync(task.folderPath)
       const stableChecks =
         task.sourceType === 'local' && task.dayFolderId
           ? Math.max(2, settings.stability.checkCount || 2)
@@ -481,7 +609,7 @@ export class ScannerService {
       }
       getDayFolderService().refreshForTask(task.id)
     } catch (err) {
-      if (!existsSync(task.folderPath)) {
+      if (!(await this.pathExists(task.folderPath))) {
         getTaskQueueService().cancelRunningTask(task.id)
         getTaskRepo().skip(task.id, '源目录已删除')
         getDayFolderService().refreshForTask(task.id)
@@ -492,14 +620,16 @@ export class ScannerService {
     }
   }
 
-  private reconcileDeletedTasks(
+  private async reconcileDeletedTasks(
     seenChildPaths: Set<string>,
     watchedDirectories: string[]
-  ): void {
+  ): Promise<void> {
     const normalizedRoots = watchedDirectories.map((directory) =>
       directory.replace(/[\\/]+$/, '')
     )
-    for (const task of getTaskRepo().listByStatus()) {
+    const tasks = getTaskRepo().listByStatus()
+    for (let index = 0; index < tasks.length; index++) {
+      const task = tasks[index]
       if (task.sourceType !== 'local' || !task.dayFolderId) continue
       if (
         !normalizedRoots.some(
@@ -511,7 +641,7 @@ export class ScannerService {
       ) {
         continue
       }
-      if (seenChildPaths.has(task.folderPath) || existsSync(task.folderPath)) continue
+      if (seenChildPaths.has(task.folderPath) || (await this.pathExists(task.folderPath))) continue
       if (
         task.status === 'completed' ||
         task.status === 'synced' ||
@@ -523,6 +653,10 @@ export class ScannerService {
       getTaskRepo().skip(task.id, '源目录已删除')
       getDayFolderService().refreshForTask(task.id)
       this.broadcastTaskStatus(task.id, task.status, 'skipped')
+
+      if ((index + 1) % SCAN_BATCH_SIZE === 0) {
+        await this.yieldToEventLoop()
+      }
     }
   }
 
@@ -699,53 +833,17 @@ export class ScannerService {
     }
   }
 
-  private snapshotDir(dirPath: string): Map<string, { size: number; mtimeMs: number }> {
-    const snapshot = new Map<string, { size: number; mtimeMs: number }>()
-    this.walkForSnapshot(dirPath, dirPath, snapshot)
-    return snapshot
-  }
-
-  private walkForSnapshot(
-    basePath: string,
-    currentPath: string,
-    snapshot: Map<string, { size: number; mtimeMs: number }>
-  ): void {
+  private async pathExists(path: string): Promise<boolean> {
     try {
-      const entries = readdirSync(currentPath, { withFileTypes: true })
-      for (const entry of entries) {
-        const fullPath = join(currentPath, entry.name)
-        if (entry.isDirectory()) {
-          if (!entry.name.startsWith('.')) {
-            this.walkForSnapshot(basePath, fullPath, snapshot)
-          }
-        } else if (entry.isFile()) {
-          try {
-            const stat = statSync(fullPath)
-            const relPath = fullPath.slice(basePath.length + 1)
-            snapshot.set(relPath, { size: stat.size, mtimeMs: stat.mtimeMs })
-          } catch {
-            // 文件可能在快照期间被删除
-          }
-        }
-      }
+      await access(path)
+      return true
     } catch {
-      // 目录可能在扫描期间被删除或暂时不可读
+      return false
     }
   }
 
-  private compareSnapshots(
-    prev: Map<string, { size: number; mtimeMs: number }>,
-    curr: Map<string, { size: number; mtimeMs: number }>
-  ): boolean {
-    if (prev.size !== curr.size) return false
-    for (const [key, prevVal] of prev) {
-      const currVal = curr.get(key)
-      if (!currVal) return false
-      if (prevVal.size !== currVal.size || prevVal.mtimeMs !== currVal.mtimeMs) {
-        return false
-      }
-    }
-    return true
+  private async yieldToEventLoop(): Promise<void> {
+    await new Promise((resolve) => setTimeout(resolve, 0))
   }
 }
 

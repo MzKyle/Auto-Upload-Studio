@@ -3,11 +3,13 @@
 // ============================================
 
 export const APP_NAME = '数据采集上传工具'
+export const DEFAULT_WORK_DIR_NAME_PATTERN = '^\\d{2}-\\d{2}-\\d{2}$'
 
 export const DEFAULT_SETTINGS = {
   scan: {
     directories: [],
-    intervalSeconds: 30
+    intervalSeconds: 30,
+    workDirNamePattern: DEFAULT_WORK_DIR_NAME_PATTERN
   },
   upload: {
     maxConcurrentTasks: 4,

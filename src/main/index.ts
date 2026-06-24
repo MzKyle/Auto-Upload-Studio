@@ -24,7 +24,6 @@ import type { WebhookConfig, LogConfig } from '@shared/types'
 import log from 'electron-log'
 
 let mainWindow: BrowserWindow | null = null
-let annotationWindow: BrowserWindow | null = null
 let startupWindow: BrowserWindow | null = null
 let tray: Tray | null = null
 let servicesStarted = false
@@ -181,6 +180,7 @@ function startServices(): void {
   const webhookService = getWebhookService()
   const taskRepo = getTaskRepo()
   const settingsRepo = getSettingsRepo()
+  const scanner = getScannerService()
 
   // 连接任务队列和执行器
   taskQueue.setTaskRunner(async (task, signal) => {
@@ -248,8 +248,11 @@ function startServices(): void {
   taskQueue.start()
 
   // 启动扫描器
-  const scanner = getScannerService()
   scanner.start()
+
+  for (const task of unfinished) {
+    scanner.queueReconcileTask(task)
+  }
 
   // 启动自动清理服务
   getCleanupService().start()
@@ -349,35 +352,4 @@ app.on('before-quit', () => {
 
 export function getMainWindow(): BrowserWindow | null {
   return mainWindow
-}
-
-export function createAnnotationWindow(): void {
-  if (annotationWindow && !annotationWindow.isDestroyed()) {
-    annotationWindow.focus()
-    return
-  }
-
-  annotationWindow = new BrowserWindow({
-    width: 1200,
-    height: 800,
-    minWidth: 960,
-    minHeight: 640,
-    title: '图像标注',
-    webPreferences: {
-      preload: join(__dirname, '../preload/index.js'),
-      sandbox: false,
-      contextIsolation: true,
-      nodeIntegration: false
-    }
-  })
-
-  annotationWindow.on('closed', () => {
-    annotationWindow = null
-  })
-
-  if (is.dev && process.env['ELECTRON_RENDERER_URL']) {
-    annotationWindow.loadURL(process.env['ELECTRON_RENDERER_URL'] + '#/annotation')
-  } else {
-    annotationWindow.loadFile(join(__dirname, '../renderer/index.html'), { hash: 'annotation' })
-  }
 }

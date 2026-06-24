@@ -375,6 +375,7 @@ export function reconcileStartupState(db: Database.Database): void {
     `UPDATE task_destinations
      SET status = CASE
            WHEN status IN ('completed', 'synced') THEN status
+           WHEN status IN ('uploading', 'scanning', 'retrying', 'failed', 'paused') THEN 'pending'
            ELSE 'pending'
          END,
          error_message = NULL,
@@ -385,21 +386,23 @@ export function reconcileStartupState(db: Database.Database): void {
          updated_at = ?
      WHERE task_id = ?`
   )
-  const resetFiles = db.prepare(
+  const resetActiveFiles = db.prepare(
     `UPDATE task_files
-     SET status = CASE WHEN status = 'completed' THEN status ELSE 'pending' END,
+     SET status = 'pending',
          error_message = NULL, retry_count = 0, next_retry_at = NULL,
          updated_at = ?
-     WHERE task_id = ? AND source_status = 'present'`
+     WHERE task_id = ?
+       AND source_status = 'present'
+       AND status IN ('uploading', 'failed')`
   )
-  const resetFileDestinations = db.prepare(
+  const resetActiveFileDestinations = db.prepare(
     `UPDATE task_file_destinations
-     SET status = CASE WHEN status = 'completed' THEN status ELSE 'pending' END,
-         error_message = NULL, updated_at = ?
-     WHERE task_file_id IN (
-       SELECT id FROM task_files
-       WHERE task_id = ? AND source_status = 'present'
-     )`
+     SET status = 'pending', error_message = NULL, updated_at = ?
+     WHERE status IN ('uploading', 'failed')
+       AND task_file_id IN (
+         SELECT id FROM task_files
+         WHERE task_id = ? AND source_status = 'present'
+       )`
   )
   const skipTask = db.prepare(
     `UPDATE tasks
@@ -420,21 +423,6 @@ export function reconcileStartupState(db: Database.Database): void {
          completed_at = COALESCE(completed_at, ?), updated_at = ?
      WHERE task_id = ?`
   )
-  const skipFiles = db.prepare(
-    `UPDATE task_files
-     SET source_status = 'missing',
-         status = CASE WHEN status = 'completed' THEN status ELSE 'skipped' END,
-         error_message = CASE WHEN status = 'completed' THEN error_message ELSE '源目录已删除' END,
-         next_retry_at = NULL, updated_at = ?
-     WHERE task_id = ?`
-  )
-  const skipFileDestinations = db.prepare(
-    `UPDATE task_file_destinations
-     SET status = CASE WHEN status = 'completed' THEN status ELSE 'skipped' END,
-         error_message = CASE WHEN status = 'completed' THEN error_message ELSE '源目录已删除' END,
-         updated_at = ?
-     WHERE task_file_id IN (SELECT id FROM task_files WHERE task_id = ?)`
-  )
 
   const transaction = db.transaction(() => {
     for (const task of unfinished) {
@@ -442,14 +430,12 @@ export function reconcileStartupState(db: Database.Database): void {
       if (monitorable && !existsSync(task.folder_path)) {
         skipTask.run(now, now, task.id)
         skipDestinations.run(now, now, task.id)
-        skipFiles.run(now, task.id)
-        skipFileDestinations.run(now, task.id)
         continue
       }
       resetTask.run(now, task.id)
       resetDestinations.run(now, task.id)
-      resetFiles.run(now, task.id)
-      resetFileDestinations.run(now, task.id)
+      resetActiveFiles.run(now, task.id)
+      resetActiveFileDestinations.run(now, task.id)
     }
   })
   transaction()

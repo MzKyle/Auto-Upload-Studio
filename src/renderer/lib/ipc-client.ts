@@ -168,24 +168,3 @@ export async function selectFolder(): Promise<string | null> {
 export async function fetchDiskUsage(): Promise<DiskUsageInfo[]> {
   return (await api.invoke(IPC.DISK_USAGE)) as DiskUsageInfo[]
 }
-
-// ---- 标注 ----
-export async function openAnnotationWindow(): Promise<void> {
-  await api.invoke(IPC.ANNOTATION_OPEN_WINDOW)
-}
-
-export async function selectAnnotationImage(): Promise<string | null> {
-  return (await api.invoke(IPC.ANNOTATION_SELECT_IMAGE)) as string | null
-}
-
-export async function readAnnotationImage(filePath: string): Promise<{ dataUrl: string; width: number; height: number }> {
-  return (await api.invoke(IPC.ANNOTATION_READ_IMAGE, { filePath })) as { dataUrl: string; width: number; height: number }
-}
-
-export async function saveAnnotationExport(dataUrl: string, jsonString: string, defaultBaseName: string): Promise<{ pngPath: string; jsonPath: string } | null> {
-  return (await api.invoke(IPC.ANNOTATION_SAVE_EXPORT, { dataUrl, jsonString, defaultBaseName })) as { pngPath: string; jsonPath: string } | null
-}
-
-export async function uploadAnnotationToOSS(imagePath: string, pngPath: string, jsonPath: string): Promise<MultiCloudOperationResult> {
-  return (await api.invoke(IPC.ANNOTATION_UPLOAD_OSS, { imagePath, pngPath, jsonPath })) as MultiCloudOperationResult
-}

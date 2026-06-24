@@ -1,4 +1,4 @@
-import { ipcMain, dialog, BrowserWindow, nativeImage } from 'electron'
+import { ipcMain, dialog, BrowserWindow } from 'electron'
 import { IPC } from '@shared/ipc-channels'
 import { getTaskRepo } from '../db/task.repo'
 import { getSettingsRepo } from '../db/settings.repo'
@@ -8,20 +8,19 @@ import { getTaskQueueService } from '../services/task-queue.service'
 import { getSSHRsyncService } from '../services/ssh-rsync.service'
 import { getOSSUploadService } from '../services/oss-upload.service'
 import { getTencentS3UploadService } from '../services/tencent-s3-upload.service'
-import { getCloudUploadService } from '../services/cloud-upload.service'
 import { getCleanupService } from '../services/cleanup.service'
 import { getDayFolderRepo } from '../db/day-folder.repo'
 import { getDayFolderService } from '../services/day-folder.service'
-import { getMainWindow, createAnnotationWindow } from '../index'
+import { getMainWindow } from '../index'
 import { getDb } from '../db/database'
 import { getDataCollectService } from '../services/data-collect.service'
 import { getTaskDestinationRepo } from '../db/task-destination.repo'
 import { v4 as uuid } from 'uuid'
 import type { AppSettings, CloudProvider, HistoryQuery, TaskStatus, SSHMachine, SSHMachineInput, RsyncProgress, TransferMode, DiskUsageInfo, ScanConfig, DayFolderListQuery } from '@shared/types'
-import { getUploadTargetSnapshot, providersForMode } from '@shared/cloud-upload'
+import { getUploadTargetSnapshot } from '@shared/cloud-upload'
 import { resolveDirectoryUploadRelativePath } from '@shared/day-folder'
-import { basename, normalize, extname, parse as pathParse, format as pathFormat, relative, join } from 'path'
-import { existsSync, readFileSync, writeFileSync } from 'fs'
+import { basename, normalize, join } from 'path'
+import { existsSync } from 'fs'
 import { statfs } from 'fs/promises'
 import log from 'electron-log'
 import { writeTmpUpload } from '../utils/marker-file'
@@ -87,7 +86,7 @@ export function registerAllIpc(): void {
       uploadRelativePath,
       sourceType: 'manual'
     })
-    getScannerService().reconcileTask(task)
+    getScannerService().queueReconcileTask(task)
     return getTaskRepo().getById(task.id)
   })
 
@@ -125,7 +124,7 @@ export function registerAllIpc(): void {
     if (!existsSync(task.folderPath)) throw new Error('源目录不存在，无法恢复')
     getTaskRepo().restore(args.taskId)
     const restored = getTaskRepo().getById(args.taskId)
-    if (restored) getScannerService().reconcileTask(restored)
+    if (restored) getScannerService().queueReconcileTask(restored)
     getDayFolderService().refreshForTask(args.taskId)
     broadcastStatusChange(args.taskId, 'scanning')
   })
@@ -181,7 +180,7 @@ export function registerAllIpc(): void {
       if (task.status !== 'skipped' || !existsSync(task.folderPath)) continue
       getTaskRepo().restore(task.id)
       const restored = getTaskRepo().getById(task.id)
-      if (restored) getScannerService().reconcileTask(restored)
+      if (restored) getScannerService().queueReconcileTask(restored)
       broadcastStatusChange(task.id, 'scanning')
     }
     return getDayFolderService().refresh(args.id)
@@ -292,7 +291,7 @@ export function registerAllIpc(): void {
           sourceType: 'rsync',
           sourceMachineId: machine.id
         })
-        getScannerService().reconcileTask(task)
+        getScannerService().queueReconcileTask(task)
         log.info('rsync 完成, 自动创建上传任务:', localDir)
       } else if (existing.uploadRelativePath !== uploadRelativePath) {
         taskRepo.updateUploadRelativePath(existing.id, uploadRelativePath)
@@ -436,135 +435,4 @@ export function registerAllIpc(): void {
     return results
   })
 
-  // ---- 标注 ----
-  ipcMain.handle(IPC.ANNOTATION_OPEN_WINDOW, () => {
-    createAnnotationWindow()
-  })
-
-  ipcMain.handle(IPC.ANNOTATION_SELECT_IMAGE, async (event) => {
-    const win = BrowserWindow.fromWebContents(event.sender)
-    if (!win) return null
-    const result = await dialog.showOpenDialog(win, {
-      filters: [{ name: 'Images', extensions: ['png', 'jpg', 'jpeg', 'bmp', 'tiff', 'tif'] }],
-      properties: ['openFile']
-    })
-    if (result.canceled || result.filePaths.length === 0) return null
-    return result.filePaths[0]
-  })
-
-  ipcMain.handle(IPC.ANNOTATION_READ_IMAGE, (_event, args: { filePath: string }) => {
-    const { filePath } = args
-    const ext = extname(filePath).toLowerCase().replace('.', '')
-    const mimeMap: Record<string, string> = {
-      png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg',
-      bmp: 'image/bmp', tiff: 'image/tiff', tif: 'image/tiff'
-    }
-    const mime = mimeMap[ext] || 'image/png'
-    const buf = readFileSync(filePath)
-    const dataUrl = `data:${mime};base64,${buf.toString('base64')}`
-    const img = nativeImage.createFromPath(filePath)
-    const size = img.getSize()
-    return { dataUrl, width: size.width, height: size.height }
-  })
-
-  ipcMain.handle(IPC.ANNOTATION_SAVE_EXPORT, async (event, args: { dataUrl: string; jsonString: string; defaultBaseName: string }) => {
-    const win = BrowserWindow.fromWebContents(event.sender)
-    if (!win) return null
-    const result = await dialog.showSaveDialog(win, {
-      defaultPath: `${args.defaultBaseName}.png`,
-      filters: [{ name: 'PNG', extensions: ['png'] }]
-    })
-    if (result.canceled || !result.filePath) return null
-
-    // Write PNG
-    const base64Data = args.dataUrl.replace(/^data:image\/\w+;base64,/, '')
-    const pngPath = result.filePath
-    writeFileSync(pngPath, Buffer.from(base64Data, 'base64'))
-
-    // Write JSON alongside PNG (same directory, same base name)
-    const parsed = pathParse(pngPath)
-    const jsonPath = pathFormat({ dir: parsed.dir, name: parsed.name, ext: '.json' })
-    writeFileSync(jsonPath, args.jsonString, 'utf-8')
-
-    log.info('[Annotation] Exported PNG:', pngPath)
-    log.info('[Annotation] Exported JSON:', jsonPath)
-
-    return { pngPath, jsonPath }
-  })
-
-  ipcMain.handle(IPC.ANNOTATION_UPLOAD_OSS, async (_event, args: { imagePath: string; pngPath: string; jsonPath: string }) => {
-    const taskRepo = getTaskRepo()
-    const settings = getSettingsRepo().getAll()
-    const task = taskRepo.findTaskContainingFile(args.imagePath)
-    const pngBuffer = readFileSync(args.pngPath)
-    const jsonBuffer = readFileSync(args.jsonPath)
-    const results = []
-
-    for (const provider of providersForMode(settings.cloud.targetMode)) {
-      const validationError = getCloudUploadService().validateProvider(provider, settings)
-      if (validationError) {
-        results.push({ provider, ok: false, error: validationError })
-        continue
-      }
-
-      const taskDestination = task?.destinations.find(
-        (destination) => destination.provider === provider
-      )
-      const configPrefix =
-        provider === 'aliyun' ? settings.oss.prefix : settings.tencentS3.prefix
-      const prefix = taskDestination?.prefix || configPrefix || ''
-      let basePath: string
-
-      if (task) {
-        const relPath = relative(task.folderPath, args.imagePath).replace(/\\/g, '/')
-        const relParsed = pathParse(relPath)
-        const relBase = pathFormat({
-          dir: relParsed.dir,
-          name: relParsed.name,
-          ext: ''
-        })
-        basePath = [
-          prefix,
-          task.uploadRelativePath || task.folderName,
-          relBase
-        ].filter(Boolean).join('/').replace(/\/+/g, '/')
-      } else {
-        const image = pathParse(args.imagePath)
-        basePath = [prefix, image.name]
-          .filter(Boolean)
-          .join('/')
-          .replace(/\/+/g, '/')
-      }
-
-      const pngKey = `${basePath}_annotation.png`
-      const jsonKey = `${basePath}_annotation.json`
-      let uploader: Awaited<ReturnType<ReturnType<typeof getCloudUploadService>['createTaskUploader']>> | null = null
-      try {
-        uploader = await getCloudUploadService().createTaskUploader(
-          provider,
-          settings,
-          settings.upload.multipartThreshold
-        )
-        await Promise.all([
-          uploader.uploadBuffer(pngBuffer, pngKey),
-          uploader.uploadBuffer(jsonBuffer, jsonKey)
-        ])
-        results.push({ provider, ok: true, keys: [pngKey, jsonKey] })
-      } catch (err) {
-        log.error(`[Annotation] ${provider} upload failed:`, err)
-        results.push({
-          provider,
-          ok: false,
-          error: err instanceof Error ? err.message : String(err)
-        })
-      } finally {
-        uploader?.dispose()
-      }
-    }
-
-    return {
-      ok: results.every((result) => result.ok),
-      results
-    }
-  })
 }
