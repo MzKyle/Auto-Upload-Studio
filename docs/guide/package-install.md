@@ -12,10 +12,10 @@ npm run build:all
 
 ## Debian / Ubuntu
 
-应用版本为 `2.0.2`，典型安装命令：
+应用版本为 `2.1.5`，典型安装命令：
 
 ```bash
-sudo dpkg -i electron-uploader_2.0.2_amd64.deb
+sudo dpkg -i electron-uploader_2.1.5_amd64.deb
 sudo apt-get -f install -y
 ```
 
@@ -26,8 +26,8 @@ sudo apt-get -f install -y
 1. 启动应用并打开设置页。
 2. 选择上传模式，配置并测试所有启用云端。
 3. 添加包含 `YYYY-MM-DD` 日期目录的数据根目录。
-4. 创建一个新的焊接子目录并触发扫描。
-5. 确认对象路径包含日期和焊接目录。
+4. 在当天日期目录下创建一个新的 `HH-MM-SS` 工作次目录并触发扫描。
+5. 确认对象路径包含日期和工作次目录。
 6. 双云模式下确认两个云端都完成后逻辑任务才完成。
 
 ## 原生模块问题

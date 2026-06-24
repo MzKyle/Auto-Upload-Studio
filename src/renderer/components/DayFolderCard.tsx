@@ -89,7 +89,7 @@ export function DayFolderCard({
         <Progress value={percent} className="mb-2" />
         <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground">
           <span>
-            焊接目录 {dayFolder.completedChildren} / {dayFolder.totalChildren}
+            工作次目录 {dayFolder.completedChildren} / {dayFolder.totalChildren}
           </span>
           <span>
             文件 {dayFolder.uploadedFiles} / {dayFolder.totalFiles}

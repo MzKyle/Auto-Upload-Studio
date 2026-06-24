@@ -3041,7 +3041,7 @@ class ScannerService {
           continue;
         }
         if (!this.pendingDirs.has(childPath)) {
-          log.info("发现新焊接目录, 注册持续同步任务:", childPath);
+          log.info("发现新工作次目录, 注册持续同步任务:", childPath);
           const pending = {
             path: childPath,
             dayFolderId: dayFolder.id,
@@ -3120,7 +3120,7 @@ class ScannerService {
       pending.uploadRelativePath,
       snapshot
     );
-    log.info("焊接目录已注册为上传任务:", pending.path);
+    log.info("工作次目录已注册为上传任务:", pending.path);
     setTimeout(() => this.collectDataInfo(pending.path), 0);
     getDayFolderService().refresh(pending.dayFolderId);
     return task;

@@ -13,14 +13,15 @@ independently, and closes completed date directories for retention and cleanup.
 
 ## What You Can Do
 
-- Scan one or more data roots organized as `YYYY-MM-DD/weld-session/files`.
-- Wait for repeated size and modification-time snapshots before registering a directory.
+- Scan one or more data roots organized as `YYYY-MM-DD/work-session/files`.
+- Automatically scan only the current date directory on startup; old dates are added manually.
+- Treat only directories matching the work-session name pattern as automatic tasks, with `HH-MM-SS` as the default.
+- Wait for repeated size and modification-time checks before uploading a file.
 - Upload to Aliyun only, Tencent only, or both providers.
 - Track progress, errors, completion, and retries independently for each provider.
 - Pause, resume, cancel, and retry an individual failed cloud destination.
 - Restrict new task starts to a daily or overnight upload window.
 - Pull remote data with `rsync`, or send smaller remote files directly through SFTP.
-- Export image annotations as PNG + JSON and upload them to the active providers.
 - Keep task, destination, file, date-summary, settings, and remote-machine state in SQLite.
 - Delete completed local data after a configurable retention period.
 
@@ -36,8 +37,16 @@ Configure the parent directory of the date folders:
       metadata.json
 ```
 
-Each direct child of a valid `YYYY-MM-DD` folder becomes one upload task after it is
-stable. Files placed directly in the date folder are not uploaded.
+Automatic scanning only processes the current valid `YYYY-MM-DD` date directory. A direct
+child directory becomes a continuous upload task only when its name matches the configured
+work-session pattern, which defaults to `^\d{2}-\d{2}-\d{2}$`. Non-matching directories
+such as `teach` are recorded as ignored directories and can be manually restored. Old date
+directories are not auto-discovered; add a specific work-session directory manually when
+historical data needs to be uploaded.
+
+Files placed directly in the date folder are not uploaded. New or modified files inside a
+work-session directory are uploaded after they become stable and overwrite the same object
+key in the cloud.
 
 Each provider has its own prefix. With `upload/` as the prefix, object keys are:
 
@@ -51,9 +60,10 @@ later affects new tasks only. In dual-cloud mode, a logical file and task comple
 after both destinations complete. Retrying one failed destination does not resend files
 that already succeeded on the other provider.
 
-After the date has passed and every discovered welding session is complete,
-`day_upload.json` is written in the date directory. If a late session appears, the date
-is reopened automatically, the new session is uploaded, and the date is closed again.
+After the date has passed and every discovered work session is complete or explicitly
+skipped, `day_upload.json` is written in the date directory. To backfill an old date, add
+the specific work-session directory manually; the date summary is recalculated after the
+backfill completes.
 
 ## Cloud Providers
 
@@ -69,17 +79,16 @@ certificate.
 Connection tests list at most one object from the configured bucket. A successful test
 does not replace the need for object-write and multipart-upload permissions.
 
-## Remote Transfer and Annotation
+## Remote Transfer
 
 | Feature | Behavior |
 | --- | --- |
 | `rsync` | Pulls to a local directory, then creates a normal resumable upload task |
 | SFTP | Reads each remote file into memory and uploads it to the currently selected providers |
-| Annotation | Exports PNG + JSON and uploads both files to the currently selected providers |
 
-SFTP and annotation operations return a result for each provider, but they do not create
-normal task-history records. For large files or unreliable networks, prefer `rsync` so
-the regular task runner can use local recovery and multipart uploads.
+SFTP operations return a result for each provider, but they do not create normal
+task-history records. For large files or unreliable networks, prefer `rsync` so the
+regular task runner can use local recovery and multipart uploads.
 
 ## Install and Run
 
@@ -103,7 +112,7 @@ In **Settings**:
 3. Add the data root that contains the `YYYY-MM-DD` directories.
 4. Adjust task, per-task file, and global file concurrency.
 5. Configure or disable the upload time window.
-6. Return to the dashboard and trigger a scan.
+6. Return to the dashboard and trigger a scan. Use manual folder add for old dates.
 
 ## Common Commands
 
@@ -119,13 +128,13 @@ npm run build:win
 npm run build:all
 ```
 
-Build output is written to `dist/`. The current application version is `2.0.2`.
+Build output is written to `dist/`. The current application version is `2.1.5`.
 
 ## Architecture
 
 ```mermaid
 flowchart LR
-  UI["React Renderer<br/>dashboard / settings / history"] --> IPC["Preload + IPC"]
+  UI["React Renderer<br/>dashboard / settings / history / remote"] --> IPC["Preload + IPC"]
   IPC --> Scanner["ScannerService<br/>date discovery / stability"]
   IPC --> Queue["TaskQueueService<br/>window / concurrency"]
   Queue --> Runner["TaskRunnerService<br/>filter / resume / retry"]
@@ -133,7 +142,6 @@ flowchart LR
   Cloud --> Aliyun["Aliyun OSS"]
   Cloud --> Tencent["Tencent TurboS3"]
   IPC --> Remote["SSHRsyncService<br/>rsync / SFTP"]
-  IPC --> Annotation["Annotation Window"]
   Scanner --> DB[("SQLite")]
   Runner --> DB
   Scanner --> Marker["tmp_upload.json<br/>process_task.json<br/>day_upload.json"]
@@ -148,7 +156,7 @@ recovery and operational state beside the collected data.
 - Database: `uploader.db` under Electron's `userData` directory
 - Logs: `userData/logs` by default
 - Task markers:
-  - `tmp_upload.json`: the welding directory has been registered
+  - `tmp_upload.json`: the work-session directory has been registered
   - `process_task.json`: logical and per-provider upload state
   - `day_upload.json`: the past date directory is fully complete
 

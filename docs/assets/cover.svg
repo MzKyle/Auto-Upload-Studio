@@ -36,7 +36,7 @@
       数据采集上传工具
     </text>
     <text x="60" y="306" fill="#CBD5E1" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="22" letter-spacing="0">
-      Folder scanning, resumable task queue, OSS upload, remote sync and annotation export.
+      Folder scanning, resumable task queue, OSS upload, remote sync and data insight.
     </text>
 
     <g transform="translate(60 354)">

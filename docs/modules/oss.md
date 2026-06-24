@@ -36,5 +36,5 @@
 
 ## Buffer 上传
 
-SFTP 和标注使用 Buffer 上传，并按当前模式创建一个或两个 uploader。操作返回
+SFTP 使用 Buffer 上传，并按当前模式创建一个或两个 uploader。操作返回
 `MultiCloudOperationResult`，但不写入普通任务历史。

@@ -1,13 +1,13 @@
 # 渲染进程代码
 
-`src/renderer/App.tsx` 使用 HashRouter 提供任务面板、设置、历史、远程机器和标注页面。
+`src/renderer/App.tsx` 使用 HashRouter 提供任务面板、设置、历史和远程机器页面。
 
 ## Dashboard
 
 - 阿里和腾讯标签分别筛选当前提供方的任务目标。
 - `TaskCard` 使用 `taskId:provider` 保存进度。
 - 失败目标从当前标签页执行“重试此云端”。
-- 日期汇总卡展示焊接目录、文件和字节统计。
+- 日期汇总卡展示工作次目录、文件和字节统计。
 - 页面订阅 `task:*` 与 `day-folder:event` 保持状态更新。
 
 ## Settings
@@ -25,7 +25,7 @@
 历史页按提供方查询 `task_destinations`，失败记录可只重试当前云端。已完成日期汇总
 单独展示并可删除汇总记录。
 
-## Remote 和 Annotation
+## Remote
 
-远程页面触发 rsync 或 SFTP，并展示多云操作结果。标注工具栏在上传后按提供方显示
-成功或失败；底层兼容 IPC 名称仍为 `annotation:upload-oss`。
+远程页面触发 rsync 或 SFTP，并展示多云操作结果。rsync 落盘后创建普通上传任务；
+SFTP 直传云端但不写入普通任务历史。

@@ -32,7 +32,6 @@ welding_state/weld_signal.csv
 | 控制指令 | `control_cmd/control_speed.csv`、`control_freq.csv` | 行数 |
 | 点云 | `scan_point_cloud` | `.bin` 和 `.ply` 文件数量 |
 | 深度图 | `camera_depth` | `.jpg` 和 `.ply` 文件数量 |
-| 标注 XML | `annotation/segment_timestamps.xml` | 数据类型、质量类型、规格范围 |
 | 总体统计 | 整个目录 | 文件数、总大小 |
 
 ## 时间解析
@@ -57,7 +56,7 @@ YYYY-MM-DD HH:mm:ss.SSS
 
 ## 使用场景
 
-- 上传前快速确认一个单次焊接目录是否包含完整相机和焊接信号数据
+- 上传前快速确认一个工作次目录是否包含完整相机和焊接信号数据
 - 观察采集时长和图像时间戳范围是否合理
 - 在任务面板中把上传任务和业务数据质量放在一起看
-- 为后续数据治理和缺陷标注提供轻量元信息
+- 为后续数据治理提供轻量元信息

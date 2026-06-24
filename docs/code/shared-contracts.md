@@ -20,7 +20,7 @@
 | `DayFolderSummary` | 日期状态、子任务和文件/字节汇总 |
 | `DayUploadMarker` | 日期封账文件结构 |
 | `CloudOperationResult` | 单个提供方的成功、keys 或错误 |
-| `MultiCloudOperationResult` | SFTP/标注的全部提供方结果 |
+| `MultiCloudOperationResult` | SFTP 的全部提供方结果 |
 
 ## 设置
 

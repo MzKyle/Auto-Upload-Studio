@@ -153,7 +153,7 @@ export default function History() {
       )}
 
       <h2 className="text-sm font-semibold text-muted-foreground">
-        单次焊接任务
+        工作次任务
       </h2>
 
       {items.length === 0 ? (
