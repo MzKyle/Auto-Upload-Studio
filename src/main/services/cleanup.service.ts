@@ -1,4 +1,5 @@
-import { existsSync, rmSync } from 'fs'
+import { existsSync } from 'fs'
+import { rm } from 'fs/promises'
 import log from 'electron-log'
 import { getTaskRepo } from '../db/task.repo'
 import { getDayFolderRepo } from '../db/day-folder.repo'
@@ -18,9 +19,9 @@ export class CleanupService {
 
   start(): void {
     if (this.timer) return
-    // 启动时延迟 30 秒执行第一次，之后每小时执行
-    this.scheduleCleanup(30000)
-    this.timer = setInterval(() => this.cleanup(), 3600000)
+    // 避免应用刚启动、任务恢复和目录扫描期间同时进行大量删除。
+    this.scheduleCleanup(5 * 60 * 1000)
+    this.timer = setInterval(() => void this.cleanup(), 3600000)
     log.info('自动清理服务已启动')
   }
 
@@ -43,11 +44,11 @@ export class CleanupService {
 
     this.pendingRun = setTimeout(() => {
       this.pendingRun = null
-      this.cleanup()
+      void this.cleanup()
     }, Math.max(0, delayMs))
   }
 
-  cleanup(): void {
+  async cleanup(): Promise<void> {
     if (this.running) return
     this.running = true
 
@@ -75,7 +76,7 @@ export class CleanupService {
           if (!existsSync(dayFolder.folderPath)) {
             continue
           }
-          rmSync(dayFolder.folderPath, { recursive: true, force: true })
+          await rm(dayFolder.folderPath, { recursive: true, force: true })
           cleaned++
           log.info(
             `自动清理: 已删除日期目录 ${dayFolder.folderPath} ` +
@@ -91,7 +92,7 @@ export class CleanupService {
           if (!existsSync(task.folderPath)) {
             continue
           }
-          rmSync(task.folderPath, { recursive: true, force: true })
+          await rm(task.folderPath, { recursive: true, force: true })
           cleaned++
           log.info(`自动清理: 已删除 ${task.folderPath} (任务ID: ${task.id}, 完成于: ${task.completedAt})`)
         } catch (err) {

@@ -51,5 +51,4 @@ ScannerService
 - [任务队列与上传执行](../modules/task-upload.md)
 - [双云上传服务](../modules/oss.md)
 - [渲染进程代码](renderer-process.md)
-- [图片标注窗口](../modules/annotation.md)
 - [共享契约与 IPC](shared-contracts.md)

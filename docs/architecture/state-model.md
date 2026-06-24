@@ -32,19 +32,21 @@ pending / uploading / completed / failed
 
 | 状态 | 含义 |
 | --- | --- |
-| `collecting` | 当天仍可能产生数据，或没有子目录 |
+| `collecting` | 当天仍可能产生数据，或没有工作次任务 |
 | `processing` | 存在待稳定、排队或上传中的任务 |
 | `blocked` | 至少一个任务失败或暂停 |
 | `completed` | 日期已跨天且全部已发现任务完成 |
+| `completed_with_skips` | 日期已跨天且全部已发现任务完成或跳过 |
 
-完成日期出现迟到焊接目录时会回到处理中，并删除旧 `day_upload.json`。
+旧日期不会自动发现新增目录；需要补传时手动添加具体工作次目录，补传完成后日期汇总
+重新计算，必要时重写 `day_upload.json`。
 
 ## 标记文件
 
 | 文件 | 位置 | 作用 |
 | --- | --- | --- |
-| `tmp_upload.json` | 焊接目录 | 扫描登记、任务模式、Prefix 和来源 |
-| `process_task.json` | 焊接目录 | 逻辑状态与逐云文件状态 |
+| `tmp_upload.json` | 工作次目录 | 扫描登记、任务模式、Prefix 和来源 |
+| `process_task.json` | 工作次目录 | 逻辑状态与逐云文件状态 |
 | `day_upload.json` | 日期目录 | 跨天完成汇总、子任务和逐云完成信息 |
 
 ## 时间窗口

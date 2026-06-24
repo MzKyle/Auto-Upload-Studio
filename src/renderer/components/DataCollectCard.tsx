@@ -82,18 +82,6 @@ export function DataCollectCard({ info }: DataCollectCardProps) {
             </div>
           )}
 
-          {/* 标注 */}
-          {info.annotation.hasXml && (
-            <div>
-              <span className="font-medium text-foreground">标注: </span>
-              {info.annotation.dataType || ""}
-              {info.annotation.qualityType
-                ? ` / ${info.annotation.qualityType}`
-                : ""}
-              {info.annotation.specMin !== null &&
-                ` (${info.annotation.specMin}-${info.annotation.specMax}mm)`}
-            </div>
-          )}
         </div>
 
         <div className="text-xs text-muted-foreground mt-1 truncate">

@@ -45,12 +45,19 @@ export function determineDayFolderStatus(
     return 'blocked'
   }
 
-  const allCompleted =
+  const allTerminal =
     childStatuses.length > 0 &&
-    childStatuses.every((status) => status === 'completed')
+    childStatuses.every(
+      (status) =>
+        status === 'completed' ||
+        status === 'synced' ||
+        status === 'skipped'
+    )
 
-  if (allCompleted && isDateFolderBeforeToday(dateName, now)) {
-    return 'completed'
+  if (allTerminal && isDateFolderBeforeToday(dateName, now)) {
+    return childStatuses.some((status) => status === 'skipped')
+      ? 'completed_with_skips'
+      : 'completed'
   }
 
   if (
@@ -59,7 +66,8 @@ export function determineDayFolderStatus(
         status === null ||
         status === 'pending' ||
         status === 'scanning' ||
-        status === 'uploading'
+        status === 'uploading' ||
+        status === 'retrying'
     )
   ) {
     return 'processing'

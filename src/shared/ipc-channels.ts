@@ -11,6 +11,9 @@ export const IPC = {
   TASK_RESUME: 'task:resume',
   TASK_CANCEL: 'task:cancel',
   TASK_RETRY: 'task:retry',
+  TASK_SKIP: 'task:skip',
+  TASK_RESTORE: 'task:restore',
+  TASK_DETAIL: 'task:detail',
   TASK_PROGRESS: 'task:progress',         // push from main
   TASK_STATUS_CHANGE: 'task:status-change', // push from main
   TASK_DESTINATION_CHANGE: 'task:destination-change',
@@ -18,6 +21,8 @@ export const IPC = {
   // 日期目录汇总
   DAY_FOLDER_LIST: 'day-folder:list',
   DAY_FOLDER_DELETE: 'day-folder:delete',
+  DAY_FOLDER_IGNORE: 'day-folder:ignore',
+  DAY_FOLDER_RESTORE: 'day-folder:restore',
   DAY_FOLDER_EVENT: 'day-folder:event',
 
   // 扫描器
@@ -65,12 +70,5 @@ export const IPC = {
 
   // 对话框
   DIALOG_SELECT_FOLDER: 'dialog:select-folder',
-  DIALOG_SELECT_DIRECTORY: 'dialog:select-directory',
-
-  // 标注
-  ANNOTATION_OPEN_WINDOW: 'annotation:open-window',
-  ANNOTATION_SELECT_IMAGE: 'annotation:select-image',
-  ANNOTATION_READ_IMAGE: 'annotation:read-image',
-  ANNOTATION_SAVE_EXPORT: 'annotation:save-export',
-  ANNOTATION_UPLOAD_OSS: 'annotation:upload-oss'
+  DIALOG_SELECT_DIRECTORY: 'dialog:select-directory'
 } as const

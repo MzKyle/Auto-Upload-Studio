@@ -19,7 +19,6 @@
   - [双云上传服务](modules/oss.md)
   - [SSH / rsync / SFTP](modules/remote-transfer.md)
   - [数采模式](modules/data-collect.md)
-  - [图片标注窗口](modules/annotation.md)
   - [历史、存储与清理](modules/storage-cleanup.md)
 
 - **代码导读**
@@ -39,7 +38,6 @@
 - **工作流程**
   - [本地目录上传](workflow/local-upload.md)
   - [远程机器同步](workflow/remote-sync.md)
-  - [标注导出与上传](workflow/annotation-workflow.md)
   - [测试验收流程](workflow/testing.md)
 
 - **日志与诊断**

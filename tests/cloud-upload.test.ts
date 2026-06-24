@@ -32,4 +32,7 @@ test('keeps the logical task failed until all selected clouds complete', () => {
   assert.equal(deriveTaskStatus(['completed', 'completed']), 'completed')
   assert.equal(deriveTaskStatus(['completed', 'failed']), 'failed')
   assert.equal(deriveTaskStatus(['completed', 'uploading']), 'uploading')
+  assert.equal(deriveTaskStatus(['synced', 'completed']), 'synced')
+  assert.equal(deriveTaskStatus(['retrying', 'completed']), 'retrying')
+  assert.equal(deriveTaskStatus(['skipped']), 'skipped')
 })

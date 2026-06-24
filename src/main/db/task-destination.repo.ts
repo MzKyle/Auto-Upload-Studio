@@ -15,6 +15,18 @@ export interface FileDestinationUploadTarget extends TaskFileDestination {
   taskId: string
   relativePath: string
   fileSize: number
+  mtimeMs: number
+  retryCount: number
+  nextRetryAt: string | null
+  sourceStatus: 'present' | 'missing'
+  stableCount: number
+}
+
+export interface FileDestinationSummary {
+  total: number
+  failed: number
+  pending: number
+  retryWaiting: number
 }
 
 function rowToDestination(row: Record<string, unknown>): TaskDestination {
@@ -65,7 +77,11 @@ export class TaskDestinationRepo {
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
     )
     const completedAt =
-      initialStatus === 'completed' || initialStatus === 'failed' ? now : null
+      initialStatus === 'completed' ||
+      initialStatus === 'failed' ||
+      initialStatus === 'skipped'
+        ? now
+        : null
     const transaction = db.transaction(() => {
       for (const provider of providersForMode(mode)) {
         stmt.run(
@@ -107,7 +123,11 @@ export class TaskDestinationRepo {
   ): void {
     const now = new Date().toISOString()
     const completedAt =
-      status === 'completed' || status === 'failed' ? now : null
+      status === 'completed' ||
+      status === 'failed' ||
+      status === 'skipped'
+        ? now
+        : null
     getDb()
       .prepare(
         `UPDATE task_destinations
@@ -124,12 +144,16 @@ export class TaskDestinationRepo {
   ): void {
     const now = new Date().toISOString()
     const completedAt =
-      status === 'completed' || status === 'failed' ? now : null
+      status === 'completed' ||
+      status === 'failed' ||
+      status === 'skipped'
+        ? now
+        : null
     getDb()
       .prepare(
         `UPDATE task_destinations
          SET status = ?, error_message = ?, updated_at = ?, completed_at = ?
-         WHERE task_id = ? AND status != 'completed'`
+         WHERE task_id = ? AND status NOT IN ('completed', 'synced', 'skipped')`
       )
       .run(status, errorMessage || null, now, completedAt, taskId)
   }
@@ -179,7 +203,9 @@ export class TaskDestinationRepo {
     if (provider) params.push(provider)
     const rows = getDb()
       .prepare(
-        `SELECT tfd.*, tf.task_id, tf.relative_path, tf.file_size
+        `SELECT tfd.*, tf.task_id, tf.relative_path, tf.file_size,
+          tf.mtime_ms, tf.retry_count, tf.next_retry_at,
+          tf.source_status, tf.stable_count
          FROM task_file_destinations tfd
          INNER JOIN task_files tf ON tf.id = tfd.task_file_id
          WHERE tf.task_id = ? ${providerCondition}
@@ -190,8 +216,73 @@ export class TaskDestinationRepo {
       ...rowToFileDestination(row),
       taskId: row.task_id as string,
       relativePath: row.relative_path as string,
-      fileSize: row.file_size as number
+      fileSize: row.file_size as number,
+      mtimeMs: Number(row.mtime_ms || 0),
+      retryCount: Number(row.retry_count || 0),
+      nextRetryAt: (row.next_retry_at as string) || null,
+      sourceStatus: (row.source_status as 'present' | 'missing') || 'present',
+      stableCount: Number(row.stable_count || 0)
     }))
+  }
+
+  listReadyFileTargets(
+    taskId: string,
+    requiredStableChecks: number,
+    now = new Date().toISOString()
+  ): FileDestinationUploadTarget[] {
+    const rows = getDb()
+      .prepare(
+        `SELECT tfd.*, tf.task_id, tf.relative_path, tf.file_size,
+          tf.mtime_ms, tf.retry_count, tf.next_retry_at,
+          tf.source_status, tf.stable_count
+         FROM task_file_destinations tfd
+         INNER JOIN task_files tf ON tf.id = tfd.task_file_id
+         WHERE tf.task_id = ?
+           AND tfd.status = 'pending'
+           AND tf.source_status = 'present'
+           AND tf.stable_count >= ?
+           AND (tf.next_retry_at IS NULL OR tf.next_retry_at <= ?)
+         ORDER BY tf.created_at, tfd.provider`
+      )
+      .all(taskId, requiredStableChecks, now) as Record<string, unknown>[]
+    return rows.map((row) => ({
+      ...rowToFileDestination(row),
+      taskId: row.task_id as string,
+      relativePath: row.relative_path as string,
+      fileSize: row.file_size as number,
+      mtimeMs: Number(row.mtime_ms || 0),
+      retryCount: Number(row.retry_count || 0),
+      nextRetryAt: (row.next_retry_at as string) || null,
+      sourceStatus: (row.source_status as 'present' | 'missing') || 'present',
+      stableCount: Number(row.stable_count || 0)
+    }))
+  }
+
+  summarizeFileTargets(
+    taskId: string,
+    provider: CloudProvider,
+    now = new Date().toISOString()
+  ): FileDestinationSummary {
+    const row = getDb().prepare(
+      `SELECT
+         COUNT(*) AS total,
+         SUM(CASE WHEN tfd.status = 'failed' THEN 1 ELSE 0 END) AS failed,
+         SUM(CASE WHEN tfd.status = 'pending' THEN 1 ELSE 0 END) AS pending,
+         SUM(CASE
+           WHEN tfd.status = 'pending'
+            AND tf.next_retry_at IS NOT NULL
+            AND tf.next_retry_at > ?
+           THEN 1 ELSE 0 END) AS retry_waiting
+       FROM task_file_destinations tfd
+       INNER JOIN task_files tf ON tf.id = tfd.task_file_id
+       WHERE tf.task_id = ? AND tfd.provider = ?`
+    ).get(now, taskId, provider) as Record<string, number>
+    return {
+      total: row.total || 0,
+      failed: row.failed || 0,
+      pending: row.pending || 0,
+      retryWaiting: row.retry_waiting || 0
+    }
   }
 
   updateFileStatus(
@@ -224,6 +315,31 @@ export class TaskDestinationRepo {
     return status
   }
 
+  recalculateProgress(taskId: string, provider: CloudProvider): void {
+    const row = getDb().prepare(
+      `SELECT
+         COUNT(*) AS total_files,
+         COALESCE(SUM(tf.file_size), 0) AS total_bytes,
+         SUM(CASE WHEN tfd.status = 'completed' THEN 1 ELSE 0 END) AS uploaded_files,
+         COALESCE(SUM(CASE WHEN tfd.status = 'completed' THEN tf.file_size ELSE 0 END), 0) AS uploaded_bytes
+       FROM task_file_destinations tfd
+       INNER JOIN task_files tf ON tf.id = tfd.task_file_id
+       WHERE tf.task_id = ? AND tfd.provider = ?`
+    ).get(taskId, provider) as Record<string, number>
+    this.setTotals(
+      taskId,
+      provider,
+      row.total_files || 0,
+      row.total_bytes || 0
+    )
+    this.updateProgress(
+      taskId,
+      provider,
+      row.uploaded_files || 0,
+      row.uploaded_bytes || 0
+    )
+  }
+
   resetFailed(taskId: string, provider?: CloudProvider): void {
     const db = getDb()
     const now = new Date().toISOString()
@@ -237,8 +353,15 @@ export class TaskDestinationRepo {
 
     db.prepare(
       `UPDATE task_destinations
-       SET status = CASE WHEN status = 'completed' THEN status ELSE 'pending' END,
-         error_message = NULL, completed_at = CASE WHEN status = 'completed' THEN completed_at ELSE NULL END,
+       SET status = CASE
+             WHEN status IN ('completed', 'synced') THEN status
+             ELSE 'pending'
+           END,
+         error_message = NULL,
+         completed_at = CASE
+           WHEN status IN ('completed', 'synced') THEN completed_at
+           ELSE NULL
+         END,
          updated_at = ?
        WHERE task_id = ? ${providerCondition}`
     ).run(...destinationParams)

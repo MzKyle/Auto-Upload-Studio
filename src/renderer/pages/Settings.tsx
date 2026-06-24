@@ -148,7 +148,7 @@ export default function Settings() {
           <div>
             <Label>数据根目录</Label>
             <p className="text-xs text-muted-foreground mt-1">
-              根目录下仅识别 YYYY-MM-DD 日期目录，并上传其直接焊接子目录
+              根目录下仅自动扫描当天 YYYY-MM-DD 日期目录；旧日期需要手动添加具体工作次目录
             </p>
             <div className="flex flex-wrap gap-2 mt-2">
               {local.scan.directories.map((dir) => (
@@ -187,6 +187,27 @@ export default function Settings() {
                 className="mt-1"
               />
             </div>
+            <div className="col-span-2">
+              <Label>工作次目录正则</Label>
+              <Input
+                value={local.scan.workDirNamePattern || "^\\d{2}-\\d{2}-\\d{2}$"}
+                onChange={(e) =>
+                  setLocal((p) => ({
+                    ...p,
+                    scan: {
+                      ...p.scan,
+                      workDirNamePattern: e.target.value,
+                    },
+                  }))
+                }
+                className="mt-1"
+              />
+              <p className="text-xs text-muted-foreground mt-1">
+                只自动上传匹配该规则的当天工作次目录；默认匹配 20-46-05 这类目录
+              </p>
+            </div>
+          </div>
+          <div className="grid grid-cols-3 gap-4">
             <div>
               <Label>稳定性检查次数</Label>
               <Input

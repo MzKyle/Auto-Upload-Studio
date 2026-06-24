@@ -11,7 +11,6 @@ graph TB
     Settings["Settings<br/>双云配置"]
     History["History<br/>分云历史"]
     Remote["SSHMachines"]
-    Annotation["Annotation"]
   end
   subgraph Main["Main"]
     IPC["IPC Handlers"]
@@ -50,7 +49,7 @@ graph TB
 
 ## 核心边界
 
-- `ScannerService`：发现日期和焊接目录、稳定性检查、日期封账。
+- `ScannerService`：发现当天日期和工作次目录、稳定性检查、忽略目录登记、日期封账。
 - `TaskQueueService`：时间窗口和任务级并发。
 - `TaskRunnerService`：文件过滤、分云上传、恢复、重试和标记文件。
 - `CloudUploadService`：根据提供方选择阿里或腾讯上传适配器。
@@ -72,3 +71,4 @@ SQLite 是应用查询和恢复的主要状态源；数据目录内的三个 JSO
 - 为未完成任务文件创建阿里云 `task_file_destinations`。
 - 补齐 `upload_target_mode`、`day_folder_id`、`upload_relative_path`。
 - 从本地或远程路径推导未完成任务的日期层上传路径。
+- 将源目录已删除的未完成任务标记为已跳过，避免启动恢复阻塞。

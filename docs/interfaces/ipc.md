@@ -29,7 +29,7 @@
 | `settings:test-oss` | invoke | 测试阿里云 OSS |
 | `settings:test-tencent-s3` | invoke | 测试腾讯云 TurboS3 |
 
-## 远程、历史与标注
+## 远程与历史
 
 | 通道 | 方向 | 说明 |
 | --- | --- | --- |
@@ -38,10 +38,8 @@
 | `sftp:start/stop/progress` | invoke/push | SFTP 多云直传与进度 |
 | `history:list` | invoke | 按 `provider` 分页查询历史 |
 | `history:clear` / `history:delete` | invoke | 删除历史 |
-| `annotation:*` | invoke | 图片读取、导出和上传 |
 
-`sftp:start` 和 `annotation:upload-oss` 返回 `MultiCloudOperationResult`。其中
-`annotation:upload-oss` 是兼容保留的历史名称，实际已支持阿里、腾讯和双云模式。
+`sftp:start` 返回 `MultiCloudOperationResult`，按当前上传模式返回一个或多个云端结果。
 
 ## 其他
 

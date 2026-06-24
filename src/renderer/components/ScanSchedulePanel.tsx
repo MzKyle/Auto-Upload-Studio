@@ -129,6 +129,12 @@ export function ScanSchedulePanel() {
                   <CheckCircle className="h-3 w-3" />
                   已注册 {status.lastScanResults.existingDirs} 个
                 </span>
+                {status.lastScanResults.ignoredDirectories > 0 && (
+                  <span className="flex items-center gap-1 text-amber-600">
+                    <AlertCircle className="h-3 w-3" />
+                    已忽略目录 {status.lastScanResults.ignoredDirectories} 个
+                  </span>
+                )}
               </div>
             )}
 

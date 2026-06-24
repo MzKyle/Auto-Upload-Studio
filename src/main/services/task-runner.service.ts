@@ -1,11 +1,9 @@
+import { existsSync, statSync } from 'fs'
 import { join } from 'path'
-import log from 'electron-log'
 import { BrowserWindow } from 'electron'
+import log from 'electron-log'
 import { IPC } from '@shared/ipc-channels'
-import {
-  buildOssKey,
-  deriveDateScopedUploadRelativePath
-} from '@shared/day-folder'
+import { buildOssKey, deriveDateScopedUploadRelativePath } from '@shared/day-folder'
 import { getTaskRepo } from '../db/task.repo'
 import {
   getTaskDestinationRepo,
@@ -20,10 +18,10 @@ import { SpeedCalculator } from '../utils/speed-calculator'
 import { getUploadSemaphore } from '../utils/upload-semaphore'
 import type {
   CloudProvider,
-  FileStatus,
   ProcessTaskMarker,
   Task,
-  TaskProgress
+  TaskProgress,
+  TaskStatus
 } from '@shared/types'
 
 interface ProviderRuntime {
@@ -33,77 +31,127 @@ interface ProviderRuntime {
   uploadedBytes: number
   totalFiles: number
   totalBytes: number
+  queuedFiles: number
+  failedFiles: number
+  skippedFiles: number
+  activeUploads: Map<string, number>
+  transferredBytes: number
+  lastBroadcastAt: number
 }
 
-export class TaskRunnerService {
-  private readonly maxUploadRetries = 2
+interface LogicalProgress {
+  completed: Set<string>
+  uploadedBytes: number
+}
 
-  async run(task: Task, signal?: AbortSignal): Promise<void> {
+const RETRY_DELAYS_MS = [1000, 2000, 5000, 15000, 30000]
+
+export class TaskRunnerService {
+  async run(task: Task, signal?: AbortSignal): Promise<TaskStatus> {
     const taskRepo = getTaskRepo()
     const destinationRepo = getTaskDestinationRepo()
     const settings = getSettingsRepo().getAll()
-    const uploadConfig = settings.upload
-    const filter = new FileFilterService(settings.filter)
-    const semaphore = getUploadSemaphore(uploadConfig.maxConcurrentUploads || 30)
+    const stableChecks =
+      task.sourceType === 'local' && task.dayFolderId
+        ? Math.max(2, settings.stability.checkCount || 2)
+        : 1
+
+    if (!existsSync(task.folderPath)) {
+      destinationRepo.updateIncompleteStatuses(
+        task.id,
+        'skipped',
+        '源目录已删除'
+      )
+      return 'skipped'
+    }
+
     const dateScopedUploadPath = deriveDateScopedUploadRelativePath(task.folderPath)
     if (
       dateScopedUploadPath &&
-      task.status !== 'completed' &&
-      task.uploadRelativePath !== dateScopedUploadPath
+      task.uploadRelativePath !== dateScopedUploadPath &&
+      task.status !== 'completed'
     ) {
       taskRepo.updateUploadRelativePath(task.id, dateScopedUploadPath)
       task.uploadRelativePath = dateScopedUploadPath
     }
 
+    await this.reconcileBeforeUpload(task, stableChecks)
     const destinations = destinationRepo.listByTask(task.id)
     if (destinations.length === 0) {
       throw new Error('任务没有配置任何上传目标')
     }
 
-    const activeDestinations = destinations.filter(
-      (destination) => destination.status === 'pending'
+    const jobs = destinationRepo.listReadyFileTargets(
+      task.id,
+      stableChecks
     )
-    if (activeDestinations.length === 0) {
-      const failed = destinations.filter(
-        (destination) => destination.status === 'failed'
-      )
-      if (failed.length > 0) {
-        throw new Error(
-          `仍有未重试的失败云端: ${failed
-            .map((destination) => destination.provider)
-            .join(', ')}`
-        )
-      }
-      return
+    if (jobs.length === 0) {
+      taskRepo.recalculateProgress(task.id)
+      return this.updateDestinationFinalStates(task)
     }
-    const runtimes = new Map<CloudProvider, ProviderRuntime>()
-
-    for (const destination of activeDestinations) {
-      const validationError = getCloudUploadService().validateProvider(
+    const jobProviders = new Set(jobs.map((job) => job.provider))
+    for (const destination of destinations) {
+      if (!jobProviders.has(destination.provider)) continue
+      const error = getCloudUploadService().validateProvider(
         destination.provider,
         settings
       )
-      if (validationError) throw new Error(validationError)
+      if (error) throw new Error(error)
     }
+    const completedLogicalFiles = taskRepo.listFiles(task.id, 'completed')
+    const logicalProgress: LogicalProgress = {
+      completed: new Set(completedLogicalFiles.map((file) => file.id)),
+      uploadedBytes: completedLogicalFiles.reduce(
+        (sum, file) => sum + file.fileSize,
+        0
+      )
+    }
+
+    const providers = Array.from(new Set(jobs.map((job) => job.provider)))
+    const runtimes = new Map<CloudProvider, ProviderRuntime>()
     try {
-      for (const destination of activeDestinations) {
+      for (const provider of providers) {
+        const destination = destinations.find((item) => item.provider === provider)
+        if (!destination) continue
         const uploader = await getCloudUploadService().createTaskUploader(
-          destination.provider,
+          provider,
           settings,
-          uploadConfig.multipartThreshold
+          settings.upload.multipartThreshold
         )
-        runtimes.set(destination.provider, {
+        const providerTargets = destinationRepo.listFileTargets(task.id, provider)
+        runtimes.set(provider, {
           uploader,
           speed: new SpeedCalculator(),
-          uploadedFiles: 0,
-          uploadedBytes: 0,
-          totalFiles: 0,
-          totalBytes: 0
+          uploadedFiles: providerTargets.filter(
+            (target) => target.status === 'completed'
+          ).length,
+          uploadedBytes: providerTargets
+            .filter((target) => target.status === 'completed')
+            .reduce((sum, target) => sum + target.fileSize, 0),
+          totalFiles: providerTargets.length,
+          totalBytes: providerTargets.reduce(
+            (sum, target) => sum + target.fileSize,
+            0
+          ),
+          queuedFiles: providerTargets.filter(
+            (target) => target.status === 'pending'
+          ).length,
+          failedFiles: providerTargets.filter(
+            (target) => target.status === 'failed'
+          ).length,
+          skippedFiles: providerTargets.filter(
+            (target) => target.status === 'skipped'
+          ).length,
+          activeUploads: new Map(),
+          transferredBytes: 0,
+          lastBroadcastAt: 0
         })
+        destinationRepo.updateStatus(task.id, provider, 'uploading')
+        this.broadcastDestinationStatus(task.id, provider, 'uploading')
       }
-    } catch (err) {
+    } catch (error) {
       for (const runtime of runtimes.values()) runtime.uploader.dispose()
-      throw err
+      throw error
     }
 
     const abortUploaders = (): void => {
@@ -111,516 +159,389 @@ export class TaskRunnerService {
     }
     signal?.addEventListener('abort', abortUploaders, { once: true })
 
+    const marker = this.createCompactMarker(
+      { ...task, status: 'uploading' },
+      destinations
+    )
+    this.writeMarker(task.folderPath, marker)
+    const markerTimer = setInterval(() => {
+      const currentTask = taskRepo.getById(task.id)
+      if (!currentTask) return
+      this.writeMarker(
+        task.folderPath,
+        this.createCompactMarker(
+          currentTask,
+          destinationRepo.listByTask(task.id)
+        )
+      )
+    }, 2000)
+
+    const semaphore = getUploadSemaphore(
+      settings.upload.maxConcurrentUploads || 24
+    )
+    let nextIndex = 0
+    const workerCount = Math.max(
+      1,
+      Math.min(settings.upload.maxFilesPerTask || 12, jobs.length)
+    )
+
+    const runNext = async (): Promise<void> => {
+      while (nextIndex < jobs.length && !signal?.aborted) {
+        const target = jobs[nextIndex++]
+        await this.uploadTarget(
+          task,
+          target,
+          destinations,
+          runtimes,
+          semaphore,
+          logicalProgress,
+          signal
+        )
+      }
+    }
+
     try {
-      if (signal?.aborted) throw new DOMException('Upload cancelled', 'AbortError')
-      taskRepo.updateStatus(task.id, 'scanning')
-      for (const destination of activeDestinations) {
-        destinationRepo.updateStatus(task.id, destination.provider, 'scanning')
-        this.broadcastDestinationStatus(task.id, destination.provider, 'scanning')
-      }
-
-      const files = filter.scanFolder(task.folderPath)
-      const totalBytes = files.reduce((sum, file) => sum + file.size, 0)
-      log.info(
-        `任务 ${task.id}: 扫描到 ${files.length} 个文件, 目标 ${destinations
-          .map((item) => item.provider)
-          .join(',')}`
-      )
-
-      taskRepo.setTotals(task.id, files.length, totalBytes)
-      this.registerFiles(task, files)
-      destinationRepo.ensureForTaskFiles(task.id)
-
-      for (const destination of destinations) {
-        destinationRepo.setTotals(
-          task.id,
-          destination.provider,
-          files.length,
-          totalBytes
-        )
-      }
-
-      if (files.length === 0) {
-        this.completeEmptyTask(task, destinations.map((item) => item.provider))
-        return
-      }
-
-      const allTargets = destinationRepo.listFileTargets(task.id)
-      const filesById = new Map(
-        taskRepo.listFiles(task.id).map((file) => [file.id, file])
-      )
-      const logicalCompleted = new Set(
-        taskRepo
-          .listFiles(task.id, 'completed')
-          .map((file) => file.id)
-      )
-      let logicalUploadedBytes = Array.from(logicalCompleted).reduce(
-        (sum, id) => sum + (filesById.get(id)?.fileSize || 0),
-        0
-      )
-
-      const processMarker = this.createProcessMarker(task, files, allTargets)
-      writeProcessTask(task.folderPath, processMarker)
-      const targetsByProvider = this.groupTargets(allTargets)
-
-      for (const destination of destinations) {
-        const providerTargets = targetsByProvider.get(destination.provider) || []
-        const completed = providerTargets.filter(
-          (target) => target.status === 'completed'
-        )
-        const runtime = runtimes.get(destination.provider)
-        if (runtime) {
-          runtime.totalFiles = files.length
-          runtime.totalBytes = totalBytes
-          runtime.uploadedFiles = completed.length
-          runtime.uploadedBytes = completed.reduce(
-            (sum, target) => sum + target.fileSize,
-            0
-          )
-          destinationRepo.updateStatus(task.id, destination.provider, 'uploading')
-          this.broadcastDestinationStatus(task.id, destination.provider, 'uploading')
-          destinationRepo.updateProgress(
-            task.id,
-            destination.provider,
-            runtime.uploadedFiles,
-            runtime.uploadedBytes
-          )
-          this.broadcastProgress(
-            task.id,
-            destination.provider,
-            runtime,
-            null
-          )
-        }
-      }
-
-      taskRepo.updateStatus(task.id, 'uploading')
-      taskRepo.updateProgress(
-        task.id,
-        logicalCompleted.size,
-        logicalUploadedBytes
-      )
-
-      const activeProviders = new Set(
-        activeDestinations.map((destination) => destination.provider)
-      )
-      const jobs = allTargets.filter(
-        (target) =>
-          activeProviders.has(target.provider) &&
-          target.status !== 'completed'
-      )
-
-      let index = 0
-      let completedRequests = allTargets.filter(
-        (target) => target.status === 'completed'
-      ).length
-      const workerCount = Math.max(
-        1,
-        Math.min(uploadConfig.maxFilesPerTask || 6, jobs.length || 1)
-      )
-
-      const runNext = async (): Promise<void> => {
-        while (index < jobs.length && !signal?.aborted) {
-          const target = jobs[index++]
-          const runtime = runtimes.get(target.provider)
-          const destination = destinations.find(
-            (item) => item.provider === target.provider
-          )
-          if (!runtime || !destination) continue
-
-          const objectKey = buildOssKey(
-            destination.prefix,
-            task.uploadRelativePath || task.folderName,
-            target.relativePath
-          )
-          const localPath = join(task.folderPath, target.relativePath)
-          let acquired = false
-
-          try {
-            await semaphore.acquire(signal)
-            acquired = true
-            destinationRepo.updateFileStatus(target.id, 'uploading')
-            target.status = 'uploading'
-            this.setMarkerFileStatus(
-              processMarker,
-              target.provider,
-              target.relativePath,
-              'uploading'
-            )
-            this.broadcastProgress(
-              task.id,
-              target.provider,
-              runtime,
-              target.relativePath
-            )
-
-            const uploadResult = await this.uploadWithRetry(
-              runtime.uploader,
-              localPath,
-              objectKey,
-              target.fileSize,
-              (fraction) => {
-                runtime.speed.addSample(Math.round(target.fileSize * fraction))
-                this.broadcastProgress(
-                  task.id,
-                  target.provider,
-                  runtime,
-                  target.relativePath
-                )
-              },
-              signal,
-              task.id,
-              target.relativePath,
-              target.provider
-            )
-
-            destinationRepo.updateFileStatus(
-              target.id,
-              'completed',
-              uploadResult.objectKey,
-              uploadResult.uploadId
-            )
-            target.status = 'completed'
-            this.setMarkerFileStatus(
-              processMarker,
-              target.provider,
-              target.relativePath,
-              'completed'
-            )
-            runtime.uploadedFiles++
-            runtime.uploadedBytes += target.fileSize
-            completedRequests++
-            destinationRepo.updateProgress(
-              task.id,
-              target.provider,
-              runtime.uploadedFiles,
-              runtime.uploadedBytes
-            )
-
-            const logicalStatus = destinationRepo.recalculateLogicalFile(
-              target.taskFileId
-            )
-            if (
-              logicalStatus === 'completed' &&
-              !logicalCompleted.has(target.taskFileId)
-            ) {
-              logicalCompleted.add(target.taskFileId)
-              logicalUploadedBytes += target.fileSize
-              taskRepo.updateProgress(
-                task.id,
-                logicalCompleted.size,
-                logicalUploadedBytes
-              )
-            }
-
-            this.updateMarkerAggregate(
-              processMarker,
-              logicalCompleted.size,
-              allTargets
-            )
-            if (
-              completedRequests % 10 === 0 ||
-              completedRequests === allTargets.length
-            ) {
-              writeProcessTask(task.folderPath, processMarker)
-            }
-            this.broadcastProgress(
-              task.id,
-              target.provider,
-              runtime,
-              null
-            )
-          } catch (err) {
-            if (err instanceof DOMException && err.name === 'AbortError') {
-              destinationRepo.updateFileStatus(target.id, 'pending')
-              target.status = 'pending'
-              this.setMarkerFileStatus(
-                processMarker,
-                target.provider,
-                target.relativePath,
-                'pending'
-              )
-              break
-            }
-            const message = err instanceof Error ? err.message : String(err)
-            destinationRepo.updateFileStatus(
-              target.id,
-              'failed',
-              undefined,
-              undefined,
-              message
-            )
-            target.status = 'failed'
-            destinationRepo.recalculateLogicalFile(target.taskFileId)
-            this.setMarkerFileStatus(
-              processMarker,
-              target.provider,
-              target.relativePath,
-              'failed'
-            )
-            log.error(
-              `上传失败 [${target.provider}] ${target.relativePath}:`,
-              message
-            )
-          } finally {
-            if (acquired) semaphore.release()
-          }
-        }
-      }
-
       await Promise.all(
         Array.from({ length: workerCount }, () => runNext())
       )
-
-      if (signal?.aborted) {
-        processMarker.status = 'paused'
-        processMarker.lastUpdated = new Date().toISOString()
-        for (const destination of activeDestinations) {
-          destinationRepo.updateStatus(task.id, destination.provider, 'paused')
-          this.broadcastDestinationStatus(task.id, destination.provider, 'paused')
-          const marker = processMarker.destinations?.[destination.provider]
-          if (marker) marker.status = 'paused'
-        }
-        writeProcessTask(task.folderPath, processMarker)
-        return
-      }
-
-      this.updateMarkerAggregate(
-        processMarker,
-        logicalCompleted.size,
-        allTargets
-      )
-      const failures: string[] = []
-      for (const destination of destinations) {
-        if (destination.status === 'completed') continue
-        const providerTargets = destinationRepo.listFileTargets(
-          task.id,
-          destination.provider
-        )
-        const failed = providerTargets.filter(
-          (target) => target.status === 'failed'
-        )
-        const runtime = runtimes.get(destination.provider)
-        const marker = processMarker.destinations?.[destination.provider]
-
-        if (failed.length > 0) {
-          const summary = `${failed.length} 个文件上传失败，例如 ${failed
-            .slice(0, 3)
-            .map(
-              (target) =>
-                `${target.relativePath}: ${target.errorMessage || 'unknown error'}`
-            )
-            .join(' | ')}`
-          destinationRepo.updateStatus(
-            task.id,
-            destination.provider,
-            'failed',
-            summary
-          )
-          this.broadcastDestinationStatus(
-            task.id,
-            destination.provider,
-            'failed',
-            summary
-          )
-          if (marker) {
-            marker.status = 'failed'
-            marker.error = summary
-          }
-          failures.push(`${destination.provider}: ${summary}`)
-        } else {
-          destinationRepo.updateStatus(
-            task.id,
-            destination.provider,
-            'completed'
-          )
-          this.broadcastDestinationStatus(
-            task.id,
-            destination.provider,
-            'completed'
-          )
-          if (runtime) {
-            destinationRepo.updateProgress(
-              task.id,
-              destination.provider,
-              runtime.totalFiles,
-              runtime.totalBytes
-            )
-          }
-          if (marker) {
-            marker.status = 'completed'
-            marker.uploadedFiles = marker.totalFiles
-            marker.error = null
-          }
-        }
-      }
-
-      processMarker.lastUpdated = new Date().toISOString()
-      if (failures.length > 0) {
-        processMarker.status = 'failed'
-        processMarker.error = failures.join(' || ')
-        writeProcessTask(task.folderPath, processMarker)
-        throw new Error(processMarker.error)
-      }
-
-      processMarker.status = 'completed'
-      processMarker.uploadedFiles = files.length
-      processMarker.error = null
-      writeProcessTask(task.folderPath, processMarker)
     } finally {
+      clearInterval(markerTimer)
       signal?.removeEventListener('abort', abortUploaders)
       for (const runtime of runtimes.values()) runtime.uploader.dispose()
     }
-  }
 
-  private registerFiles(
-    task: Task,
-    files: Array<{ relativePath: string; size: number }>
-  ): void {
-    const taskRepo = getTaskRepo()
-    const existingPaths = new Set(
-      taskRepo.listFiles(task.id).map((file) => file.relativePath)
-    )
-    const newFiles = files.filter(
-      (file) => !existingPaths.has(file.relativePath)
-    )
-    if (newFiles.length > 0) {
-      taskRepo.bulkCreateFiles(
-        task.id,
-        newFiles.map((file) => ({
-          relativePath: file.relativePath,
-          fileSize: file.size
-        }))
-      )
+    if (signal?.aborted) {
+      return getTaskRepo().getById(task.id)?.status || 'paused'
     }
+
+    taskRepo.recalculateProgress(task.id)
+    const finalStatus = this.updateDestinationFinalStates(task)
+    const currentTask = taskRepo.getById(task.id) || task
+    const finalTask = { ...currentTask, status: finalStatus }
+    this.writeMarker(
+      task.folderPath,
+      this.createCompactMarker(finalTask, destinationRepo.listByTask(task.id))
+    )
+    return finalStatus
   }
 
-  private completeEmptyTask(
+  private async reconcileBeforeUpload(
     task: Task,
-    providers: CloudProvider[]
-  ): void {
+    stableChecks: number
+  ): Promise<void> {
+    const settings = getSettingsRepo().getAll()
+    const files = await new FileFilterService(settings.filter).scanFolderAsync(
+      task.folderPath
+    )
+    getTaskRepo().reconcileFiles(
+      task.id,
+      files.map((file) => ({
+        relativePath: file.relativePath,
+        size: file.size,
+        mtimeMs: file.mtimeMs
+      })),
+      stableChecks
+    )
+  }
+
+  private async uploadTarget(
+    task: Task,
+    target: FileDestinationUploadTarget,
+    destinations: Task['destinations'],
+    runtimes: Map<CloudProvider, ProviderRuntime>,
+    semaphore: ReturnType<typeof getUploadSemaphore>,
+    logicalProgress: LogicalProgress,
+    signal?: AbortSignal
+  ): Promise<void> {
     const taskRepo = getTaskRepo()
     const destinationRepo = getTaskDestinationRepo()
-    taskRepo.updateProgress(task.id, 0, 0)
-    for (const provider of providers) {
-      destinationRepo.setTotals(task.id, provider, 0, 0)
-      destinationRepo.updateProgress(task.id, provider, 0, 0)
-      destinationRepo.updateStatus(task.id, provider, 'completed')
+    const runtime = runtimes.get(target.provider)
+    const destination = destinations.find(
+      (item) => item.provider === target.provider
+    )
+    if (!runtime || !destination) return
+
+    const localPath = join(task.folderPath, target.relativePath)
+    if (!existsSync(localPath)) {
+      destinationRepo.updateFileStatus(
+        target.id,
+        'skipped',
+        undefined,
+        undefined,
+        '源文件已删除'
+      )
+      destinationRepo.recalculateLogicalFile(target.taskFileId)
+      runtime.skippedFiles++
+      runtime.queuedFiles = Math.max(0, runtime.queuedFiles - 1)
+      this.broadcastProgress(task.id, target.provider, runtime, null, true)
+      return
     }
-    writeProcessTask(task.folderPath, {
-      version: 2,
+
+    let acquired = false
+    try {
+      await semaphore.acquire(signal)
+      acquired = true
+      if (signal?.aborted) throw new DOMException('Upload aborted', 'AbortError')
+
+      const before = statSync(localPath)
+      if (
+        before.size !== target.fileSize ||
+        before.mtimeMs !== target.mtimeMs
+      ) {
+        taskRepo.markFileChanged(
+          target.taskFileId,
+          before.size,
+          before.mtimeMs
+        )
+        log.info('文件在进入上传前发生变化，等待重新稳定:', localPath)
+        return
+      }
+      destinationRepo.updateFileStatus(target.id, 'uploading')
+      runtime.activeUploads.set(target.id, 0)
+      runtime.queuedFiles = Math.max(0, runtime.queuedFiles - 1)
+      this.broadcastProgress(
+        task.id,
+        target.provider,
+        runtime,
+        target.relativePath,
+        true
+      )
+
+      const objectKey = buildOssKey(
+        destination.prefix,
+        task.uploadRelativePath || task.folderName,
+        target.relativePath
+      )
+      let previousLoaded = 0
+      const result = await runtime.uploader.uploadFile(
+        localPath,
+        objectKey,
+        target.fileSize,
+        (fraction) => {
+          const loaded = Math.min(
+            target.fileSize,
+            Math.max(0, Math.round(target.fileSize * fraction))
+          )
+          const delta = Math.max(0, loaded - previousLoaded)
+          previousLoaded = loaded
+          runtime.transferredBytes += delta
+          runtime.activeUploads.set(target.id, loaded)
+          runtime.speed.addSample(runtime.transferredBytes)
+          this.broadcastProgress(
+            task.id,
+            target.provider,
+            runtime,
+            target.relativePath
+          )
+        },
+        signal
+      )
+
+      if (existsSync(localPath)) {
+        const after = statSync(localPath)
+        if (
+          after.size !== before.size ||
+          after.mtimeMs !== before.mtimeMs
+        ) {
+          taskRepo.markFileChanged(target.taskFileId, after.size, after.mtimeMs)
+          log.info('文件上传期间发生变化，重新排队:', localPath)
+          return
+        }
+      }
+
+      destinationRepo.updateFileStatus(
+        target.id,
+        'completed',
+        result.objectKey,
+        result.uploadId
+      )
+      const logicalStatus = destinationRepo.recalculateLogicalFile(
+        target.taskFileId
+      )
+      if (logicalStatus === 'completed') {
+        taskRepo.clearRetry(target.taskFileId)
+        if (!logicalProgress.completed.has(target.taskFileId)) {
+          logicalProgress.completed.add(target.taskFileId)
+          logicalProgress.uploadedBytes += target.fileSize
+          taskRepo.updateProgress(
+            task.id,
+            logicalProgress.completed.size,
+            logicalProgress.uploadedBytes
+          )
+        }
+      }
+      runtime.uploadedFiles++
+      runtime.uploadedBytes += target.fileSize
+    } catch (error) {
+      if (error instanceof DOMException && error.name === 'AbortError') {
+        if (taskRepo.getById(task.id)?.status !== 'skipped') {
+          destinationRepo.updateFileStatus(target.id, 'pending')
+        }
+        return
+      }
+
+      const message = error instanceof Error ? error.message : String(error)
+      if (
+        this.isRetriableUploadError(error) &&
+        target.retryCount < RETRY_DELAYS_MS.length
+      ) {
+        const delay = this.retryDelay(target.retryCount)
+        const nextRetryAt = new Date(Date.now() + delay).toISOString()
+        const retryCount = taskRepo.scheduleRetry(
+          target.taskFileId,
+          message,
+          nextRetryAt
+        )
+        destinationRepo.updateFileStatus(
+          target.id,
+          'pending',
+          undefined,
+          undefined,
+          `第 ${retryCount} 次重试等待中: ${message}`
+        )
+        log.warn(
+          `任务 ${task.id} [${target.provider}] 将在 ${delay}ms 后重试: ${target.relativePath}`
+        )
+      } else {
+        destinationRepo.updateFileStatus(
+          target.id,
+          'failed',
+          undefined,
+          undefined,
+          message
+        )
+        destinationRepo.recalculateLogicalFile(target.taskFileId)
+        runtime.failedFiles++
+        log.error(
+          `上传失败 [${target.provider}] ${target.relativePath}:`,
+          message
+        )
+      }
+    } finally {
+      runtime.activeUploads.delete(target.id)
+      if (acquired) semaphore.release()
+      destinationRepo.updateProgress(
+        task.id,
+        target.provider,
+        runtime.uploadedFiles,
+        runtime.uploadedBytes
+      )
+      this.broadcastProgress(task.id, target.provider, runtime, null, true)
+    }
+  }
+
+  private updateDestinationFinalStates(task: Task): TaskStatus {
+    const repo = getTaskDestinationRepo()
+    let taskStatus: TaskStatus =
+      task.sourceType === 'local' && task.dayFolderId ? 'synced' : 'completed'
+
+    for (const destination of repo.listByTask(task.id)) {
+      const targets = repo.listFileTargets(task.id, destination.provider)
+      const failed = targets.filter((target) => target.status === 'failed')
+      const pending = targets.filter((target) => target.status === 'pending')
+      const skipped = targets.filter((target) => target.status === 'skipped')
+
+      if (failed.length > 0) {
+        const summary = `${failed.length} 个文件上传失败，例如 ${failed
+          .slice(0, 3)
+          .map(
+            (target) =>
+              `${target.relativePath}: ${target.errorMessage || 'unknown error'}`
+          )
+          .join(' | ')}`
+        repo.updateStatus(task.id, destination.provider, 'failed', summary)
+        this.broadcastDestinationStatus(
+          task.id,
+          destination.provider,
+          'failed',
+          summary
+        )
+        taskStatus = 'failed'
+      } else if (pending.length > 0) {
+        repo.updateStatus(
+          task.id,
+          destination.provider,
+          'retrying',
+          `${pending.length} 个文件等待自动重试或稳定`
+        )
+        this.broadcastDestinationStatus(
+          task.id,
+          destination.provider,
+          'retrying',
+          `${pending.length} 个文件等待自动重试或稳定`
+        )
+        if (taskStatus !== 'failed') taskStatus = 'retrying'
+      } else {
+        const status: TaskStatus =
+          task.sourceType === 'local' && task.dayFolderId
+            ? 'synced'
+            : 'completed'
+        repo.updateStatus(
+          task.id,
+          destination.provider,
+          status,
+          skipped.length > 0 ? `${skipped.length} 个源文件已跳过` : undefined
+        )
+        this.broadcastDestinationStatus(
+          task.id,
+          destination.provider,
+          status,
+          skipped.length > 0 ? `${skipped.length} 个源文件已跳过` : undefined
+        )
+      }
+      repo.recalculateProgress(task.id, destination.provider)
+    }
+
+    return taskStatus
+  }
+
+  private createCompactMarker(
+    task: Task,
+    destinations: Task['destinations']
+  ): ProcessTaskMarker {
+    const destinationRepo = getTaskDestinationRepo()
+    return {
+      version: 3,
       taskId: task.id,
-      status: 'completed',
-      totalFiles: 0,
-      uploadedFiles: 0,
-      files: {},
+      status: task.status,
+      totalFiles: task.totalFiles,
+      uploadedFiles: task.uploadedFiles,
+      failedFiles: taskRepoCount(task.id, 'failed'),
+      skippedFiles: taskRepoCount(task.id, 'skipped'),
       lastUpdated: new Date().toISOString(),
-      error: null,
+      error:
+        task.errorMessage ||
+        destinations
+          .map((destination) => destination.errorMessage)
+          .filter(Boolean)
+          .join(' || ') ||
+        null,
       uploadTargetMode: task.uploadTargetMode,
       destinations: Object.fromEntries(
-        providers.map((provider) => [
-          provider,
-          {
-            status: 'completed',
-            totalFiles: 0,
-            uploadedFiles: 0,
-            files: {},
-            error: null
-          }
-        ])
+        destinations.map((destination) => {
+          const targets = destinationRepo.listFileTargets(
+            task.id,
+            destination.provider
+          )
+          return [
+            destination.provider,
+            {
+              status: destination.status,
+              totalFiles: targets.length,
+              uploadedFiles: targets.filter(
+                (target) => target.status === 'completed'
+              ).length,
+              failedFiles: targets.filter(
+                (target) => target.status === 'failed'
+              ).length,
+              skippedFiles: targets.filter(
+                (target) => target.status === 'skipped'
+              ).length,
+              error: destination.errorMessage
+            }
+          ]
+        })
       )
-    })
-  }
-
-  private createProcessMarker(
-    task: Task,
-    files: Array<{ relativePath: string }>,
-    targets: FileDestinationUploadTarget[]
-  ): ProcessTaskMarker {
-    const destinations: NonNullable<ProcessTaskMarker['destinations']> = {}
-    for (const destination of task.destinations) {
-      const providerTargets = targets.filter(
-        (target) => target.provider === destination.provider
-      )
-      destinations[destination.provider] = {
-        status:
-          destination.status === 'pending' ? 'uploading' : destination.status,
-        totalFiles: files.length,
-        uploadedFiles: providerTargets.filter(
-          (target) => target.status === 'completed'
-        ).length,
-        files: Object.fromEntries(
-          providerTargets.map((target) => [
-            target.relativePath,
-            target.status === 'uploading' ? 'pending' : target.status
-          ])
-        ),
-        error: null
-      }
-    }
-    return {
-      version: 2,
-      taskId: task.id,
-      status: 'uploading',
-      totalFiles: files.length,
-      uploadedFiles: 0,
-      files: Object.fromEntries(
-        files.map((file) => [file.relativePath, 'pending'])
-      ),
-      lastUpdated: new Date().toISOString(),
-      error: null,
-      uploadTargetMode: task.uploadTargetMode,
-      destinations
-    }
-  }
-
-  private groupTargets(
-    targets: FileDestinationUploadTarget[]
-  ): Map<CloudProvider, FileDestinationUploadTarget[]> {
-    const result = new Map<CloudProvider, FileDestinationUploadTarget[]>()
-    for (const target of targets) {
-      const list = result.get(target.provider) || []
-      list.push(target)
-      result.set(target.provider, list)
-    }
-    return result
-  }
-
-  private setMarkerFileStatus(
-    marker: ProcessTaskMarker,
-    provider: CloudProvider,
-    relativePath: string,
-    status: FileStatus
-  ): void {
-    const destination = marker.destinations?.[provider]
-    if (destination) {
-      destination.files[relativePath] = status
-      destination.uploadedFiles = Object.values(destination.files).filter(
-        (value) => value === 'completed'
-      ).length
-    }
-  }
-
-  private updateMarkerAggregate(
-    marker: ProcessTaskMarker,
-    uploadedFiles: number,
-    allTargets: FileDestinationUploadTarget[]
-  ): void {
-    marker.uploadedFiles = uploadedFiles
-    marker.lastUpdated = new Date().toISOString()
-    const relativePaths = new Set(allTargets.map((target) => target.relativePath))
-    for (const relativePath of relativePaths) {
-      const targets = allTargets.filter(
-        (target) => target.relativePath === relativePath
-      )
-      const latestStatuses = targets.map((target) => target.status)
-      marker.files[relativePath] = latestStatuses.every(
-        (status) => status === 'completed'
-      )
-        ? 'completed'
-        : latestStatuses.some((status) => status === 'failed')
-          ? 'failed'
-          : 'pending'
     }
   }
 
@@ -628,27 +549,52 @@ export class TaskRunnerService {
     taskId: string,
     provider: CloudProvider,
     runtime: ProviderRuntime,
-    currentFile: string | null
+    currentFile: string | null,
+    force = false
   ): void {
+    const now = Date.now()
+    if (!force && now - runtime.lastBroadcastAt < 250) return
+    runtime.lastBroadcastAt = now
+    const inFlightBytes = Array.from(runtime.activeUploads.values()).reduce(
+      (sum, bytes) => sum + bytes,
+      0
+    )
     const progress: TaskProgress = {
       taskId,
       provider,
       uploadedFiles: runtime.uploadedFiles,
       totalFiles: runtime.totalFiles,
-      uploadedBytes: runtime.uploadedBytes,
+      uploadedBytes: Math.min(
+        runtime.totalBytes,
+        runtime.uploadedBytes + inFlightBytes
+      ),
       totalBytes: runtime.totalBytes,
       speed: runtime.speed.getSpeed(),
-      currentFile
+      currentFile,
+      queuedFiles: runtime.queuedFiles,
+      activeUploads: runtime.activeUploads.size,
+      failedFiles: runtime.failedFiles,
+      skippedFiles: runtime.skippedFiles,
+      transferredBytes: runtime.transferredBytes
     }
     for (const win of BrowserWindow.getAllWindows()) {
       win.webContents.send(IPC.TASK_PROGRESS, progress)
     }
   }
 
+  private writeMarker(folderPath: string, marker: ProcessTaskMarker): void {
+    if (!existsSync(folderPath)) return
+    try {
+      writeProcessTask(folderPath, marker)
+    } catch (error) {
+      log.warn('写入任务汇总标记失败:', folderPath, error)
+    }
+  }
+
   private broadcastDestinationStatus(
     taskId: string,
     provider: CloudProvider,
-    status: Task['status'],
+    status: TaskStatus,
     errorMessage?: string
   ): void {
     for (const win of BrowserWindow.getAllWindows()) {
@@ -661,45 +607,15 @@ export class TaskRunnerService {
     }
   }
 
-  private async uploadWithRetry(
-    uploader: CloudTaskUploader,
-    localPath: string,
-    objectKey: string,
-    fileSize: number,
-    onProgress: (fraction: number) => void,
-    signal: AbortSignal | undefined,
-    taskId: string,
-    relativePath: string,
-    provider: CloudProvider
-  ): Promise<Awaited<ReturnType<CloudTaskUploader['uploadFile']>>> {
-    let attempt = 0
-    while (true) {
-      try {
-        const result = await uploader.uploadFile(
-          localPath,
-          objectKey,
-          fileSize,
-          onProgress,
-          signal
-        )
-        return result
-      } catch (err) {
-        if (err instanceof DOMException && err.name === 'AbortError') throw err
-        if (!this.isRetriableUploadError(err) || attempt >= this.maxUploadRetries) {
-          throw err
-        }
-        attempt++
-        const delayMs = Math.min(5000, 500 * 2 ** (attempt - 1))
-        log.warn(
-          `任务 ${taskId} [${provider}] 文件重试 ${attempt}/${this.maxUploadRetries}: ${relativePath}`
-        )
-        await this.sleep(delayMs)
-      }
-    }
+  private retryDelay(retryCount: number): number {
+    const base =
+      RETRY_DELAYS_MS[Math.min(retryCount, RETRY_DELAYS_MS.length - 1)]
+    const jitter = 0.8 + Math.random() * 0.4
+    return Math.round(base * jitter)
   }
 
-  private isRetriableUploadError(err: unknown): boolean {
-    const error = err as {
+  private isRetriableUploadError(errorValue: unknown): boolean {
+    const error = errorValue as {
       code?: string
       status?: number
       name?: string
@@ -716,16 +632,21 @@ export class TaskRunnerService {
       'ESOCKETTIMEDOUT',
       'EAI_AGAIN',
       'ENOTFOUND',
-      'EPIPE'
+      'EPIPE',
+      'ECONNREFUSED'
     ])
     if (error.code && transientCodes.has(error.code)) return true
     const text = `${error.name || ''} ${error.message || ''}`.toLowerCase()
-    return text.includes('timeout') || text.includes('temporarily unavailable')
+    return (
+      text.includes('timeout') ||
+      text.includes('temporarily unavailable') ||
+      text.includes('socket hang up')
+    )
   }
+}
 
-  private sleep(ms: number): Promise<void> {
-    return new Promise((resolve) => setTimeout(resolve, ms))
-  }
+function taskRepoCount(taskId: string, status: string): number {
+  return getTaskRepo().listFiles(taskId, status).length
 }
 
 let instance: TaskRunnerService | null = null

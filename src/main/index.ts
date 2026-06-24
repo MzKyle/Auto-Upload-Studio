@@ -24,8 +24,53 @@ import type { WebhookConfig, LogConfig } from '@shared/types'
 import log from 'electron-log'
 
 let mainWindow: BrowserWindow | null = null
-let annotationWindow: BrowserWindow | null = null
+let startupWindow: BrowserWindow | null = null
 let tray: Tray | null = null
+let servicesStarted = false
+
+const hasSingleInstanceLock = app.requestSingleInstanceLock()
+if (!hasSingleInstanceLock) {
+  app.quit()
+}
+
+app.on('second-instance', () => {
+  const window = mainWindow || startupWindow
+  if (!window || window.isDestroyed()) return
+  if (window.isMinimized()) window.restore()
+  window.show()
+  window.focus()
+})
+
+async function createStartupWindow(): Promise<void> {
+  startupWindow = new BrowserWindow({
+    width: 460,
+    height: 220,
+    resizable: false,
+    minimizable: false,
+    maximizable: false,
+    show: false,
+    title: '数据采集上传工具正在启动',
+    backgroundColor: '#f8fafc',
+    webPreferences: {
+      sandbox: true,
+      contextIsolation: true,
+      nodeIntegration: false
+    }
+  })
+  startupWindow.once('ready-to-show', () => startupWindow?.show())
+  const html = `<!doctype html>
+    <html lang="zh-CN">
+      <head><meta charset="utf-8"><title>正在启动</title></head>
+      <body style="margin:0;font-family:sans-serif;background:#f8fafc;color:#0f172a">
+        <main style="height:220px;display:flex;flex-direction:column;align-items:center;justify-content:center">
+          <div style="font-size:18px;font-weight:600">数据采集上传工具正在启动</div>
+          <div style="margin-top:14px;font-size:14px;color:#475569">正在检查和升级本地数据库，请勿重复启动或强制关机。</div>
+          <div style="margin-top:8px;font-size:12px;color:#64748b">历史文件较多时首次升级可能需要几分钟。</div>
+        </main>
+      </body>
+    </html>`
+  await startupWindow.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(html)}`)
+}
 
 function createWindow(): void {
   mainWindow = new BrowserWindow({
@@ -44,7 +89,19 @@ function createWindow(): void {
   })
 
   mainWindow.on('ready-to-show', () => {
+    startupWindow?.destroy()
+    startupWindow = null
     mainWindow?.show()
+    if (!servicesStarted) {
+      servicesStarted = true
+      setTimeout(() => {
+        try {
+          startServices()
+        } catch (error) {
+          log.error('后台服务启动失败:', error)
+        }
+      }, 500)
+    }
   })
 
   // 关闭时隐藏到托盘而不是退出
@@ -123,15 +180,16 @@ function startServices(): void {
   const webhookService = getWebhookService()
   const taskRepo = getTaskRepo()
   const settingsRepo = getSettingsRepo()
+  const scanner = getScannerService()
 
   // 连接任务队列和执行器
   taskQueue.setTaskRunner(async (task, signal) => {
-    await taskRunner.run(task, signal)
-    if (signal.aborted) return
+    const finalStatus = await taskRunner.run(task, signal)
+    if (signal.aborted) return finalStatus
 
     // 上传完成后发送 webhook
     const webhookConfig = settingsRepo.get<WebhookConfig>('webhook')
-    if (webhookConfig?.enabled) {
+    if (webhookConfig?.enabled && finalStatus === 'completed') {
       const updatedTask = taskRepo.getById(task.id)
       if (updatedTask) {
         const createdAt = new Date(updatedTask.createdAt).getTime()
@@ -150,6 +208,7 @@ function startServices(): void {
         })
       }
     }
+    return finalStatus
   })
 
   // 监听任务失败事件发送 webhook
@@ -182,20 +241,18 @@ function startServices(): void {
   // 恢复未完成的任务
   const unfinished = taskRepo.getUnfinishedTasks()
   if (unfinished.length > 0) {
-    log.info(`发现 ${unfinished.length} 个未完成任务，重新加入队列`)
-    for (const task of unfinished) {
-      if (task.status === 'uploading' || task.status === 'scanning') {
-        taskRepo.retry(task.id)
-      }
-    }
+    log.info(`发现 ${unfinished.length} 个未完成任务，等待后台队列分批恢复`)
   }
 
   // 启动任务队列
   taskQueue.start()
 
   // 启动扫描器
-  const scanner = getScannerService()
   scanner.start()
+
+  for (const task of unfinished) {
+    scanner.queueReconcileTask(task)
+  }
 
   // 启动自动清理服务
   getCleanupService().start()
@@ -203,7 +260,8 @@ function startServices(): void {
   log.info('所有服务已启动')
 }
 
-app.whenReady().then(() => {
+app.whenReady().then(async () => {
+  if (!hasSingleInstanceLock) return
   electronApp.setAppUserModelId('com.uploader.app')
 
   app.on('browser-window-created', (_, window) => {
@@ -212,6 +270,24 @@ app.whenReady().then(() => {
 
   // 初始化日志系统（在数据库之前，使用默认配置）
   initLogger()
+  process.on('uncaughtException', (error) => {
+    log.error('主进程未捕获异常:', error)
+  })
+  process.on('unhandledRejection', (reason) => {
+    log.error('主进程未处理 Promise 异常:', reason)
+  })
+  app.on('render-process-gone', (_event, webContents, details) => {
+    log.error('渲染进程异常退出:', {
+      reason: details.reason,
+      exitCode: details.exitCode,
+      url: webContents.getURL()
+    })
+  })
+  app.on('child-process-gone', (_event, details) => {
+    log.error('Electron 子进程异常退出:', details)
+  })
+
+  await createStartupWindow()
 
   // 初始化数据库
   initDatabase()
@@ -234,10 +310,7 @@ app.whenReady().then(() => {
   // 注册全局快捷键
   registerHotkey()
 
-  // 启动后端服务
-  startServices()
-
-  log.info('应用启动完成')
+  log.info('应用界面初始化完成，后台服务将在窗口显示后启动')
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) {
@@ -247,9 +320,13 @@ app.whenReady().then(() => {
 }).catch((error: unknown) => {
   const message = error instanceof Error ? error.message : String(error)
   log.error('应用启动失败:', error)
+  startupWindow?.destroy()
+  startupWindow = null
   dialog.showErrorBox(
     '数据采集上传工具启动失败',
-    `${message}\n\n请查看 ~/.config/electron-uploader/logs 下的日志。`
+    message.includes('database is locked')
+      ? '数据库正在被另一个程序进程使用。请结束旧的数据采集上传工具进程后重试。'
+      : `${message}\n\n请查看 ~/.config/electron-uploader/logs 下的日志。`
   )
   app.quit()
 })
@@ -275,35 +352,4 @@ app.on('before-quit', () => {
 
 export function getMainWindow(): BrowserWindow | null {
   return mainWindow
-}
-
-export function createAnnotationWindow(): void {
-  if (annotationWindow && !annotationWindow.isDestroyed()) {
-    annotationWindow.focus()
-    return
-  }
-
-  annotationWindow = new BrowserWindow({
-    width: 1200,
-    height: 800,
-    minWidth: 960,
-    minHeight: 640,
-    title: '图像标注',
-    webPreferences: {
-      preload: join(__dirname, '../preload/index.js'),
-      sandbox: false,
-      contextIsolation: true,
-      nodeIntegration: false
-    }
-  })
-
-  annotationWindow.on('closed', () => {
-    annotationWindow = null
-  })
-
-  if (is.dev && process.env['ELECTRON_RENDERER_URL']) {
-    annotationWindow.loadURL(process.env['ELECTRON_RENDERER_URL'] + '#/annotation')
-  } else {
-    annotationWindow.loadFile(join(__dirname, '../renderer/index.html'), { hash: 'annotation' })
-  }
 }

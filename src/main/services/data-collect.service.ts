@@ -59,13 +59,6 @@ export class DataCollectService {
       },
       pointCloudCount: 0,
       depthImageCount: 0,
-      annotation: {
-        hasXml: false,
-        dataType: null,
-        qualityType: null,
-        specMin: null,
-        specMax: null
-      },
       totalFileCount: 0,
       totalSizeBytes: 0,
       collectedAt: new Date().toISOString()
@@ -136,23 +129,6 @@ export class DataCollectService {
     // --- 深度图 ---
     const depthDir = join(folderPath, 'camera_depth')
     info.depthImageCount = countFiles(depthDir, '.jpg') + countFiles(depthDir, '.ply')
-
-    // --- 标注 XML ---
-    const xmlPath = join(folderPath, 'annotation', 'segment_timestamps.xml')
-    if (existsSync(xmlPath)) {
-      info.annotation.hasXml = true
-      try {
-        const xmlContent = readFileSync(xmlPath, 'utf-8')
-        info.annotation.dataType = extractXmlTag(xmlContent, 'data_type')
-        info.annotation.qualityType = extractXmlTag(xmlContent, 'quality_type')
-        const specMin = extractXmlTag(xmlContent, 'data_spec_min')
-        const specMax = extractXmlTag(xmlContent, 'data_spec_max')
-        if (specMin !== null) info.annotation.specMin = parseInt(specMin)
-        if (specMax !== null) info.annotation.specMax = parseInt(specMax)
-      } catch {
-        // ignore XML parse error
-      }
-    }
 
     // --- 统计总文件数和总大小 ---
     const { fileCount, totalSize } = walkDirStats(folderPath)
@@ -302,12 +278,6 @@ function getImageTimestampRange(folderPath: string): { tsMin: number | null; tsM
   }
 
   return { tsMin, tsMax, count }
-}
-
-function extractXmlTag(xml: string, tagName: string): string | null {
-  const re = new RegExp(`<${tagName}>\\s*([^<]*)\\s*</${tagName}>`)
-  const m = re.exec(xml)
-  return m ? m[1].trim() : null
 }
 
 function walkDirStats(dirPath: string): { fileCount: number; totalSize: number } {

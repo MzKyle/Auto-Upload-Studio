@@ -8,7 +8,7 @@
 | `day-folder.repo.ts` | 日期汇总、子任务统计和完成查询 |
 | `task.repo.ts` | 逻辑任务与逻辑文件 |
 | `task-destination.repo.ts` | 分云任务、分云文件、进度与重试 |
-| `scanner.service.ts` | 日期发现、稳定性检查、任务注册和封账 |
+| `scanner.service.ts` | 当天日期发现、工作次识别、忽略目录登记、任务注册和封账 |
 | `task-queue.service.ts` | 时间窗口和任务并发 |
 | `task-runner.service.ts` | 过滤、分云上传、恢复和标记文件 |
 | `cloud-upload.service.ts` | 上传提供方适配入口 |
@@ -26,7 +26,6 @@
 | `History` | 分提供方历史与日期汇总 |
 | `Settings` | 上传模式、双云连接测试和自动保存 |
 | `SSHMachines` | 远程机器配置与传输 |
-| `AnnotationApp` | 标注编辑、导出和多云上传 |
 
 ## 共享模块
 

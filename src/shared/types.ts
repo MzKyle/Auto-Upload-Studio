@@ -3,10 +3,25 @@
 // ============================================
 
 // ---- 任务相关 ----
-export type TaskStatus = 'pending' | 'scanning' | 'uploading' | 'completed' | 'failed' | 'paused'
-export type FileStatus = 'pending' | 'uploading' | 'completed' | 'failed'
+export type TaskStatus =
+  | 'pending'
+  | 'scanning'
+  | 'uploading'
+  | 'synced'
+  | 'retrying'
+  | 'completed'
+  | 'failed'
+  | 'paused'
+  | 'skipped'
+export type FileStatus = 'pending' | 'uploading' | 'completed' | 'failed' | 'skipped'
 export type SourceType = 'local' | 'rsync' | 'manual'
-export type DayFolderStatus = 'collecting' | 'processing' | 'blocked' | 'completed'
+export type FileSourceStatus = 'present' | 'missing'
+export type DayFolderStatus =
+  | 'collecting'
+  | 'processing'
+  | 'blocked'
+  | 'completed'
+  | 'completed_with_skips'
 export type SSHAuthType = 'key' | 'password'
 export type TransferMode = 'rsync' | 'sftp'
 export type CloudProvider = 'aliyun' | 'tencent'
@@ -43,8 +58,23 @@ export interface TaskFile {
   ossKey: string | null
   uploadId: string | null
   errorMessage: string | null
+  mtimeMs: number
+  lastSeenAt: string | null
+  sourceStatus: FileSourceStatus
+  stableCount: number
+  retryCount: number
+  nextRetryAt: string | null
   createdAt: string
   updatedAt: string
+}
+
+export interface TaskFileDetail extends TaskFile {
+  destinations: TaskFileDestination[]
+}
+
+export interface TaskDetail {
+  task: Task
+  files: TaskFileDetail[]
 }
 
 export interface TaskDestination {
@@ -85,6 +115,11 @@ export interface TaskProgress {
   totalBytes: number
   speed: number // bytes per second
   currentFile: string | null
+  queuedFiles: number
+  activeUploads: number
+  failedFiles: number
+  skippedFiles: number
+  transferredBytes: number
 }
 
 export interface TaskStatusEvent {
@@ -115,6 +150,7 @@ export interface DayFolderSummary {
   createdAt: string
   updatedAt: string
   completedAt: string | null
+  ignored: boolean
 }
 
 export interface DayFolderListQuery {
@@ -205,6 +241,7 @@ export interface WebhookConfig {
 export interface ScanConfig {
   directories: string[]
   intervalSeconds: number
+  workDirNamePattern?: string
 }
 
 export interface UploadConfig {
@@ -266,6 +303,8 @@ export interface ScannerStatus {
     scannedDirs: number
     newDirsFound: number
     existingDirs: number
+    ignoredDirectories: number
+    skippedChildren: number
     timestamp: string
   } | null
 }
@@ -295,13 +334,6 @@ export interface DataCollectInfo {
   controlCmd: { speedRows: number; freqRows: number }
   pointCloudCount: number
   depthImageCount: number
-  annotation: {
-    hasXml: boolean
-    dataType: string | null
-    qualityType: string | null
-    specMin: number | null
-    specMax: number | null
-  }
   totalFileCount: number
   totalSizeBytes: number
   collectedAt: string
@@ -359,7 +391,9 @@ export interface ProcessTaskDestinationMarker {
   status: TaskStatus
   totalFiles: number
   uploadedFiles: number
-  files: Record<string, FileStatus>
+  files?: Record<string, FileStatus>
+  failedFiles?: number
+  skippedFiles?: number
   error: string | null
 }
 
@@ -369,7 +403,9 @@ export interface ProcessTaskMarker {
   status: TaskStatus
   totalFiles: number
   uploadedFiles: number
-  files: Record<string, FileStatus>
+  files?: Record<string, FileStatus>
+  failedFiles?: number
+  skippedFiles?: number
   lastUpdated: string
   error: string | null
   uploadTargetMode?: UploadTargetMode
@@ -381,7 +417,7 @@ export interface DayUploadMarker {
   dayFolderId: string
   date: string
   folderPath: string
-  status: 'completed'
+  status: 'completed' | 'completed_with_skips'
   totalChildren: number
   totalFiles: number
   uploadedFiles: number

@@ -1,7 +1,13 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import Database from 'better-sqlite3'
-import { runMigrations } from '../src/main/db/database'
+import { mkdirSync, mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import {
+  reconcileStartupState,
+  runMigrations
+} from '../src/main/db/database'
 
 function createLegacyDatabase(): Database.Database {
   const db = new Database(':memory:')
@@ -185,5 +191,106 @@ test('legacy rsync tasks recover the date and child package from the remote path
     upload_relative_path: '2026-03-14/17-38-09_teleop'
   })
 
+  db.close()
+})
+
+test('startup reconciliation resumes existing sources and skips deleted sources', () => {
+  const db = createLegacyDatabase()
+  runMigrations(db)
+  const root = mkdtempSync(join(tmpdir(), 'uploader-reconcile-'))
+  const existingPath = join(root, 'existing')
+  const missingPath = join(root, 'missing')
+  mkdirSync(existingPath)
+  const now = new Date().toISOString()
+  const insertTask = db.prepare(`
+    INSERT INTO tasks (
+      id, folder_path, folder_name, status, oss_prefix, upload_target_mode,
+      upload_relative_path, source_type, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, '', 'aliyun', ?, 'local', ?, ?)
+  `)
+  insertTask.run(
+    'existing-task',
+    existingPath,
+    'existing',
+    'uploading',
+    '2026-06-18/existing',
+    now,
+    now
+  )
+  insertTask.run(
+    'missing-task',
+    missingPath,
+    'missing',
+    'uploading',
+    '2026-06-18/missing',
+    now,
+    now
+  )
+
+  db.prepare(`
+    INSERT INTO task_destinations (
+      id, task_id, provider, status, prefix, created_at, updated_at
+    ) VALUES (?, ?, 'aliyun', 'uploading', '', ?, ?)
+  `).run('destination-existing', 'existing-task', now, now)
+  db.prepare(`
+    INSERT INTO task_destinations (
+      id, task_id, provider, status, prefix, created_at, updated_at
+    ) VALUES (?, ?, 'aliyun', 'uploading', '', ?, ?)
+  `).run('destination-missing', 'missing-task', now, now)
+
+  reconcileStartupState(db)
+
+  assert.deepEqual(
+    db.prepare('SELECT id, status FROM tasks ORDER BY id').all(),
+    [
+      { id: 'existing-task', status: 'pending' },
+      { id: 'missing-task', status: 'skipped' }
+    ]
+  )
+  assert.deepEqual(
+    db.prepare(
+      'SELECT task_id, status FROM task_destinations ORDER BY task_id'
+    ).all(),
+    [
+      { task_id: 'existing-task', status: 'pending' },
+      { task_id: 'missing-task', status: 'skipped' }
+    ]
+  )
+
+  rmSync(root, { recursive: true, force: true })
+  db.close()
+})
+
+test('migration removes legacy duplicate file rows before adding unique index', () => {
+  const db = createLegacyDatabase()
+  const now = new Date().toISOString()
+  db.prepare(`
+    INSERT INTO tasks (
+      id, folder_path, folder_name, status, oss_prefix, source_type,
+      created_at, updated_at
+    ) VALUES (?, ?, ?, 'pending', '', 'local', ?, ?)
+  `).run('duplicate-task', '/data/duplicate', 'duplicate', now, now)
+  const insertFile = db.prepare(`
+    INSERT INTO task_files (
+      id, task_id, relative_path, file_size, status, created_at, updated_at
+    ) VALUES (?, 'duplicate-task', 'same.jpg', 10, 'pending', ?, ?)
+  `)
+  insertFile.run('duplicate-file-1', now, now)
+  insertFile.run('duplicate-file-2', now, now)
+
+  runMigrations(db)
+
+  const count = db.prepare(
+    `SELECT COUNT(*) AS count
+     FROM task_files
+     WHERE task_id = 'duplicate-task' AND relative_path = 'same.jpg'`
+  ).get() as { count: number }
+  assert.equal(count.count, 1)
+  assert.ok(
+    db.prepare(
+      `SELECT 1 FROM sqlite_master
+       WHERE type = 'index' AND name = 'idx_task_files_task_path'`
+    ).get()
+  )
   db.close()
 })

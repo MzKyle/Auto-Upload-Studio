@@ -2,7 +2,8 @@ import { IPC } from '@shared/ipc-channels'
 import type {
   Task, TaskStatus, AppSettings, HistoryQuery, HistoryResult,
   SSHMachine, SSHMachineInput, ScannerStatus, DataCollectInfo, DiskUsageInfo,
-  DayFolderSummary, DayFolderListQuery, CloudProvider, MultiCloudOperationResult
+  DayFolderSummary, DayFolderListQuery, CloudProvider, MultiCloudOperationResult,
+  TaskDetail
 } from '@shared/types'
 
 const api = window.api
@@ -14,6 +15,10 @@ export async function fetchTasks(status?: TaskStatus): Promise<Task[]> {
 
 export async function fetchTask(taskId: string): Promise<Task> {
   return (await api.invoke(IPC.TASK_GET, { taskId })) as Task
+}
+
+export async function fetchTaskDetail(taskId: string): Promise<TaskDetail> {
+  return (await api.invoke(IPC.TASK_DETAIL, { taskId })) as TaskDetail
 }
 
 export async function addFolder(folderPath: string): Promise<Task> {
@@ -32,6 +37,14 @@ export async function cancelTask(taskId: string): Promise<void> {
   await api.invoke(IPC.TASK_CANCEL, { taskId })
 }
 
+export async function skipTask(taskId: string): Promise<void> {
+  await api.invoke(IPC.TASK_SKIP, { taskId })
+}
+
+export async function restoreTask(taskId: string): Promise<void> {
+  await api.invoke(IPC.TASK_RESTORE, { taskId })
+}
+
 export async function retryTask(taskId: string, provider?: CloudProvider): Promise<void> {
   await api.invoke(IPC.TASK_RETRY, { taskId, provider })
 }
@@ -43,6 +56,14 @@ export async function fetchDayFolders(query?: DayFolderListQuery): Promise<DayFo
 
 export async function deleteDayFolderHistory(id: string): Promise<void> {
   await api.invoke(IPC.DAY_FOLDER_DELETE, { id })
+}
+
+export async function ignoreDayFolder(id: string): Promise<DayFolderSummary> {
+  return (await api.invoke(IPC.DAY_FOLDER_IGNORE, { id })) as DayFolderSummary
+}
+
+export async function restoreDayFolder(id: string): Promise<DayFolderSummary> {
+  return (await api.invoke(IPC.DAY_FOLDER_RESTORE, { id })) as DayFolderSummary
 }
 
 // ---- 扫描器 ----
@@ -146,25 +167,4 @@ export async function selectFolder(): Promise<string | null> {
 // ---- 磁盘用量 ----
 export async function fetchDiskUsage(): Promise<DiskUsageInfo[]> {
   return (await api.invoke(IPC.DISK_USAGE)) as DiskUsageInfo[]
-}
-
-// ---- 标注 ----
-export async function openAnnotationWindow(): Promise<void> {
-  await api.invoke(IPC.ANNOTATION_OPEN_WINDOW)
-}
-
-export async function selectAnnotationImage(): Promise<string | null> {
-  return (await api.invoke(IPC.ANNOTATION_SELECT_IMAGE)) as string | null
-}
-
-export async function readAnnotationImage(filePath: string): Promise<{ dataUrl: string; width: number; height: number }> {
-  return (await api.invoke(IPC.ANNOTATION_READ_IMAGE, { filePath })) as { dataUrl: string; width: number; height: number }
-}
-
-export async function saveAnnotationExport(dataUrl: string, jsonString: string, defaultBaseName: string): Promise<{ pngPath: string; jsonPath: string } | null> {
-  return (await api.invoke(IPC.ANNOTATION_SAVE_EXPORT, { dataUrl, jsonString, defaultBaseName })) as { pngPath: string; jsonPath: string } | null
-}
-
-export async function uploadAnnotationToOSS(imagePath: string, pngPath: string, jsonPath: string): Promise<MultiCloudOperationResult> {
-  return (await api.invoke(IPC.ANNOTATION_UPLOAD_OSS, { imagePath, pngPath, jsonPath })) as MultiCloudOperationResult
 }

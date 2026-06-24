@@ -1,5 +1,5 @@
 import { useEffect, useCallback, useState } from "react";
-import { FolderPlus, RefreshCw, PlayCircle, PenTool } from "lucide-react";
+import { FolderPlus, RefreshCw, PlayCircle } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { TaskCard } from "@/components/TaskCard";
 import { DataCollectCard } from "@/components/DataCollectCard";
@@ -14,12 +14,14 @@ import {
   addFolder as addFolderApi,
   pauseTask,
   resumeTask,
-  cancelTask,
+  skipTask,
+  restoreTask,
   retryTask,
   triggerScan,
   fetchDataCollectList,
   fetchDayFolders,
-  openAnnotationWindow,
+  ignoreDayFolder,
+  restoreDayFolder,
 } from "@/lib/ipc-client";
 import { IPC } from "@shared/ipc-channels";
 import type {
@@ -124,12 +126,39 @@ export default function Dashboard() {
 
   const handleCancel = useCallback(async (taskId: string) => {
     try {
-      await cancelTask(taskId);
-      showToast("任务已取消", "warning");
+      await skipTask(taskId);
+      showToast("工作次已跳过", "warning");
     } catch (err) {
-      showToast(`取消失败: ${err}`, "error");
+      showToast(`跳过失败: ${err}`, "error");
     }
   }, []);
+
+  const handleRestore = useCallback(async (taskId: string) => {
+    try {
+      await restoreTask(taskId);
+      await loadTasks();
+      showToast("已恢复监控", "success");
+    } catch (err) {
+      showToast(`恢复失败: ${err}`, "error");
+    }
+  }, [loadTasks]);
+
+  const handleIgnoreDay = useCallback(async (id: string) => {
+    if (!window.confirm("确认忽略该日期下所有未完成工作次吗？")) return;
+    await ignoreDayFolder(id);
+    await Promise.all([
+      loadTasks(),
+      fetchDayFolders({ limit: 30 }).then(setDayFolders),
+    ]);
+  }, [loadTasks]);
+
+  const handleRestoreDay = useCallback(async (id: string) => {
+    await restoreDayFolder(id);
+    await Promise.all([
+      loadTasks(),
+      fetchDayFolders({ limit: 30 }).then(setDayFolders),
+    ]);
+  }, [loadTasks]);
 
   const handleRetry = useCallback(async (
     taskId: string,
@@ -146,21 +175,7 @@ export default function Dashboard() {
   const providerTasks = tasks.filter((task) =>
     task.destinations.some((destination) => destination.provider === provider)
   );
-  const destinationStatus = (task: (typeof tasks)[number]) =>
-    task.destinations.find((destination) => destination.provider === provider)
-      ?.status;
-  const activeTasks = providerTasks.filter(
-    (task) => !["completed", "failed"].includes(destinationStatus(task) || "")
-  );
-  const doneTasks = tasks
-    .filter((task) =>
-      task.destinations.some(
-        (destination) =>
-          destination.provider === provider &&
-          ["completed", "failed"].includes(destination.status)
-      )
-    )
-    .slice(0, 10);
+  const independentTasks = providerTasks.filter((task) => !task.dayFolderId);
 
   return (
     <div className="p-6 space-y-6">
@@ -168,14 +183,6 @@ export default function Dashboard() {
       <div className="flex items-center justify-between">
         <h1 className="text-xl font-bold">任务面板</h1>
         <div className="flex items-center gap-2">
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={() => openAnnotationWindow()}
-          >
-            <PenTool className="h-4 w-4 mr-1" />
-            标注
-          </Button>
           <Button variant="outline" size="sm" onClick={handleScan}>
             <PlayCircle className="h-4 w-4 mr-1" />
             触发扫描
@@ -217,11 +224,50 @@ export default function Dashboard() {
       {dayFolders.length > 0 && (
         <section>
           <h2 className="text-sm font-semibold text-muted-foreground mb-3">
-            日期目录汇总 ({dayFolders.length})
+            日期与工作次 ({dayFolders.length})
           </h2>
-          {dayFolders.map((dayFolder) => (
-            <DayFolderCard key={dayFolder.id} dayFolder={dayFolder} />
-          ))}
+          {dayFolders.map((dayFolder) => {
+            const childTasks = providerTasks.filter(
+              (task) => task.dayFolderId === dayFolder.id,
+            );
+            const daySpeed = childTasks.reduce(
+              (sum, task) =>
+                sum + (progress[progressKey(task.id, provider)]?.speed || 0),
+              0,
+            );
+            return (
+              <div key={dayFolder.id} className="mb-5">
+                <DayFolderCard
+                  dayFolder={dayFolder}
+                  tasks={childTasks}
+                  speed={daySpeed}
+                  onIgnore={handleIgnoreDay}
+                  onRestore={handleRestoreDay}
+                />
+                <div className="ml-5 border-l pl-4">
+                  {childTasks.length === 0 ? (
+                    <div className="text-xs text-muted-foreground py-2">
+                      尚未发现工作次
+                    </div>
+                  ) : (
+                    childTasks.map((task) => (
+                      <TaskCard
+                        key={task.id}
+                        task={task}
+                        provider={provider}
+                        progress={progress[progressKey(task.id, provider)]}
+                        onPause={handlePause}
+                        onResume={handleResume}
+                        onCancel={handleCancel}
+                        onRetry={handleRetry}
+                        onRestore={handleRestore}
+                      />
+                    ))
+                  )}
+                </div>
+              </div>
+            );
+          })}
         </section>
       )}
 
@@ -242,38 +288,12 @@ export default function Dashboard() {
         </section>
       )}
 
-      {/* 活跃任务 */}
-      <section>
-        <h2 className="text-sm font-semibold text-muted-foreground mb-3">
-          活跃任务 ({activeTasks.length})
-        </h2>
-        {activeTasks.length === 0 ? (
-          <div className="text-sm text-muted-foreground text-center py-12 border rounded-lg border-dashed">
-            暂无活跃任务，点击"添加文件夹"或启动扫描开始上传
-          </div>
-        ) : (
-          activeTasks.map((task) => (
-            <TaskCard
-              key={task.id}
-              task={task}
-              provider={provider}
-              progress={progress[progressKey(task.id, provider)]}
-              onPause={handlePause}
-              onResume={handleResume}
-              onCancel={handleCancel}
-              onRetry={handleRetry}
-            />
-          ))
-        )}
-      </section>
-
-      {/* 近期完成 */}
-      {doneTasks.length > 0 && (
+      {independentTasks.length > 0 && (
         <section>
           <h2 className="text-sm font-semibold text-muted-foreground mb-3">
-            近期完成
+            独立任务
           </h2>
-          {doneTasks.map((task) => (
+          {independentTasks.map((task) => (
             <TaskCard
               key={task.id}
               task={task}
@@ -283,6 +303,7 @@ export default function Dashboard() {
               onResume={handleResume}
               onCancel={handleCancel}
               onRetry={handleRetry}
+              onRestore={handleRestore}
             />
           ))}
         </section>

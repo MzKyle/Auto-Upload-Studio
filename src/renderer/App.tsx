@@ -4,17 +4,13 @@ import {
   Route,
   NavLink,
   Outlet,
-  useLocation,
 } from "react-router-dom";
 import { LayoutDashboard, Settings, Clock, Server } from "lucide-react";
 import { ToastContainer } from "@/components/ui/toast";
-import { lazy, Suspense } from "react";
 import Dashboard from "@/pages/Dashboard";
 import SettingsPage from "@/pages/Settings";
 import History from "@/pages/History";
 import SSHMachines from "@/pages/SSHMachines";
-
-const AnnotationApp = lazy(() => import("@/pages/annotation/AnnotationApp"));
 
 const navItems = [
   { to: "/", icon: LayoutDashboard, label: "任务面板" },
@@ -73,20 +69,6 @@ export default function App() {
           <Route path="/history" element={<History />} />
           <Route path="/ssh" element={<SSHMachines />} />
         </Route>
-        <Route
-          path="/annotation"
-          element={
-            <Suspense
-              fallback={
-                <div className="flex items-center justify-center h-screen text-muted-foreground">
-                  加载中...
-                </div>
-              }
-            >
-              <AnnotationApp />
-            </Suspense>
-          }
-        />
       </Routes>
     </HashRouter>
   );

@@ -15,21 +15,34 @@ import type { Task, TaskStatus, UploadConfig } from '@shared/types'
 export class TaskQueueService extends EventEmitter {
   private runningTasks: Map<string, { cancel: () => void }> = new Map()
   private processTimer: ReturnType<typeof setInterval> | null = null
-  private taskRunner: ((task: Task, signal: AbortSignal) => Promise<void>) | null = null
+  private initialProcessTimer: ReturnType<typeof setTimeout> | null = null
+  private taskRunner:
+    | ((task: Task, signal: AbortSignal) => Promise<TaskStatus>)
+    | null = null
 
-  setTaskRunner(runner: (task: Task, signal: AbortSignal) => Promise<void>): void {
+  setTaskRunner(
+    runner: (task: Task, signal: AbortSignal) => Promise<TaskStatus>
+  ): void {
     this.taskRunner = runner
   }
 
   start(): void {
+    if (this.processTimer) return
     // 每 2 秒检查一次队列
-    this.processTimer = setInterval(() => this.processQueue(), 2000)
-    // 启动时立即处理
-    this.processQueue()
+    this.processTimer = setInterval(() => void this.processQueue(), 2000)
+    // 让主窗口先完成绘制，再恢复上传任务。
+    this.initialProcessTimer = setTimeout(() => {
+      this.initialProcessTimer = null
+      void this.processQueue()
+    }, 1500)
     log.info('任务队列已启动')
   }
 
   stop(): void {
+    if (this.initialProcessTimer) {
+      clearTimeout(this.initialProcessTimer)
+      this.initialProcessTimer = null
+    }
     if (this.processTimer) {
       clearInterval(this.processTimer)
       this.processTimer = null
@@ -60,17 +73,18 @@ export class TaskQueueService extends EventEmitter {
     const uploadConfig = settings.get<UploadConfig>('upload')
     if (!this.isWithinUploadWindow(uploadConfig?.startAfterTime, uploadConfig?.endBeforeTime)) return
 
-    const maxConcurrent = uploadConfig?.maxConcurrentTasks || 5
+    const maxConcurrent = uploadConfig?.maxConcurrentTasks || 4
 
     const taskRepo = getTaskRepo()
     const availableSlots = maxConcurrent - this.runningTasks.size
     if (availableSlots <= 0) return
 
-    const pendingTasks = taskRepo.listByStatus('pending')
+    const pendingTasks = taskRepo.listRunnable()
     const eligibleTasks = pendingTasks.filter((task) =>
       this.isTaskEligibleForCurrentStartCycle(task, uploadConfig?.startAfterTime)
     )
-    const toRun = eligibleTasks.slice(0, availableSlots)
+    // 每轮只启动一个新任务，避免多个大目录在主进程中同时做首次校准。
+    const toRun = eligibleTasks.slice(0, Math.min(availableSlots, 1))
 
     for (const task of toRun) {
       this.executeTask(task)
@@ -91,18 +105,20 @@ export class TaskQueueService extends EventEmitter {
         newStatus: 'uploading'
       })
 
-      await this.taskRunner!(task, controller.signal)
+      const finalStatus = await this.taskRunner!(task, controller.signal)
 
       if (!controller.signal.aborted) {
-        taskRepo.updateStatus(task.id, 'completed')
+        taskRepo.updateStatus(task.id, finalStatus)
         getDayFolderService().refreshForTask(task.id)
-        getCleanupService().scheduleCleanup()
+        if (finalStatus === 'completed') {
+          getCleanupService().scheduleCleanup()
+        }
         this.emit('task:status-change', {
           taskId: task.id,
           oldStatus: 'uploading',
-          newStatus: 'completed'
+          newStatus: finalStatus
         })
-        log.info('任务完成:', task.folderPath)
+        log.info(`任务状态更新为 ${finalStatus}:`, task.folderPath)
       }
     } catch (err) {
       if (!controller.signal.aborted) {

@@ -25,9 +25,11 @@ Object.defineProperty(exports, Symbol.toStringTag, { value: "Module" });
 const electron = require("electron");
 const path = require("path");
 const Database = require("better-sqlite3");
+const fs = require("fs");
 const log = require("electron-log");
 const uuid = require("uuid");
-const fs = require("fs");
+const promises = require("fs/promises");
+const chokidar = require("chokidar");
 const events = require("events");
 const child_process = require("child_process");
 const ssh2 = require("ssh2");
@@ -35,7 +37,6 @@ const https = require("https");
 const clientS3 = require("@aws-sdk/client-s3");
 const libStorage = require("@aws-sdk/lib-storage");
 const nodeHttpHandler = require("@smithy/node-http-handler");
-const promises = require("fs/promises");
 const is = {
   dev: !electron.app.isPackaged
 };
@@ -138,6 +139,9 @@ const IPC = {
   TASK_RESUME: "task:resume",
   TASK_CANCEL: "task:cancel",
   TASK_RETRY: "task:retry",
+  TASK_SKIP: "task:skip",
+  TASK_RESTORE: "task:restore",
+  TASK_DETAIL: "task:detail",
   TASK_PROGRESS: "task:progress",
   // push from main
   TASK_STATUS_CHANGE: "task:status-change",
@@ -146,6 +150,8 @@ const IPC = {
   // 日期目录汇总
   DAY_FOLDER_LIST: "day-folder:list",
   DAY_FOLDER_DELETE: "day-folder:delete",
+  DAY_FOLDER_IGNORE: "day-folder:ignore",
+  DAY_FOLDER_RESTORE: "day-folder:restore",
   DAY_FOLDER_EVENT: "day-folder:event",
   // 扫描器
   SCANNER_STATUS: "scanner:status",
@@ -189,13 +195,7 @@ const IPC = {
   WINDOW_MINI_MONITOR: "window:mini-monitor",
   // 对话框
   DIALOG_SELECT_FOLDER: "dialog:select-folder",
-  DIALOG_SELECT_DIRECTORY: "dialog:select-directory",
-  // 标注
-  ANNOTATION_OPEN_WINDOW: "annotation:open-window",
-  ANNOTATION_SELECT_IMAGE: "annotation:select-image",
-  ANNOTATION_READ_IMAGE: "annotation:read-image",
-  ANNOTATION_SAVE_EXPORT: "annotation:save-export",
-  ANNOTATION_UPLOAD_OSS: "annotation:upload-oss"
+  DIALOG_SELECT_DIRECTORY: "dialog:select-directory"
 };
 const DATE_FOLDER_PATTERN = /^(\d{4})-(\d{2})-(\d{2})$/;
 function parseDateFolderName(name) {
@@ -225,12 +225,14 @@ function determineDayFolderStatus(dateName, childStatuses, now = /* @__PURE__ */
   if (childStatuses.some((status) => status === "failed" || status === "paused")) {
     return "blocked";
   }
-  const allCompleted = childStatuses.length > 0 && childStatuses.every((status) => status === "completed");
-  if (allCompleted && isDateFolderBeforeToday(dateName, now)) {
-    return "completed";
+  const allTerminal = childStatuses.length > 0 && childStatuses.every(
+    (status) => status === "completed" || status === "synced" || status === "skipped"
+  );
+  if (allTerminal && isDateFolderBeforeToday(dateName, now)) {
+    return childStatuses.some((status) => status === "skipped") ? "completed_with_skips" : "completed";
   }
   if (childStatuses.some(
-    (status) => status === null || status === "pending" || status === "scanning" || status === "uploading"
+    (status) => status === null || status === "pending" || status === "scanning" || status === "uploading" || status === "retrying"
   )) {
     return "processing";
   }
@@ -279,11 +281,12 @@ function initDatabase() {
   const dbPath = path.join(electron.app.getPath("userData"), "uploader.db");
   log.info("数据库路径:", dbPath);
   db = new Database(dbPath);
-  db.pragma("busy_timeout = 5000");
+  db.pragma("busy_timeout = 30000");
   db.pragma("journal_mode = WAL");
   db.pragma("foreign_keys = ON");
   log.info("开始检查数据库结构");
   runMigrations(db);
+  reconcileStartupState(db);
   log.info("数据库初始化完成");
 }
 function runMigrations(db2) {
@@ -303,7 +306,8 @@ function runMigrations(db2) {
       uploaded_bytes INTEGER NOT NULL DEFAULT 0,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL,
-      completed_at TEXT
+      completed_at TEXT,
+      ignored INTEGER NOT NULL DEFAULT 0
     );
 
     CREATE TABLE IF NOT EXISTS tasks (
@@ -337,6 +341,12 @@ function runMigrations(db2) {
       oss_key TEXT,
       upload_id TEXT,
       error_message TEXT,
+      mtime_ms INTEGER NOT NULL DEFAULT 0,
+      last_seen_at TEXT,
+      source_status TEXT NOT NULL DEFAULT 'present',
+      stable_count INTEGER NOT NULL DEFAULT 0,
+      retry_count INTEGER NOT NULL DEFAULT 0,
+      next_retry_at TEXT,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL,
       FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE
@@ -423,6 +433,31 @@ function runMigrations(db2) {
     log.info("迁移: tasks 表添加 upload_target_mode 列");
   }
   db2.exec(`CREATE INDEX IF NOT EXISTS idx_tasks_day_folder_id ON tasks(day_folder_id)`);
+  const dayFolderColumns = db2.pragma("table_info(day_folders)");
+  if (!dayFolderColumns.some((c) => c.name === "ignored")) {
+    db2.exec(`ALTER TABLE day_folders ADD COLUMN ignored INTEGER NOT NULL DEFAULT 0`);
+    log.info("迁移: day_folders 表添加 ignored 列");
+  }
+  const taskFileColumns = db2.pragma("table_info(task_files)");
+  const taskFileAdditions = [
+    ["mtime_ms", `INTEGER NOT NULL DEFAULT 0`],
+    ["last_seen_at", `TEXT`],
+    ["source_status", `TEXT NOT NULL DEFAULT 'present'`],
+    ["stable_count", `INTEGER NOT NULL DEFAULT 0`],
+    ["retry_count", `INTEGER NOT NULL DEFAULT 0`],
+    ["next_retry_at", `TEXT`]
+  ];
+  for (const [name, definition] of taskFileAdditions) {
+    if (!taskFileColumns.some((column) => column.name === name)) {
+      db2.exec(`ALTER TABLE task_files ADD COLUMN ${name} ${definition}`);
+      log.info(`迁移: task_files 表添加 ${name} 列`);
+    }
+  }
+  ensureUniqueTaskFilePathIndex(db2);
+  db2.exec(`
+    CREATE INDEX IF NOT EXISTS idx_task_files_retry
+    ON task_files(status, next_retry_at)
+  `);
   const incompleteTasks = db2.prepare(
     `SELECT id, folder_path, source_type, source_machine_id, upload_relative_path
      FROM tasks
@@ -499,6 +534,133 @@ function runMigrations(db2) {
     log.info("迁移: ssh_machines 表添加 transfer_mode 列");
   }
 }
+function ensureUniqueTaskFilePathIndex(db2) {
+  const existing = db2.prepare(
+    `SELECT 1
+     FROM sqlite_master
+     WHERE type = 'index' AND name = 'idx_task_files_task_path'`
+  ).get();
+  if (existing) return;
+  log.info("迁移: 开始创建任务文件路径索引");
+  try {
+    db2.exec(`
+      CREATE UNIQUE INDEX idx_task_files_task_path
+      ON task_files(task_id, relative_path)
+    `);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (!message.toLowerCase().includes("unique constraint failed")) {
+      throw error;
+    }
+    log.warn("迁移: 发现重复任务文件记录，开始清理");
+    const transaction = db2.transaction(() => {
+      db2.exec(`
+        DELETE FROM task_files
+        WHERE rowid NOT IN (
+          SELECT MIN(rowid)
+          FROM task_files
+          GROUP BY task_id, relative_path
+        )
+      `);
+      db2.exec(`
+        CREATE UNIQUE INDEX idx_task_files_task_path
+        ON task_files(task_id, relative_path)
+      `);
+    });
+    transaction();
+  }
+  log.info("迁移: 任务文件路径索引创建完成");
+}
+function reconcileStartupState(db2) {
+  const now = (/* @__PURE__ */ new Date()).toISOString();
+  db2.prepare(
+    `UPDATE task_files
+     SET status = 'pending', updated_at = ?
+     WHERE status = 'uploading'`
+  ).run(now);
+  db2.prepare(
+    `UPDATE task_file_destinations
+     SET status = 'pending', updated_at = ?
+     WHERE status = 'uploading'`
+  ).run(now);
+  const unfinished = db2.prepare(
+    `SELECT id, folder_path, source_type, status
+     FROM tasks
+     WHERE status NOT IN ('completed', 'synced', 'skipped')`
+  ).all();
+  const resetTask = db2.prepare(
+    `UPDATE tasks
+     SET status = 'pending', error_message = NULL, completed_at = NULL, updated_at = ?
+     WHERE id = ?`
+  );
+  const resetDestinations = db2.prepare(
+    `UPDATE task_destinations
+     SET status = CASE
+           WHEN status IN ('completed', 'synced') THEN status
+           WHEN status IN ('uploading', 'scanning', 'retrying', 'failed', 'paused') THEN 'pending'
+           ELSE 'pending'
+         END,
+         error_message = NULL,
+         completed_at = CASE
+           WHEN status IN ('completed', 'synced') THEN completed_at
+           ELSE NULL
+         END,
+         updated_at = ?
+     WHERE task_id = ?`
+  );
+  const resetActiveFiles = db2.prepare(
+    `UPDATE task_files
+     SET status = 'pending',
+         error_message = NULL, retry_count = 0, next_retry_at = NULL,
+         updated_at = ?
+     WHERE task_id = ?
+       AND source_status = 'present'
+       AND status IN ('uploading', 'failed')`
+  );
+  const resetActiveFileDestinations = db2.prepare(
+    `UPDATE task_file_destinations
+     SET status = 'pending', error_message = NULL, updated_at = ?
+     WHERE status IN ('uploading', 'failed')
+       AND task_file_id IN (
+         SELECT id FROM task_files
+         WHERE task_id = ? AND source_status = 'present'
+       )`
+  );
+  const skipTask = db2.prepare(
+    `UPDATE tasks
+     SET status = 'skipped', error_message = '源目录已删除',
+         completed_at = ?, updated_at = ?
+     WHERE id = ?`
+  );
+  const skipDestinations = db2.prepare(
+    `UPDATE task_destinations
+     SET status = CASE
+           WHEN status IN ('completed', 'synced') THEN status
+           ELSE 'skipped'
+         END,
+         error_message = CASE
+           WHEN status IN ('completed', 'synced') THEN error_message
+           ELSE '源目录已删除'
+         END,
+         completed_at = COALESCE(completed_at, ?), updated_at = ?
+     WHERE task_id = ?`
+  );
+  const transaction = db2.transaction(() => {
+    for (const task of unfinished) {
+      const monitorable = task.source_type === "local" || task.source_type === "rsync";
+      if (monitorable && !fs.existsSync(task.folder_path)) {
+        skipTask.run(now, now, task.id);
+        skipDestinations.run(now, now, task.id);
+        continue;
+      }
+      resetTask.run(now, task.id);
+      resetDestinations.run(now, task.id);
+      resetActiveFiles.run(now, task.id);
+      resetActiveFileDestinations.run(now, task.id);
+    }
+  });
+  transaction();
+}
 function providersForMode(mode) {
   if (mode === "both") return ["aliyun", "tencent"];
   return [mode];
@@ -517,6 +679,9 @@ function deriveLogicalFileStatus(statuses) {
     return "completed";
   }
   if (statuses.some((status) => status === "failed")) return "failed";
+  if (statuses.length > 0 && statuses.every((status) => status === "skipped")) {
+    return "skipped";
+  }
   if (statuses.some((status) => status === "uploading")) return "uploading";
   return "pending";
 }
@@ -560,7 +725,7 @@ class TaskDestinationRepo {
         id, task_id, provider, status, prefix, created_at, updated_at, completed_at
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
     );
-    const completedAt = initialStatus === "completed" || initialStatus === "failed" ? now : null;
+    const completedAt = initialStatus === "completed" || initialStatus === "failed" || initialStatus === "skipped" ? now : null;
     const transaction = db2.transaction(() => {
       for (const provider of providersForMode(mode)) {
         stmt.run(
@@ -587,7 +752,7 @@ class TaskDestinationRepo {
   }
   updateStatus(taskId, provider, status, errorMessage) {
     const now = (/* @__PURE__ */ new Date()).toISOString();
-    const completedAt = status === "completed" || status === "failed" ? now : null;
+    const completedAt = status === "completed" || status === "failed" || status === "skipped" ? now : null;
     getDb().prepare(
       `UPDATE task_destinations
          SET status = ?, error_message = ?, updated_at = ?, completed_at = ?
@@ -596,11 +761,11 @@ class TaskDestinationRepo {
   }
   updateIncompleteStatuses(taskId, status, errorMessage) {
     const now = (/* @__PURE__ */ new Date()).toISOString();
-    const completedAt = status === "completed" || status === "failed" ? now : null;
+    const completedAt = status === "completed" || status === "failed" || status === "skipped" ? now : null;
     getDb().prepare(
       `UPDATE task_destinations
          SET status = ?, error_message = ?, updated_at = ?, completed_at = ?
-         WHERE task_id = ? AND status != 'completed'`
+         WHERE task_id = ? AND status NOT IN ('completed', 'synced', 'skipped')`
     ).run(status, errorMessage || null, now, completedAt, taskId);
   }
   setTotals(taskId, provider, totalFiles, totalBytes) {
@@ -635,7 +800,9 @@ class TaskDestinationRepo {
     const params = [taskId];
     if (provider) params.push(provider);
     const rows = getDb().prepare(
-      `SELECT tfd.*, tf.task_id, tf.relative_path, tf.file_size
+      `SELECT tfd.*, tf.task_id, tf.relative_path, tf.file_size,
+          tf.mtime_ms, tf.retry_count, tf.next_retry_at,
+          tf.source_status, tf.stable_count
          FROM task_file_destinations tfd
          INNER JOIN task_files tf ON tf.id = tfd.task_file_id
          WHERE tf.task_id = ? ${providerCondition}
@@ -645,8 +812,61 @@ class TaskDestinationRepo {
       ...rowToFileDestination(row),
       taskId: row.task_id,
       relativePath: row.relative_path,
-      fileSize: row.file_size
+      fileSize: row.file_size,
+      mtimeMs: Number(row.mtime_ms || 0),
+      retryCount: Number(row.retry_count || 0),
+      nextRetryAt: row.next_retry_at || null,
+      sourceStatus: row.source_status || "present",
+      stableCount: Number(row.stable_count || 0)
     }));
+  }
+  listReadyFileTargets(taskId, requiredStableChecks, now = (/* @__PURE__ */ new Date()).toISOString()) {
+    const rows = getDb().prepare(
+      `SELECT tfd.*, tf.task_id, tf.relative_path, tf.file_size,
+          tf.mtime_ms, tf.retry_count, tf.next_retry_at,
+          tf.source_status, tf.stable_count
+         FROM task_file_destinations tfd
+         INNER JOIN task_files tf ON tf.id = tfd.task_file_id
+         WHERE tf.task_id = ?
+           AND tfd.status = 'pending'
+           AND tf.source_status = 'present'
+           AND tf.stable_count >= ?
+           AND (tf.next_retry_at IS NULL OR tf.next_retry_at <= ?)
+         ORDER BY tf.created_at, tfd.provider`
+    ).all(taskId, requiredStableChecks, now);
+    return rows.map((row) => ({
+      ...rowToFileDestination(row),
+      taskId: row.task_id,
+      relativePath: row.relative_path,
+      fileSize: row.file_size,
+      mtimeMs: Number(row.mtime_ms || 0),
+      retryCount: Number(row.retry_count || 0),
+      nextRetryAt: row.next_retry_at || null,
+      sourceStatus: row.source_status || "present",
+      stableCount: Number(row.stable_count || 0)
+    }));
+  }
+  summarizeFileTargets(taskId, provider, now = (/* @__PURE__ */ new Date()).toISOString()) {
+    const row = getDb().prepare(
+      `SELECT
+         COUNT(*) AS total,
+         SUM(CASE WHEN tfd.status = 'failed' THEN 1 ELSE 0 END) AS failed,
+         SUM(CASE WHEN tfd.status = 'pending' THEN 1 ELSE 0 END) AS pending,
+         SUM(CASE
+           WHEN tfd.status = 'pending'
+            AND tf.next_retry_at IS NOT NULL
+            AND tf.next_retry_at > ?
+           THEN 1 ELSE 0 END) AS retry_waiting
+       FROM task_file_destinations tfd
+       INNER JOIN task_files tf ON tf.id = tfd.task_file_id
+       WHERE tf.task_id = ? AND tfd.provider = ?`
+    ).get(now, taskId, provider);
+    return {
+      total: row.total || 0,
+      failed: row.failed || 0,
+      pending: row.pending || 0,
+      retryWaiting: row.retry_waiting || 0
+    };
   }
   updateFileStatus(id, status, objectKey, uploadId, errorMessage) {
     const now = (/* @__PURE__ */ new Date()).toISOString();
@@ -664,6 +884,30 @@ class TaskDestinationRepo {
     getDb().prepare("UPDATE task_files SET status = ?, updated_at = ? WHERE id = ?").run(status, (/* @__PURE__ */ new Date()).toISOString(), taskFileId);
     return status;
   }
+  recalculateProgress(taskId, provider) {
+    const row = getDb().prepare(
+      `SELECT
+         COUNT(*) AS total_files,
+         COALESCE(SUM(tf.file_size), 0) AS total_bytes,
+         SUM(CASE WHEN tfd.status = 'completed' THEN 1 ELSE 0 END) AS uploaded_files,
+         COALESCE(SUM(CASE WHEN tfd.status = 'completed' THEN tf.file_size ELSE 0 END), 0) AS uploaded_bytes
+       FROM task_file_destinations tfd
+       INNER JOIN task_files tf ON tf.id = tfd.task_file_id
+       WHERE tf.task_id = ? AND tfd.provider = ?`
+    ).get(taskId, provider);
+    this.setTotals(
+      taskId,
+      provider,
+      row.total_files || 0,
+      row.total_bytes || 0
+    );
+    this.updateProgress(
+      taskId,
+      provider,
+      row.uploaded_files || 0,
+      row.uploaded_bytes || 0
+    );
+  }
   resetFailed(taskId, provider) {
     const db2 = getDb();
     const now = (/* @__PURE__ */ new Date()).toISOString();
@@ -676,8 +920,15 @@ class TaskDestinationRepo {
     }
     db2.prepare(
       `UPDATE task_destinations
-       SET status = CASE WHEN status = 'completed' THEN status ELSE 'pending' END,
-         error_message = NULL, completed_at = CASE WHEN status = 'completed' THEN completed_at ELSE NULL END,
+       SET status = CASE
+             WHEN status IN ('completed', 'synced') THEN status
+             ELSE 'pending'
+           END,
+         error_message = NULL,
+         completed_at = CASE
+           WHEN status IN ('completed', 'synced') THEN completed_at
+           ELSE NULL
+         END,
          updated_at = ?
        WHERE task_id = ? ${providerCondition}`
     ).run(...destinationParams);
@@ -733,6 +984,12 @@ function rowToTaskFile(row) {
     ossKey: row.oss_key || null,
     uploadId: row.upload_id || null,
     errorMessage: row.error_message || null,
+    mtimeMs: Number(row.mtime_ms || 0),
+    lastSeenAt: row.last_seen_at || null,
+    sourceStatus: row.source_status || "present",
+    stableCount: Number(row.stable_count || 0),
+    retryCount: Number(row.retry_count || 0),
+    nextRetryAt: row.next_retry_at || null,
     createdAt: row.created_at,
     updatedAt: row.updated_at
   };
@@ -744,6 +1001,32 @@ class TaskRepo {
       return db2.prepare("SELECT * FROM tasks WHERE status = ? ORDER BY created_at DESC").all(status).map(rowToTask);
     }
     return db2.prepare("SELECT * FROM tasks ORDER BY created_at DESC").all().map(rowToTask);
+  }
+  listContinuouslyMonitored(dateName) {
+    const rows = getDb().prepare(
+      `SELECT * FROM tasks
+       WHERE source_type = 'local'
+         AND day_folder_id IS NOT NULL
+         AND replace(upload_relative_path, '\\', '/') LIKE ?
+         AND status NOT IN ('skipped', 'paused', 'completed')
+       ORDER BY created_at ASC`
+    ).all(`${dateName}/%`);
+    return rows.map(rowToTask);
+  }
+  listRunnable(now = (/* @__PURE__ */ new Date()).toISOString()) {
+    const rows = getDb().prepare(
+      `SELECT DISTINCT t.*
+       FROM tasks t
+       INNER JOIN task_files tf ON tf.task_id = t.id
+       INNER JOIN task_file_destinations tfd ON tfd.task_file_id = tf.id
+       WHERE t.status IN ('pending', 'retrying')
+         AND tf.source_status = 'present'
+         AND tf.stable_count >= CASE WHEN t.source_type = 'local' THEN 2 ELSE 1 END
+         AND (tf.next_retry_at IS NULL OR tf.next_retry_at <= ?)
+         AND tfd.status = 'pending'
+       ORDER BY t.created_at ASC`
+    ).all(now);
+    return rows.map(rowToTask);
   }
   getById(id) {
     const db2 = getDb();
@@ -823,14 +1106,101 @@ class TaskRepo {
   updateStatus(id, status, errorMessage) {
     const db2 = getDb();
     const now = (/* @__PURE__ */ new Date()).toISOString();
-    const completedAt = status === "completed" || status === "failed" ? now : null;
+    const completedAt = status === "completed" || status === "failed" || status === "skipped" ? now : null;
     db2.prepare(
       "UPDATE tasks SET status = ?, error_message = ?, updated_at = ?, completed_at = ? WHERE id = ?"
     ).run(status, errorMessage || null, now, completedAt, id);
   }
   retry(id, provider) {
     getTaskDestinationRepo().resetFailed(id, provider);
+    getDb().prepare(
+      `UPDATE task_files
+       SET retry_count = 0, next_retry_at = NULL, error_message = NULL,
+           status = CASE
+             WHEN source_status = 'present' AND status != 'completed' THEN 'pending'
+             ELSE status
+           END,
+           updated_at = ?
+       WHERE task_id = ?`
+    ).run((/* @__PURE__ */ new Date()).toISOString(), id);
     this.updateStatus(id, "pending");
+  }
+  skip(id, reason = "用户跳过") {
+    const db2 = getDb();
+    const now = (/* @__PURE__ */ new Date()).toISOString();
+    const transaction = db2.transaction(() => {
+      db2.prepare(
+        `UPDATE tasks
+         SET status = 'skipped', error_message = ?, completed_at = ?, updated_at = ?
+         WHERE id = ?`
+      ).run(reason, now, now, id);
+      db2.prepare(
+        `UPDATE task_destinations
+         SET status = CASE WHEN status IN ('completed', 'synced') THEN status ELSE 'skipped' END,
+             error_message = CASE WHEN status IN ('completed', 'synced') THEN error_message ELSE ? END,
+             completed_at = COALESCE(completed_at, ?), updated_at = ?
+         WHERE task_id = ?`
+      ).run(reason, now, now, id);
+      db2.prepare(
+        `UPDATE task_file_destinations
+         SET status = CASE WHEN status = 'completed' THEN status ELSE 'skipped' END,
+             error_message = CASE WHEN status = 'completed' THEN error_message ELSE ? END,
+             updated_at = ?
+         WHERE task_file_id IN (SELECT id FROM task_files WHERE task_id = ?)`
+      ).run(reason, now, id);
+      db2.prepare(
+        `UPDATE task_files
+         SET status = CASE WHEN status = 'completed' THEN status ELSE 'skipped' END,
+             error_message = CASE WHEN status = 'completed' THEN error_message ELSE ? END,
+             next_retry_at = NULL, updated_at = ?
+         WHERE task_id = ?`
+      ).run(reason, now, id);
+    });
+    transaction();
+  }
+  restore(id) {
+    const db2 = getDb();
+    const now = (/* @__PURE__ */ new Date()).toISOString();
+    const transaction = db2.transaction(() => {
+      db2.prepare(
+        `UPDATE tasks
+         SET status = 'scanning', error_message = NULL, completed_at = NULL, updated_at = ?
+         WHERE id = ?`
+      ).run(now, id);
+      db2.prepare(
+        `UPDATE task_destinations
+         SET status = CASE WHEN status = 'skipped' THEN 'pending' ELSE status END,
+             error_message = NULL,
+             completed_at = CASE WHEN status = 'skipped' THEN NULL ELSE completed_at END,
+             updated_at = ?
+         WHERE task_id = ?`
+      ).run(now, id);
+      db2.prepare(
+        `UPDATE task_file_destinations
+         SET status = CASE
+               WHEN status = 'skipped'
+                AND task_file_id IN (
+                  SELECT id FROM task_files
+                  WHERE task_id = ? AND source_status = 'present'
+                )
+               THEN 'pending'
+               ELSE status
+             END,
+             error_message = NULL, updated_at = ?
+         WHERE task_file_id IN (SELECT id FROM task_files WHERE task_id = ?)`
+      ).run(id, now, id);
+      db2.prepare(
+        `UPDATE task_files
+         SET status = CASE
+               WHEN status = 'skipped' AND source_status = 'present' THEN 'pending'
+               ELSE status
+             END,
+             retry_count = 0, next_retry_at = NULL, error_message = NULL,
+             updated_at = ?
+         WHERE task_id = ?`
+      ).run(now, id);
+    });
+    transaction();
   }
   updateProgress(id, uploadedFiles, uploadedBytes) {
     const db2 = getDb();
@@ -847,26 +1217,39 @@ class TaskRepo {
     ).run(totalFiles, totalBytes, now, id);
   }
   // ---- task_files ----
-  createFile(taskId, relativePath, fileSize) {
+  createFile(taskId, relativePath, fileSize, mtimeMs = 0) {
     const db2 = getDb();
     const id = uuid.v4();
     const now = (/* @__PURE__ */ new Date()).toISOString();
     db2.prepare(
-      `INSERT INTO task_files (id, task_id, relative_path, file_size, status, created_at, updated_at)
-       VALUES (?, ?, ?, ?, 'pending', ?, ?)`
-    ).run(id, taskId, relativePath, fileSize, now, now);
+      `INSERT INTO task_files (
+        id, task_id, relative_path, file_size, status, mtime_ms,
+        last_seen_at, source_status, stable_count, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, 'pending', ?, ?, 'present', 1, ?, ?)`
+    ).run(id, taskId, relativePath, fileSize, mtimeMs, now, now, now);
     return rowToTaskFile(db2.prepare("SELECT * FROM task_files WHERE id = ?").get(id));
   }
   bulkCreateFiles(taskId, files) {
     const db2 = getDb();
     const now = (/* @__PURE__ */ new Date()).toISOString();
     const stmt = db2.prepare(
-      `INSERT INTO task_files (id, task_id, relative_path, file_size, status, created_at, updated_at)
-       VALUES (?, ?, ?, ?, 'pending', ?, ?)`
+      `INSERT OR IGNORE INTO task_files (
+        id, task_id, relative_path, file_size, status, mtime_ms,
+        last_seen_at, source_status, stable_count, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, 'pending', ?, ?, 'present', 1, ?, ?)`
     );
     const transaction = db2.transaction(() => {
       for (const f of files) {
-        stmt.run(uuid.v4(), taskId, f.relativePath, f.fileSize, now, now);
+        stmt.run(
+          uuid.v4(),
+          taskId,
+          f.relativePath,
+          f.fileSize,
+          f.mtimeMs || 0,
+          now,
+          now,
+          now
+        );
       }
     });
     transaction();
@@ -878,6 +1261,287 @@ class TaskRepo {
     }
     return db2.prepare("SELECT * FROM task_files WHERE task_id = ?").all(taskId).map(rowToTaskFile);
   }
+  listFileDetails(taskId) {
+    const files = this.listFiles(taskId);
+    const destinations = getTaskDestinationRepo().listFileTargets(taskId);
+    const destinationsByFile = /* @__PURE__ */ new Map();
+    for (const destination of destinations) {
+      const list = destinationsByFile.get(destination.taskFileId) || [];
+      list.push(destination);
+      destinationsByFile.set(destination.taskFileId, list);
+    }
+    return files.map((file) => ({
+      ...file,
+      destinations: (destinationsByFile.get(file.id) || []).map(({ taskId: _taskId, relativePath: _path, fileSize: _size, ...destination }) => destination)
+    }));
+  }
+  reconcileFiles(taskId, files, requiredStableChecks) {
+    const db2 = getDb();
+    const task = this.getById(taskId);
+    if (!task || task.status === "skipped" || task.status === "paused") {
+      return {
+        changed: false,
+        readyFiles: 0,
+        unstableFiles: 0,
+        failedFiles: 0,
+        skippedFiles: 0
+      };
+    }
+    const now = (/* @__PURE__ */ new Date()).toISOString();
+    const existingRows = db2.prepare(
+      "SELECT * FROM task_files WHERE task_id = ?"
+    ).all(taskId);
+    const existing = new Map(
+      existingRows.map((row) => [row.relative_path, rowToTaskFile(row)])
+    );
+    const seen = /* @__PURE__ */ new Set();
+    let changed = false;
+    const insert = db2.prepare(
+      `INSERT INTO task_files (
+        id, task_id, relative_path, file_size, status, mtime_ms,
+        last_seen_at, source_status, stable_count, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, 'pending', ?, ?, 'present', 1, ?, ?)`
+    );
+    const updateChanged = db2.prepare(
+      `UPDATE task_files
+       SET file_size = ?, mtime_ms = ?, last_seen_at = ?, source_status = 'present',
+           stable_count = 1, status = 'pending', error_message = NULL,
+           retry_count = 0, next_retry_at = NULL, updated_at = ?
+       WHERE id = ?`
+    );
+    const updateStable = db2.prepare(
+      `UPDATE task_files
+       SET last_seen_at = ?, source_status = 'present',
+           stable_count = MIN(stable_count + 1, ?), updated_at = ?
+       WHERE id = ?`
+    );
+    const resetTargets = db2.prepare(
+      `UPDATE task_file_destinations
+       SET status = 'pending', object_key = NULL, upload_id = NULL,
+           error_message = NULL, updated_at = ?
+       WHERE task_file_id = ? AND status != 'uploading'`
+    );
+    const markFileMissing = db2.prepare(
+      `UPDATE task_files
+       SET source_status = 'missing',
+           status = CASE WHEN status = 'completed' THEN status ELSE 'skipped' END,
+           error_message = CASE WHEN status = 'completed' THEN error_message ELSE '源文件已删除' END,
+           next_retry_at = NULL, updated_at = ?
+       WHERE id = ?`
+    );
+    const markTargetsMissing = db2.prepare(
+      `UPDATE task_file_destinations
+       SET status = CASE WHEN status = 'completed' THEN status ELSE 'skipped' END,
+           error_message = CASE WHEN status = 'completed' THEN error_message ELSE '源文件已删除' END,
+           updated_at = ?
+       WHERE task_file_id = ? AND status != 'uploading'`
+    );
+    const transaction = db2.transaction(() => {
+      for (const file of files) {
+        seen.add(file.relativePath);
+        const current = existing.get(file.relativePath);
+        if (!current) {
+          insert.run(
+            uuid.v4(),
+            taskId,
+            file.relativePath,
+            file.size,
+            file.mtimeMs,
+            now,
+            now,
+            now
+          );
+          changed = true;
+          continue;
+        }
+        const fileChanged = current.fileSize !== file.size || current.mtimeMs !== file.mtimeMs || current.sourceStatus === "missing";
+        if (fileChanged) {
+          updateChanged.run(file.size, file.mtimeMs, now, now, current.id);
+          resetTargets.run(now, current.id);
+          changed = true;
+        } else if (current.stableCount < Math.max(1, requiredStableChecks)) {
+          updateStable.run(
+            now,
+            Math.max(1, requiredStableChecks),
+            now,
+            current.id
+          );
+        }
+      }
+      for (const current of existing.values()) {
+        if (seen.has(current.relativePath) || current.sourceStatus === "missing") continue;
+        markFileMissing.run(now, current.id);
+        markTargetsMissing.run(now, current.id);
+        changed = true;
+      }
+    });
+    transaction();
+    getTaskDestinationRepo().ensureForTaskFiles(taskId);
+    const counts = db2.prepare(
+      `SELECT
+         COUNT(*) AS total_files,
+         COALESCE(SUM(file_size), 0) AS total_bytes,
+         SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) AS uploaded_files,
+         COALESCE(SUM(CASE WHEN status = 'completed' THEN file_size ELSE 0 END), 0) AS uploaded_bytes,
+         SUM(CASE
+           WHEN source_status = 'present'
+            AND stable_count >= ?
+            AND status IN ('pending', 'failed')
+            AND (next_retry_at IS NULL OR next_retry_at <= ?)
+           THEN 1 ELSE 0 END) AS ready_files,
+         SUM(CASE
+           WHEN source_status = 'present' AND stable_count < ?
+           THEN 1 ELSE 0 END) AS unstable_files,
+         SUM(CASE
+           WHEN source_status = 'present'
+            AND status = 'pending'
+            AND next_retry_at IS NOT NULL
+            AND next_retry_at > ?
+           THEN 1 ELSE 0 END) AS retry_waiting_files,
+         SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed_files,
+         SUM(CASE WHEN status = 'skipped' THEN 1 ELSE 0 END) AS skipped_files
+       FROM task_files
+       WHERE task_id = ?`
+    ).get(
+      requiredStableChecks,
+      now,
+      requiredStableChecks,
+      now,
+      taskId
+    );
+    db2.prepare(
+      `UPDATE tasks
+       SET total_files = ?, total_bytes = ?, uploaded_files = ?, uploaded_bytes = ?,
+           updated_at = ?
+       WHERE id = ?`
+    ).run(
+      counts.total_files || 0,
+      counts.total_bytes || 0,
+      counts.uploaded_files || 0,
+      counts.uploaded_bytes || 0,
+      now,
+      taskId
+    );
+    for (const destination of getTaskDestinationRepo().listByTask(taskId)) {
+      const destinationRepo = getTaskDestinationRepo();
+      destinationRepo.recalculateProgress(taskId, destination.provider);
+      const summary = destinationRepo.summarizeFileTargets(
+        taskId,
+        destination.provider,
+        now
+      );
+      if (summary.failed > 0) {
+        destinationRepo.updateStatus(
+          taskId,
+          destination.provider,
+          "failed",
+          "存在需要处理的上传失败文件"
+        );
+      } else if (summary.pending > 0) {
+        destinationRepo.updateStatus(
+          taskId,
+          destination.provider,
+          summary.retryWaiting > 0 ? "retrying" : "pending"
+        );
+      } else if (summary.total > 0) {
+        destinationRepo.updateStatus(
+          taskId,
+          destination.provider,
+          task.sourceType === "local" && task.dayFolderId ? "synced" : "completed"
+        );
+      }
+    }
+    const latest = this.getById(taskId);
+    if (latest && latest.status !== "uploading") {
+      if ((counts.failed_files || 0) > 0) {
+        this.updateStatus(taskId, "failed", "存在需要处理的上传失败文件");
+      } else if ((counts.ready_files || 0) > 0) {
+        this.updateStatus(taskId, "pending");
+      } else if ((counts.retry_waiting_files || 0) > 0) {
+        this.updateStatus(taskId, "retrying");
+      } else if ((counts.unstable_files || 0) > 0) {
+        this.updateStatus(taskId, "scanning");
+      } else {
+        this.updateStatus(
+          taskId,
+          task.sourceType === "local" && task.dayFolderId ? "synced" : "completed"
+        );
+      }
+    }
+    return {
+      changed,
+      readyFiles: counts.ready_files || 0,
+      unstableFiles: counts.unstable_files || 0,
+      failedFiles: counts.failed_files || 0,
+      skippedFiles: counts.skipped_files || 0
+    };
+  }
+  markFileChanged(fileId, fileSize, mtimeMs) {
+    const db2 = getDb();
+    const now = (/* @__PURE__ */ new Date()).toISOString();
+    const transaction = db2.transaction(() => {
+      db2.prepare(
+        `UPDATE task_files
+         SET file_size = ?, mtime_ms = ?, stable_count = 1,
+             status = 'pending', source_status = 'present',
+             error_message = NULL, retry_count = 0, next_retry_at = NULL,
+             last_seen_at = ?, updated_at = ?
+         WHERE id = ?`
+      ).run(fileSize, mtimeMs, now, now, fileId);
+      db2.prepare(
+        `UPDATE task_file_destinations
+         SET status = 'pending', object_key = NULL, upload_id = NULL,
+             error_message = NULL, updated_at = ?
+         WHERE task_file_id = ?`
+      ).run(now, fileId);
+    });
+    transaction();
+  }
+  scheduleRetry(fileId, errorMessage, nextRetryAt) {
+    const now = (/* @__PURE__ */ new Date()).toISOString();
+    getDb().prepare(
+      `UPDATE task_files
+       SET status = 'pending', retry_count = retry_count + 1,
+           next_retry_at = ?, error_message = ?, updated_at = ?
+       WHERE id = ?`
+    ).run(nextRetryAt, errorMessage, now, fileId);
+    const row = getDb().prepare(
+      "SELECT retry_count FROM task_files WHERE id = ?"
+    ).get(fileId);
+    return row.retry_count;
+  }
+  clearRetry(fileId) {
+    getDb().prepare(
+      `UPDATE task_files
+       SET retry_count = 0, next_retry_at = NULL, error_message = NULL,
+           updated_at = ?
+       WHERE id = ?`
+    ).run((/* @__PURE__ */ new Date()).toISOString(), fileId);
+  }
+  recalculateProgress(taskId) {
+    const row = getDb().prepare(
+      `SELECT
+         COUNT(*) AS total_files,
+         COALESCE(SUM(file_size), 0) AS total_bytes,
+         SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) AS uploaded_files,
+         COALESCE(SUM(CASE WHEN status = 'completed' THEN file_size ELSE 0 END), 0) AS uploaded_bytes
+       FROM task_files
+       WHERE task_id = ?`
+    ).get(taskId);
+    getDb().prepare(
+      `UPDATE tasks
+       SET total_files = ?, total_bytes = ?, uploaded_files = ?,
+           uploaded_bytes = ?, updated_at = ?
+       WHERE id = ?`
+    ).run(
+      row.total_files || 0,
+      row.total_bytes || 0,
+      row.uploaded_files || 0,
+      row.uploaded_bytes || 0,
+      (/* @__PURE__ */ new Date()).toISOString(),
+      taskId
+    );
+  }
   updateFileStatus(fileId, status, ossKey, uploadId, errorMessage) {
     const db2 = getDb();
     const now = (/* @__PURE__ */ new Date()).toISOString();
@@ -887,7 +1551,11 @@ class TaskRepo {
   }
   getUnfinishedTasks() {
     const db2 = getDb();
-    return db2.prepare("SELECT * FROM tasks WHERE status IN ('pending', 'uploading', 'scanning') ORDER BY created_at ASC").all().map(rowToTask);
+    return db2.prepare(
+      `SELECT * FROM tasks
+       WHERE status IN ('pending', 'uploading', 'scanning', 'retrying', 'failed', 'paused')
+       ORDER BY created_at ASC`
+    ).all().map(rowToTask);
   }
   getCompletedForCleanup(retentionDays) {
     const db2 = getDb();
@@ -906,15 +1574,17 @@ function getTaskRepo() {
   if (!instance$f) instance$f = new TaskRepo();
   return instance$f;
 }
+const DEFAULT_WORK_DIR_NAME_PATTERN = "^\\d{2}-\\d{2}-\\d{2}$";
 const DEFAULT_SETTINGS = {
   scan: {
     directories: [],
-    intervalSeconds: 30
+    intervalSeconds: 30,
+    workDirNamePattern: DEFAULT_WORK_DIR_NAME_PATTERN
   },
   upload: {
-    maxConcurrentTasks: 5,
-    maxFilesPerTask: 6,
-    maxConcurrentUploads: 30,
+    maxConcurrentTasks: 4,
+    maxFilesPerTask: 12,
+    maxConcurrentUploads: 24,
     multipartThreshold: 100 * 1024 * 1024,
     // 100MB
     startAfterTime: "20:30",
@@ -954,7 +1624,7 @@ const DEFAULT_SETTINGS = {
   hotkey: "CommandOrControl+Shift+U",
   stability: {
     checkIntervalMs: 5e3,
-    checkCount: 3
+    checkCount: 2
   },
   log: {
     directory: "",
@@ -1176,6 +1846,7 @@ function rowToRecord(row) {
     createdAt: row.created_at,
     updatedAt: row.updated_at,
     completedAt: row.completed_at || null,
+    ignored: Boolean(row.ignored),
     childFolders
   };
 }
@@ -1211,7 +1882,7 @@ class DayFolderRepo {
       conditions.push("status = ?");
       params.push(query.status);
     } else if (query.includeCompleted === false) {
-      conditions.push("status != 'completed'");
+      conditions.push("status NOT IN ('completed', 'completed_with_skips')");
     }
     const where = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
     const limit = Math.max(1, Math.min(query.limit || 100, 1e3));
@@ -1248,14 +1919,16 @@ class DayFolderRepo {
       (folderName) => latestByPath.get(normalizeFolderPath(path.join(record.folderPath, folderName))) || null
     );
     const childStatuses = childTasks.map((task) => task?.status || null);
-    const status = determineDayFolderStatus(record.date, childStatuses, now);
-    const completedChildren = childTasks.filter((task) => task?.status === "completed").length;
+    const status = record.ignored ? "completed_with_skips" : determineDayFolderStatus(record.date, childStatuses, now);
+    const completedChildren = childTasks.filter(
+      (task) => task?.status === "completed" || task?.status === "synced" || task?.status === "skipped"
+    ).length;
     const totalFiles = childTasks.reduce((sum, task) => sum + (task?.totalFiles || 0), 0);
     const uploadedFiles = childTasks.reduce((sum, task) => sum + (task?.uploadedFiles || 0), 0);
     const totalBytes = childTasks.reduce((sum, task) => sum + (task?.totalBytes || 0), 0);
     const uploadedBytes = childTasks.reduce((sum, task) => sum + (task?.uploadedBytes || 0), 0);
     const updatedAt = (/* @__PURE__ */ new Date()).toISOString();
-    const completedAt = status === "completed" ? record.completedAt || updatedAt : null;
+    const completedAt = status === "completed" || status === "completed_with_skips" ? record.completedAt || updatedAt : null;
     getDb().prepare(
       `UPDATE day_folders SET
         status = ?, completed_children = ?, total_files = ?, uploaded_files = ?,
@@ -1293,7 +1966,8 @@ class DayFolderRepo {
     const cutoff = new Date(Date.now() - retentionDays * 864e5).toISOString();
     const rows = getDb().prepare(
       `SELECT * FROM day_folders
-       WHERE status = 'completed' AND completed_at IS NOT NULL AND completed_at < ?
+       WHERE status IN ('completed', 'completed_with_skips')
+         AND completed_at IS NOT NULL AND completed_at < ?
        ORDER BY completed_at ASC`
     ).all(cutoff);
     return rows.map((row) => this.toSummary(rowToRecord(row)));
@@ -1301,13 +1975,26 @@ class DayFolderRepo {
   clearCompleted(before) {
     const db2 = getDb();
     if (before) {
-      db2.prepare("DELETE FROM day_folders WHERE status = 'completed' AND completed_at < ?").run(before);
+      db2.prepare(
+        "DELETE FROM day_folders WHERE status IN ('completed', 'completed_with_skips') AND completed_at < ?"
+      ).run(before);
     } else {
-      db2.prepare("DELETE FROM day_folders WHERE status = 'completed'").run();
+      db2.prepare(
+        "DELETE FROM day_folders WHERE status IN ('completed', 'completed_with_skips')"
+      ).run();
     }
   }
   deleteCompleted(id) {
-    getDb().prepare("DELETE FROM day_folders WHERE id = ? AND status = 'completed'").run(id);
+    getDb().prepare(
+      "DELETE FROM day_folders WHERE id = ? AND status IN ('completed', 'completed_with_skips')"
+    ).run(id);
+  }
+  setIgnored(id, ignored) {
+    getDb().prepare(
+      `UPDATE day_folders
+       SET ignored = ?, updated_at = ?
+       WHERE id = ?`
+    ).run(ignored ? 1 : 0, (/* @__PURE__ */ new Date()).toISOString(), id);
   }
   getRecordById(id) {
     const row = getDb().prepare("SELECT * FROM day_folders WHERE id = ?").get(id);
@@ -1373,13 +2060,6 @@ class DataCollectService {
       },
       pointCloudCount: 0,
       depthImageCount: 0,
-      annotation: {
-        hasXml: false,
-        dataType: null,
-        qualityType: null,
-        specMin: null,
-        specMax: null
-      },
       totalFileCount: 0,
       totalSizeBytes: 0,
       collectedAt: (/* @__PURE__ */ new Date()).toISOString()
@@ -1434,20 +2114,6 @@ class DataCollectService {
     info.pointCloudCount = countFiles(pcDir, ".bin") + countFiles(pcDir, ".ply");
     const depthDir = path.join(folderPath, "camera_depth");
     info.depthImageCount = countFiles(depthDir, ".jpg") + countFiles(depthDir, ".ply");
-    const xmlPath = path.join(folderPath, "annotation", "segment_timestamps.xml");
-    if (fs.existsSync(xmlPath)) {
-      info.annotation.hasXml = true;
-      try {
-        const xmlContent = fs.readFileSync(xmlPath, "utf-8");
-        info.annotation.dataType = extractXmlTag(xmlContent, "data_type");
-        info.annotation.qualityType = extractXmlTag(xmlContent, "quality_type");
-        const specMin = extractXmlTag(xmlContent, "data_spec_min");
-        const specMax = extractXmlTag(xmlContent, "data_spec_max");
-        if (specMin !== null) info.annotation.specMin = parseInt(specMin);
-        if (specMax !== null) info.annotation.specMax = parseInt(specMax);
-      } catch {
-      }
-    }
     const { fileCount, totalSize } = walkDirStats(folderPath);
     info.totalFileCount = fileCount;
     info.totalSizeBytes = totalSize;
@@ -1571,11 +2237,6 @@ function getImageTimestampRange(folderPath) {
   }
   return { tsMin, tsMax, count };
 }
-function extractXmlTag(xml, tagName) {
-  const re = new RegExp(`<${tagName}>\\s*([^<]*)\\s*</${tagName}>`);
-  const m = re.exec(xml);
-  return m ? m[1].trim() : null;
-}
 function walkDirStats(dirPath) {
   let fileCount = 0;
   let totalSize = 0;
@@ -1650,14 +2311,14 @@ class DayFolderService {
     const summary = repo.recalculate(dayFolderId);
     if (!summary) return null;
     try {
-      if (summary.status === "completed" && summary.completedAt) {
+      if ((summary.status === "completed" || summary.status === "completed_with_skips") && summary.completedAt) {
         const children = repo.getChildTasks(dayFolderId);
         const marker = {
           version: 1,
           dayFolderId: summary.id,
           date: summary.date,
           folderPath: summary.folderPath,
-          status: "completed",
+          status: summary.status,
           totalChildren: summary.totalChildren,
           totalFiles: summary.totalFiles,
           uploadedFiles: summary.uploadedFiles,
@@ -1702,19 +2363,422 @@ function getDayFolderService() {
   if (!instance$a) instance$a = new DayFolderService();
   return instance$a;
 }
-function discoverDayDirectories(rootDir) {
-  return fs.readdirSync(rootDir, { withFileTypes: true }).filter(
-    (entry) => entry.isDirectory() && !entry.name.startsWith(".") && isDateFolderName(entry.name)
-  ).map((entry) => {
-    const folderPath = path.join(rootDir, entry.name);
-    const childFolderNames = fs.readdirSync(folderPath, { withFileTypes: true }).filter((child) => child.isDirectory() && !child.name.startsWith(".")).map((child) => child.name).sort();
-    return {
-      dateName: entry.name,
-      folderPath,
-      childFolderNames
-    };
-  }).sort((a, b) => a.dateName.localeCompare(b.dateName));
+class CleanupService {
+  timer = null;
+  pendingRun = null;
+  running = false;
+  start() {
+    if (this.timer) return;
+    this.scheduleCleanup(5 * 60 * 1e3);
+    this.timer = setInterval(() => void this.cleanup(), 36e5);
+    log.info("自动清理服务已启动");
+  }
+  stop() {
+    if (this.pendingRun) {
+      clearTimeout(this.pendingRun);
+      this.pendingRun = null;
+    }
+    if (this.timer) {
+      clearInterval(this.timer);
+      this.timer = null;
+    }
+    log.info("自动清理服务已停止");
+  }
+  scheduleCleanup(delayMs = 0) {
+    if (this.pendingRun) {
+      clearTimeout(this.pendingRun);
+    }
+    this.pendingRun = setTimeout(() => {
+      this.pendingRun = null;
+      void this.cleanup();
+    }, Math.max(0, delayMs));
+  }
+  async cleanup() {
+    if (this.running) return;
+    this.running = true;
+    try {
+      const settings = getSettingsRepo();
+      const config = settings.get("cleanup");
+      if (!config?.enabled) return;
+      const retentionDays = this.normalizeRetentionDays(config);
+      const taskRepo = getTaskRepo();
+      const dayFolderRepo = getDayFolderRepo();
+      const tasks = taskRepo.getCompletedForCleanup(retentionDays);
+      const dayFolders = dayFolderRepo.getCompletedForCleanup(retentionDays);
+      if (tasks.length === 0 && dayFolders.length === 0) return;
+      log.info(
+        `自动清理: 发现 ${dayFolders.length} 个日期目录和 ${tasks.length} 个独立任务可清理 (保留天数: ${retentionDays})`
+      );
+      let cleaned = 0;
+      for (const dayFolder of dayFolders) {
+        try {
+          if (!fs.existsSync(dayFolder.folderPath)) {
+            continue;
+          }
+          await promises.rm(dayFolder.folderPath, { recursive: true, force: true });
+          cleaned++;
+          log.info(
+            `自动清理: 已删除日期目录 ${dayFolder.folderPath} (日期目录ID: ${dayFolder.id}, 完成于: ${dayFolder.completedAt})`
+          );
+        } catch (err) {
+          log.error(`自动清理日期目录失败: ${dayFolder.folderPath}`, err);
+        }
+      }
+      for (const task of tasks) {
+        try {
+          if (!fs.existsSync(task.folderPath)) {
+            continue;
+          }
+          await promises.rm(task.folderPath, { recursive: true, force: true });
+          cleaned++;
+          log.info(`自动清理: 已删除 ${task.folderPath} (任务ID: ${task.id}, 完成于: ${task.completedAt})`);
+        } catch (err) {
+          log.error(`自动清理失败: ${task.folderPath}`, err);
+        }
+      }
+      if (cleaned > 0) {
+        log.info(`自动清理完成: 共删除 ${cleaned} 个文件夹`);
+      }
+    } catch (err) {
+      log.error("自动清理服务异常:", err);
+    } finally {
+      this.running = false;
+    }
+  }
+  normalizeRetentionDays(config) {
+    if (!Number.isFinite(config.retentionDays)) {
+      return 7;
+    }
+    return Math.max(0, Math.floor(config.retentionDays));
+  }
 }
+let instance$9 = null;
+function getCleanupService() {
+  if (!instance$9) instance$9 = new CleanupService();
+  return instance$9;
+}
+class TaskQueueService extends events.EventEmitter {
+  runningTasks = /* @__PURE__ */ new Map();
+  processTimer = null;
+  initialProcessTimer = null;
+  taskRunner = null;
+  setTaskRunner(runner) {
+    this.taskRunner = runner;
+  }
+  start() {
+    if (this.processTimer) return;
+    this.processTimer = setInterval(() => void this.processQueue(), 2e3);
+    this.initialProcessTimer = setTimeout(() => {
+      this.initialProcessTimer = null;
+      void this.processQueue();
+    }, 1500);
+    log.info("任务队列已启动");
+  }
+  stop() {
+    if (this.initialProcessTimer) {
+      clearTimeout(this.initialProcessTimer);
+      this.initialProcessTimer = null;
+    }
+    if (this.processTimer) {
+      clearInterval(this.processTimer);
+      this.processTimer = null;
+    }
+    log.info("任务队列已停止");
+  }
+  getRunningCount() {
+    return this.runningTasks.size;
+  }
+  isTaskRunning(taskId) {
+    return this.runningTasks.has(taskId);
+  }
+  cancelRunningTask(taskId) {
+    const running = this.runningTasks.get(taskId);
+    if (running) {
+      running.cancel();
+      this.runningTasks.delete(taskId);
+    }
+  }
+  async processQueue() {
+    if (!this.taskRunner) return;
+    const settings = getSettingsRepo();
+    const uploadConfig = settings.get("upload");
+    if (!this.isWithinUploadWindow(uploadConfig?.startAfterTime, uploadConfig?.endBeforeTime)) return;
+    const maxConcurrent = uploadConfig?.maxConcurrentTasks || 4;
+    const taskRepo = getTaskRepo();
+    const availableSlots = maxConcurrent - this.runningTasks.size;
+    if (availableSlots <= 0) return;
+    const pendingTasks = taskRepo.listRunnable();
+    const eligibleTasks = pendingTasks.filter(
+      (task) => this.isTaskEligibleForCurrentStartCycle(task, uploadConfig?.startAfterTime)
+    );
+    const toRun = eligibleTasks.slice(0, Math.min(availableSlots, 1));
+    for (const task of toRun) {
+      this.executeTask(task);
+    }
+  }
+  async executeTask(task) {
+    const taskRepo = getTaskRepo();
+    const controller = new AbortController();
+    this.runningTasks.set(task.id, { cancel: () => controller.abort() });
+    try {
+      taskRepo.updateStatus(task.id, "uploading");
+      this.emit("task:status-change", {
+        taskId: task.id,
+        oldStatus: task.status,
+        newStatus: "uploading"
+      });
+      const finalStatus = await this.taskRunner(task, controller.signal);
+      if (!controller.signal.aborted) {
+        taskRepo.updateStatus(task.id, finalStatus);
+        getDayFolderService().refreshForTask(task.id);
+        if (finalStatus === "completed") {
+          getCleanupService().scheduleCleanup();
+        }
+        this.emit("task:status-change", {
+          taskId: task.id,
+          oldStatus: "uploading",
+          newStatus: finalStatus
+        });
+        log.info(`任务状态更新为 ${finalStatus}:`, task.folderPath);
+      }
+    } catch (err) {
+      if (!controller.signal.aborted) {
+        const errMsg = err instanceof Error ? err.message : String(err);
+        taskRepo.updateStatus(task.id, "failed", errMsg);
+        getTaskDestinationRepo().updateIncompleteStatuses(
+          task.id,
+          "failed",
+          errMsg
+        );
+        getDayFolderService().refreshForTask(task.id);
+        this.emit("task:status-change", {
+          taskId: task.id,
+          oldStatus: "uploading",
+          newStatus: "failed"
+        });
+        log.error("任务失败:", task.folderPath, errMsg);
+      }
+    } finally {
+      this.runningTasks.delete(task.id);
+    }
+  }
+  isWithinUploadWindow(startAfterTime, endBeforeTime) {
+    const startMinutes = this.parseMinutes(startAfterTime);
+    const endMinutes = this.parseMinutes(endBeforeTime);
+    const now = /* @__PURE__ */ new Date();
+    const currentMinutes = now.getHours() * 60 + now.getMinutes();
+    if (startMinutes === null && endMinutes === null) return true;
+    if (startMinutes !== null && endMinutes === null) {
+      return currentMinutes >= startMinutes;
+    }
+    if (startMinutes === null && endMinutes !== null) {
+      return currentMinutes <= endMinutes;
+    }
+    if (startMinutes === null || endMinutes === null) return true;
+    if (startMinutes === endMinutes) return true;
+    if (startMinutes < endMinutes) {
+      return currentMinutes >= startMinutes && currentMinutes <= endMinutes;
+    }
+    return currentMinutes >= startMinutes || currentMinutes <= endMinutes;
+  }
+  parseMinutes(time) {
+    if (!time || !time.trim()) return null;
+    const match = time.match(/^(\d{1,2}):(\d{1,2})$/);
+    if (!match) return null;
+    const hour = Number(match[1]);
+    const minute = Number(match[2]);
+    if (Number.isNaN(hour) || Number.isNaN(minute)) return null;
+    if (hour < 0 || hour > 23 || minute < 0 || minute > 59) return null;
+    return hour * 60 + minute;
+  }
+  isTaskEligibleForCurrentStartCycle(task, startAfterTime) {
+    const startMinutes = this.parseMinutes(startAfterTime);
+    if (startMinutes === null) return true;
+    const cycleStart = this.getCurrentStartCycleStart(startMinutes, /* @__PURE__ */ new Date());
+    const createdAtMs = new Date(task.createdAt).getTime();
+    if (Number.isNaN(createdAtMs)) return true;
+    return createdAtMs <= cycleStart.getTime();
+  }
+  getCurrentStartCycleStart(startMinutes, now) {
+    const todayStart = new Date(now);
+    todayStart.setHours(Math.floor(startMinutes / 60), startMinutes % 60, 0, 0);
+    if (now.getTime() >= todayStart.getTime()) {
+      return todayStart;
+    }
+    const previousStart = new Date(todayStart);
+    previousStart.setDate(previousStart.getDate() - 1);
+    return previousStart;
+  }
+}
+let instance$8 = null;
+function getTaskQueueService() {
+  if (!instance$8) instance$8 = new TaskQueueService();
+  return instance$8;
+}
+class FileFilterService {
+  rules;
+  constructor(rules) {
+    this.rules = rules;
+  }
+  updateRules(rules) {
+    this.rules = rules;
+  }
+  /**
+   * 判断单个文件是否应该被包含
+   * @param relativePath 文件相对路径
+   * @returns true = 包含, false = 排除
+   */
+  shouldInclude(relativePath) {
+    const fileName = path.basename(relativePath);
+    const ext = path.extname(relativePath).toLowerCase();
+    if (this.rules.whitelist.length > 0) {
+      for (const pattern of this.rules.whitelist) {
+        if (this.matchPattern(fileName, relativePath, pattern)) {
+          return true;
+        }
+      }
+    }
+    if (this.rules.blacklist.length > 0) {
+      for (const pattern of this.rules.blacklist) {
+        if (this.matchPattern(fileName, relativePath, pattern)) {
+          return false;
+        }
+      }
+    }
+    if (this.rules.regex.length > 0) {
+      for (const pattern of this.rules.regex) {
+        try {
+          const re = new RegExp(pattern);
+          if (re.test(relativePath) || re.test(fileName)) {
+            return false;
+          }
+        } catch {
+        }
+      }
+    }
+    if (this.rules.suffixes.length > 0) {
+      return this.rules.suffixes.some((suffix) => ext === this.normalizeSuffix(suffix));
+    }
+    return true;
+  }
+  /**
+   * 递归扫描文件夹，返回过滤后的文件列表
+   */
+  scanFolder(folderPath) {
+    const results = [];
+    this.walkDir(folderPath, folderPath, results);
+    return results;
+  }
+  async scanFolderAsync(folderPath) {
+    const results = [];
+    await this.walkDirAsync(folderPath, folderPath, results);
+    return results;
+  }
+  walkDir(basePath, currentPath, results) {
+    const entries = fs.readdirSync(currentPath, { withFileTypes: true });
+    for (const entry of entries) {
+      const fullPath = path.join(currentPath, entry.name);
+      if (entry.isDirectory()) {
+        if (entry.name.startsWith(".")) continue;
+        this.walkDir(basePath, fullPath, results);
+      } else if (entry.isFile()) {
+        const relativePath = fullPath.slice(basePath.length + 1);
+        if (entry.name === "tmp_upload.json" || entry.name === "process_task.json" || entry.name === "day_upload.json") continue;
+        if (this.shouldInclude(relativePath)) {
+          const stat2 = fs.statSync(fullPath);
+          results.push({
+            relativePath,
+            absolutePath: fullPath,
+            size: stat2.size,
+            mtimeMs: stat2.mtimeMs
+          });
+        }
+      }
+    }
+  }
+  async walkDirAsync(basePath, currentPath, results) {
+    const entries = await promises.readdir(currentPath, { withFileTypes: true });
+    for (const entry of entries) {
+      const fullPath = path.join(currentPath, entry.name);
+      if (entry.isDirectory()) {
+        if (entry.name.startsWith(".")) continue;
+        await this.walkDirAsync(basePath, fullPath, results);
+      } else if (entry.isFile()) {
+        const relativePath = fullPath.slice(basePath.length + 1);
+        if (entry.name === "tmp_upload.json" || entry.name === "process_task.json" || entry.name === "day_upload.json") continue;
+        if (!this.shouldInclude(relativePath)) continue;
+        try {
+          const fileStat = await promises.stat(fullPath);
+          results.push({
+            relativePath,
+            absolutePath: fullPath,
+            size: fileStat.size,
+            mtimeMs: fileStat.mtimeMs
+          });
+        } catch {
+        }
+      }
+    }
+  }
+  matchPattern(fileName, relativePath, pattern) {
+    if (fileName === pattern) return true;
+    if (pattern.startsWith(".") && path.extname(fileName).toLowerCase() === pattern.toLowerCase()) return true;
+    if (pattern.includes("*")) {
+      const regexStr = "^" + pattern.replace(/\./g, "\\.").replace(/\*/g, ".*") + "$";
+      try {
+        const re = new RegExp(regexStr, "i");
+        if (re.test(fileName) || re.test(relativePath)) return true;
+      } catch {
+      }
+    }
+    return false;
+  }
+  normalizeSuffix(suffix) {
+    const trimmed = suffix.trim().toLowerCase();
+    if (!trimmed) return "";
+    return trimmed.startsWith(".") ? trimmed : `.${trimmed}`;
+  }
+}
+function createWorkDirNameRegex(pattern) {
+  try {
+    return new RegExp(pattern?.trim() || DEFAULT_WORK_DIR_NAME_PATTERN);
+  } catch {
+    return new RegExp(DEFAULT_WORK_DIR_NAME_PATTERN);
+  }
+}
+async function discoverCurrentDayDirectory(rootDir, dateName, workDirNamePattern) {
+  if (!isDateFolderName(dateName)) return null;
+  const folderPath = path.join(rootDir, dateName);
+  let childEntries;
+  try {
+    childEntries = await promises.readdir(folderPath, { withFileTypes: true });
+  } catch (error) {
+    const code = error.code;
+    if (code === "ENOENT" || code === "ENOTDIR") return null;
+    throw error;
+  }
+  const workDirRegex = createWorkDirNameRegex(workDirNamePattern);
+  const childFolderNames = [];
+  const ignoredChildFolderNames = [];
+  for (const child of childEntries) {
+    if (!child.isDirectory() || child.name.startsWith(".")) continue;
+    if (workDirRegex.test(child.name)) {
+      childFolderNames.push(child.name);
+    } else {
+      ignoredChildFolderNames.push(child.name);
+    }
+  }
+  return {
+    dateName,
+    folderPath,
+    childFolderNames: childFolderNames.sort(),
+    ignoredChildFolderNames: ignoredChildFolderNames.sort()
+  };
+}
+const NON_WORK_DIR_REASON = "非工作次目录";
+const INITIAL_SCAN_DELAY_MS = 3e3;
+const SCAN_BATCH_SIZE = 4;
+const RECONCILE_BATCH_SIZE = 2;
 class ScannerService {
   timer = null;
   stabilityTimer = null;
@@ -1723,14 +2787,26 @@ class ScannerService {
   nextScanAt = null;
   pendingDirs = /* @__PURE__ */ new Map();
   lastScanResults = null;
+  watcher = null;
+  scanDebounceTimer = null;
+  watcherErrorHandled = false;
+  lastWatcherWarningAt = 0;
+  scanInProgress = false;
+  scanQueued = false;
+  reconcileQueue = [];
+  reconcileQueuedIds = /* @__PURE__ */ new Set();
+  reconcileInProgress = false;
+  stabilityCursor = 0;
   start() {
     if (this.running) return;
     this.running = true;
     const settings = getSettingsRepo();
     const scanConfig = settings.get("scan");
+    const directories = scanConfig?.directories || [];
     const intervalMs = (scanConfig?.intervalSeconds || 30) * 1e3;
-    this.scan();
-    this.timer = setInterval(() => this.scan(), intervalMs);
+    this.startWatcher(directories);
+    this.timer = setInterval(() => this.scheduleFullScan(), intervalMs);
+    this.scheduleFullScan(INITIAL_SCAN_DELAY_MS);
     const stabilityConfig = settings.get("stability");
     const checkInterval = stabilityConfig?.checkIntervalMs || 5e3;
     this.stabilityTimer = setInterval(() => this.checkStability(), checkInterval);
@@ -1745,6 +2821,17 @@ class ScannerService {
       clearInterval(this.stabilityTimer);
       this.stabilityTimer = null;
     }
+    if (this.watcher) {
+      void this.watcher.close();
+      this.watcher = null;
+    }
+    if (this.scanDebounceTimer) {
+      clearTimeout(this.scanDebounceTimer);
+      this.scanDebounceTimer = null;
+    }
+    this.scanQueued = false;
+    this.reconcileQueue = [];
+    this.reconcileQueuedIds.clear();
     this.running = false;
     this.nextScanAt = null;
     log.info("扫描器已停止");
@@ -1777,82 +2864,144 @@ class ScannerService {
     };
   }
   triggerScan() {
-    this.scan();
+    this.scheduleFullScan(0);
   }
-  scan() {
+  async scan() {
+    if (!this.running) return;
+    if (this.scanInProgress) {
+      this.scanQueued = true;
+      return;
+    }
+    this.scanInProgress = true;
     const settings = getSettingsRepo();
     const scanConfig = settings.get("scan");
     const directories = scanConfig?.directories || [];
     const intervalMs = (scanConfig?.intervalSeconds || 30) * 1e3;
+    const today = this.formatLocalDate(/* @__PURE__ */ new Date());
     const seenChildPaths = /* @__PURE__ */ new Set();
     let scannedDirs = 0;
     let newDirsFound = 0;
     let existingDirs = 0;
-    for (const rootDir of directories) {
-      if (!fs.existsSync(rootDir)) {
-        log.warn("扫描根目录不存在:", rootDir);
-        continue;
+    let ignoredDirectories = 0;
+    let skippedChildren = 0;
+    try {
+      for (const rootDir of directories) {
+        if (!await this.pathExists(rootDir)) {
+          log.warn("扫描根目录不存在:", rootDir);
+          continue;
+        }
+        const result = await this.scanRootDirectory(
+          rootDir,
+          today,
+          scanConfig?.workDirNamePattern,
+          seenChildPaths
+        );
+        scannedDirs += result.scanned;
+        newDirsFound += result.newFound;
+        existingDirs += result.existing;
+        ignoredDirectories += result.ignored;
+        skippedChildren += result.skipped;
+        await this.yieldToEventLoop();
       }
-      const result = this.scanRootDirectory(rootDir, seenChildPaths);
-      scannedDirs += result.scanned;
-      newDirsFound += result.newFound;
-      existingDirs += result.existing;
-    }
-    for (const pendingPath of this.pendingDirs.keys()) {
-      if (!seenChildPaths.has(pendingPath)) {
-        this.pendingDirs.delete(pendingPath);
+      for (const pendingPath of this.pendingDirs.keys()) {
+        if (!seenChildPaths.has(pendingPath)) {
+          this.pendingDirs.delete(pendingPath);
+        }
+      }
+      await this.reconcileDeletedTasks(seenChildPaths, directories);
+      this.lastScanAt = (/* @__PURE__ */ new Date()).toISOString();
+      this.nextScanAt = new Date(Date.now() + intervalMs).toISOString();
+      this.lastScanResults = {
+        scannedDirs,
+        newDirsFound,
+        existingDirs,
+        ignoredDirectories,
+        skippedChildren,
+        timestamp: this.lastScanAt
+      };
+      this.broadcastStatus();
+    } finally {
+      this.scanInProgress = false;
+      if (this.scanQueued && this.running) {
+        this.scanQueued = false;
+        this.scheduleFullScan(250);
       }
     }
-    this.lastScanAt = (/* @__PURE__ */ new Date()).toISOString();
-    this.nextScanAt = new Date(Date.now() + intervalMs).toISOString();
-    this.lastScanResults = {
-      scannedDirs,
-      newDirsFound,
-      existingDirs,
-      timestamp: this.lastScanAt
-    };
-    this.broadcastStatus();
   }
-  scanRootDirectory(rootDir, seenChildPaths) {
+  async scanRootDirectory(rootDir, today, workDirNamePattern, seenChildPaths) {
     let scanned = 0;
     let newFound = 0;
     let existing = 0;
+    let ignored = 0;
+    let skipped = 0;
     try {
-      const dayDirectories = discoverDayDirectories(rootDir);
-      for (const dayDirectory of dayDirectories) {
-        const result = this.scanDayDirectory(
+      const dayDirectory = await discoverCurrentDayDirectory(
+        rootDir,
+        today,
+        workDirNamePattern
+      );
+      if (dayDirectory) {
+        const result = await this.scanDayDirectory(
           dayDirectory.folderPath,
           dayDirectory.dateName,
           dayDirectory.childFolderNames,
+          dayDirectory.ignoredChildFolderNames,
           seenChildPaths
         );
         scanned += result.scanned;
         newFound += result.newFound;
         existing += result.existing;
+        ignored += result.ignored;
+        skipped += result.skipped;
       }
     } catch (err) {
       log.error("扫描数据根目录失败:", rootDir, err);
     }
-    return { scanned, newFound, existing };
+    return { scanned, newFound, existing, ignored, skipped };
   }
-  scanDayDirectory(dayFolderPath, dateName, discoveredChildNames, seenChildPaths) {
+  async scanDayDirectory(dayFolderPath, dateName, discoveredChildNames, ignoredChildNames, seenChildPaths) {
     const dayFolder = getDayFolderRepo().ensure(dayFolderPath, dateName);
-    const childNames = [];
+    const childNames = Array.from(
+      /* @__PURE__ */ new Set([...discoveredChildNames, ...ignoredChildNames])
+    ).sort();
+    const ignoredSet = new Set(ignoredChildNames);
     let scanned = 0;
     let newFound = 0;
     let existing = 0;
+    let ignored = 0;
+    let skipped = 0;
     try {
-      for (const childName of discoveredChildNames) {
+      for (let index = 0; index < childNames.length; index++) {
+        const childName = childNames[index];
         const childPath = path.join(dayFolderPath, childName);
         const uploadRelativePath = buildUploadRelativePath(dateName, childName);
-        childNames.push(childName);
         seenChildPaths.add(childPath);
         scanned++;
         const existingTask = getTaskRepo().getByFolderPath(childPath);
         if (existingTask) {
           this.attachTaskToDayFolder(existingTask, dayFolder.id, uploadRelativePath);
           this.pendingDirs.delete(childPath);
+          if (dayFolder.ignored && existingTask.status !== "completed" && existingTask.status !== "synced") {
+            getTaskRepo().skip(existingTask.id, "用户忽略整个日期");
+            this.broadcastTaskStatus(
+              existingTask.id,
+              existingTask.status,
+              "skipped"
+            );
+          }
           existing++;
+          continue;
+        }
+        if (ignoredSet.has(childName)) {
+          const task = this.registerIgnoredDir(
+            childPath,
+            childName,
+            dayFolder.id,
+            uploadRelativePath
+          );
+          this.broadcastTaskStatus(task.id, task.status, "skipped");
+          ignored++;
+          skipped++;
           continue;
         }
         const processMarker = readProcessTask(childPath);
@@ -1870,7 +3019,7 @@ class ScannerService {
         }
         const tmpMarker = readTmpUpload(childPath);
         if (tmpMarker) {
-          this.registerNewDir({
+          const task = this.registerNewDir({
             path: childPath,
             dayFolderId: dayFolder.id,
             dateName,
@@ -1882,12 +3031,18 @@ class ScannerService {
             uploadTargetMode: tmpMarker.metadata.uploadTargetMode,
             destinationPrefixes: tmpMarker.metadata.destinationPrefixes
           });
+          if (dayFolder.ignored) {
+            getTaskRepo().skip(task.id, "用户忽略整个日期");
+            this.broadcastTaskStatus(task.id, task.status, "skipped");
+          } else {
+            this.queueReconcileTask(task);
+          }
           existing++;
           continue;
         }
         if (!this.pendingDirs.has(childPath)) {
-          log.info("发现新焊接目录, 加入稳定性检查:", childPath);
-          this.pendingDirs.set(childPath, {
+          log.info("发现新工作次目录, 注册持续同步任务:", childPath);
+          const pending = {
             path: childPath,
             dayFolderId: dayFolder.id,
             dateName,
@@ -1895,49 +3050,45 @@ class ScannerService {
             uploadRelativePath,
             checks: 0,
             discoveredAt: (/* @__PURE__ */ new Date()).toISOString(),
-            lastSnapshot: this.snapshotDir(childPath)
-          });
+            lastSnapshot: /* @__PURE__ */ new Map()
+          };
+          const task = this.registerNewDir(pending);
+          if (dayFolder.ignored) {
+            getTaskRepo().skip(task.id, "用户忽略整个日期");
+            this.broadcastTaskStatus(task.id, task.status, "skipped");
+          } else {
+            this.queueReconcileTask(task);
+          }
           newFound++;
+        }
+        if ((index + 1) % SCAN_BATCH_SIZE === 0) {
+          await this.yieldToEventLoop();
         }
       }
     } catch (err) {
       log.error("扫描日期目录失败:", dayFolderPath, err);
     }
     getDayFolderService().refresh(dayFolder.id, childNames);
-    return { scanned, newFound, existing };
+    return { scanned, newFound, existing, ignored, skipped };
   }
   checkStability() {
-    if (this.pendingDirs.size === 0) return;
-    const settings = getSettingsRepo();
-    const stabilityConfig = settings.get("stability");
-    const requiredChecks = stabilityConfig?.checkCount || 3;
-    let changed = false;
-    for (const [dirPath, pending] of this.pendingDirs) {
-      if (!fs.existsSync(dirPath)) {
-        this.pendingDirs.delete(dirPath);
-        getDayFolderService().refresh(pending.dayFolderId);
-        changed = true;
-        continue;
+    const today = this.formatLocalDate(/* @__PURE__ */ new Date());
+    const tasks = getTaskRepo().listContinuouslyMonitored(today);
+    if (tasks.length > 0) {
+      const batchSize = Math.min(RECONCILE_BATCH_SIZE, tasks.length);
+      for (let i = 0; i < batchSize; i++) {
+        const task = tasks[(this.stabilityCursor + i) % tasks.length];
+        if (task) this.queueReconcileTask(task);
       }
-      const currentSnapshot = this.snapshotDir(dirPath);
-      const isStable = this.compareSnapshots(pending.lastSnapshot, currentSnapshot);
-      if (isStable) {
-        pending.checks++;
-        log.info(`焊接目录稳定性检查 ${pending.checks}/${requiredChecks}:`, dirPath);
-        if (pending.checks >= requiredChecks) {
-          this.registerNewDir(pending);
-          this.pendingDirs.delete(dirPath);
-        }
-        changed = true;
-      } else {
-        pending.checks = 0;
-        pending.lastSnapshot = currentSnapshot;
-        changed = true;
-      }
+      this.stabilityCursor = (this.stabilityCursor + batchSize) % tasks.length;
     }
-    if (changed) {
-      this.broadcastStatus();
-    }
+    this.broadcastStatus();
+  }
+  formatLocalDate(date) {
+    const year = date.getFullYear();
+    const month = String(date.getMonth() + 1).padStart(2, "0");
+    const day = String(date.getDate()).padStart(2, "0");
+    return `${year}-${month}-${day}`;
   }
   registerNewDir(pending) {
     const settings = getSettingsRepo().getAll();
@@ -1969,10 +3120,172 @@ class ScannerService {
       pending.uploadRelativePath,
       snapshot
     );
-    log.info("焊接目录已注册为上传任务:", pending.path);
-    this.collectDataInfo(pending.path);
+    log.info("工作次目录已注册为上传任务:", pending.path);
+    setTimeout(() => this.collectDataInfo(pending.path), 0);
     getDayFolderService().refresh(pending.dayFolderId);
     return task;
+  }
+  registerIgnoredDir(dirPath, folderName, dayFolderId, uploadRelativePath) {
+    const task = this.ensureTaskRegistered(
+      dirPath,
+      folderName,
+      dayFolderId,
+      uploadRelativePath
+    );
+    if (task.status !== "skipped" || task.errorMessage !== NON_WORK_DIR_REASON) {
+      getTaskRepo().skip(task.id, NON_WORK_DIR_REASON);
+      log.info("已忽略非工作次目录:", dirPath);
+    }
+    getDayFolderService().refresh(dayFolderId);
+    return getTaskRepo().getById(task.id) || task;
+  }
+  startWatcher(directories) {
+    if (this.watcher) void this.watcher.close();
+    this.watcherErrorHandled = false;
+    const existingDirectories = directories.filter(
+      (directory) => fs.existsSync(directory)
+    );
+    if (existingDirectories.length === 0) return;
+    this.watcher = chokidar.watch(existingDirectories, {
+      ignoreInitial: true,
+      persistent: true,
+      awaitWriteFinish: false,
+      // 只监听 根目录/日期目录/工作次目录 的目录结构。
+      // 文件变化由稳定性检查和 30 秒全量校准处理，避免大量小文件耗尽 inotify。
+      depth: 2,
+      ignored: (path2, stats) => {
+        const normalized = path2.replace(/\\/g, "/");
+        return stats?.isFile() === true || normalized.includes("/.git/") || normalized.endsWith("/tmp_upload.json") || normalized.endsWith("/process_task.json") || normalized.endsWith("/day_upload.json");
+      }
+    });
+    this.watcher.on("addDir", () => this.scheduleFullScan()).on("unlinkDir", () => this.scheduleFullScan()).on("error", (error) => this.handleWatcherError(error));
+  }
+  scheduleFullScan(delayMs = 500) {
+    if (this.scanDebounceTimer) clearTimeout(this.scanDebounceTimer);
+    this.scanDebounceTimer = setTimeout(() => {
+      this.scanDebounceTimer = null;
+      void this.scan();
+    }, delayMs);
+  }
+  handleWatcherError(error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const isResourceLimit = message.includes("ENOSPC") || message.includes("EMFILE") || message.includes("file watchers");
+    if (isResourceLimit && !this.watcherErrorHandled) {
+      this.watcherErrorHandled = true;
+      log.warn(
+        "目录事件监控达到系统资源上限，已关闭事件监听并回退到周期扫描:",
+        message
+      );
+      const watcher = this.watcher;
+      this.watcher = null;
+      if (watcher) void watcher.close();
+      return;
+    }
+    const now = Date.now();
+    if (now - this.lastWatcherWarningAt >= 6e4) {
+      this.lastWatcherWarningAt = now;
+      log.warn("目录事件监控异常，周期扫描仍会继续:", message);
+    }
+  }
+  queueReconcileTask(task) {
+    if (this.reconcileQueuedIds.has(task.id)) return;
+    this.reconcileQueuedIds.add(task.id);
+    this.reconcileQueue.push(task.id);
+    void this.processReconcileQueue();
+  }
+  async processReconcileQueue() {
+    if (this.reconcileInProgress) return;
+    this.reconcileInProgress = true;
+    try {
+      while (this.reconcileQueue.length > 0) {
+        const taskId = this.reconcileQueue.shift();
+        this.reconcileQueuedIds.delete(taskId);
+        const task = getTaskRepo().getById(taskId);
+        if (task) {
+          await this.reconcileTask(task);
+        }
+        await this.yieldToEventLoop();
+      }
+    } finally {
+      this.reconcileInProgress = false;
+    }
+  }
+  async reconcileTask(task) {
+    if (task.status === "skipped" || task.status === "paused" || task.status === "completed") {
+      return;
+    }
+    if (!await this.pathExists(task.folderPath)) {
+      if (task.status !== "synced") {
+        getTaskQueueService().cancelRunningTask(task.id);
+        getTaskRepo().skip(task.id, "源目录已删除");
+        getDayFolderService().refreshForTask(task.id);
+        this.broadcastTaskStatus(task.id, task.status, "skipped");
+      }
+      return;
+    }
+    try {
+      const settings = getSettingsRepo().getAll();
+      const files = await new FileFilterService(settings.filter).scanFolderAsync(task.folderPath);
+      const stableChecks = task.sourceType === "local" && task.dayFolderId ? Math.max(2, settings.stability.checkCount || 2) : 1;
+      getTaskRepo().reconcileFiles(
+        task.id,
+        files.map((file) => ({
+          relativePath: file.relativePath,
+          size: file.size,
+          mtimeMs: file.mtimeMs
+        })),
+        stableChecks
+      );
+      const updated = getTaskRepo().getById(task.id);
+      if (updated && updated.status !== task.status) {
+        this.broadcastTaskStatus(task.id, task.status, updated.status);
+      }
+      getDayFolderService().refreshForTask(task.id);
+    } catch (err) {
+      if (!await this.pathExists(task.folderPath)) {
+        getTaskQueueService().cancelRunningTask(task.id);
+        getTaskRepo().skip(task.id, "源目录已删除");
+        getDayFolderService().refreshForTask(task.id);
+        this.broadcastTaskStatus(task.id, task.status, "skipped");
+        return;
+      }
+      log.warn("持续同步校准失败:", task.folderPath, err);
+    }
+  }
+  async reconcileDeletedTasks(seenChildPaths, watchedDirectories) {
+    const normalizedRoots = watchedDirectories.map(
+      (directory) => directory.replace(/[\\/]+$/, "")
+    );
+    const tasks = getTaskRepo().listByStatus();
+    for (let index = 0; index < tasks.length; index++) {
+      const task = tasks[index];
+      if (task.sourceType !== "local" || !task.dayFolderId) continue;
+      if (!normalizedRoots.some(
+        (root) => task.folderPath === root || task.folderPath.startsWith(`${root}/`) || task.folderPath.startsWith(`${root}\\`)
+      )) {
+        continue;
+      }
+      if (seenChildPaths.has(task.folderPath) || await this.pathExists(task.folderPath)) continue;
+      if (task.status === "completed" || task.status === "synced" || task.status === "skipped") {
+        continue;
+      }
+      getTaskQueueService().cancelRunningTask(task.id);
+      getTaskRepo().skip(task.id, "源目录已删除");
+      getDayFolderService().refreshForTask(task.id);
+      this.broadcastTaskStatus(task.id, task.status, "skipped");
+      if ((index + 1) % SCAN_BATCH_SIZE === 0) {
+        await this.yieldToEventLoop();
+      }
+    }
+  }
+  broadcastTaskStatus(taskId, oldStatus, newStatus) {
+    for (const win of electron.BrowserWindow.getAllWindows()) {
+      win.webContents.send(IPC.TASK_STATUS_CHANGE, {
+        taskId,
+        oldStatus,
+        newStatus
+      });
+    }
   }
   registerLegacyCompletedDir(dirPath, folderName, dayFolderId, dateName, processMarker, tmpMarker) {
     const legacyUploadRelativePath = folderName;
@@ -2086,288 +3399,21 @@ class ScannerService {
       win.webContents.send(IPC.SCANNER_EVENT, status);
     }
   }
-  snapshotDir(dirPath) {
-    const snapshot = /* @__PURE__ */ new Map();
-    this.walkForSnapshot(dirPath, dirPath, snapshot);
-    return snapshot;
-  }
-  walkForSnapshot(basePath, currentPath, snapshot) {
+  async pathExists(path2) {
     try {
-      const entries = fs.readdirSync(currentPath, { withFileTypes: true });
-      for (const entry of entries) {
-        const fullPath = path.join(currentPath, entry.name);
-        if (entry.isDirectory()) {
-          if (!entry.name.startsWith(".")) {
-            this.walkForSnapshot(basePath, fullPath, snapshot);
-          }
-        } else if (entry.isFile()) {
-          try {
-            const stat = fs.statSync(fullPath);
-            const relPath = fullPath.slice(basePath.length + 1);
-            snapshot.set(relPath, { size: stat.size, mtimeMs: stat.mtimeMs });
-          } catch {
-          }
-        }
-      }
+      await promises.access(path2);
+      return true;
     } catch {
+      return false;
     }
   }
-  compareSnapshots(prev, curr) {
-    if (prev.size !== curr.size) return false;
-    for (const [key, prevVal] of prev) {
-      const currVal = curr.get(key);
-      if (!currVal) return false;
-      if (prevVal.size !== currVal.size || prevVal.mtimeMs !== currVal.mtimeMs) {
-        return false;
-      }
-    }
-    return true;
-  }
-}
-let instance$9 = null;
-function getScannerService() {
-  if (!instance$9) instance$9 = new ScannerService();
-  return instance$9;
-}
-class CleanupService {
-  timer = null;
-  pendingRun = null;
-  running = false;
-  start() {
-    if (this.timer) return;
-    this.scheduleCleanup(3e4);
-    this.timer = setInterval(() => this.cleanup(), 36e5);
-    log.info("自动清理服务已启动");
-  }
-  stop() {
-    if (this.pendingRun) {
-      clearTimeout(this.pendingRun);
-      this.pendingRun = null;
-    }
-    if (this.timer) {
-      clearInterval(this.timer);
-      this.timer = null;
-    }
-    log.info("自动清理服务已停止");
-  }
-  scheduleCleanup(delayMs = 0) {
-    if (this.pendingRun) {
-      clearTimeout(this.pendingRun);
-    }
-    this.pendingRun = setTimeout(() => {
-      this.pendingRun = null;
-      this.cleanup();
-    }, Math.max(0, delayMs));
-  }
-  cleanup() {
-    if (this.running) return;
-    this.running = true;
-    try {
-      const settings = getSettingsRepo();
-      const config = settings.get("cleanup");
-      if (!config?.enabled) return;
-      const retentionDays = this.normalizeRetentionDays(config);
-      const taskRepo = getTaskRepo();
-      const dayFolderRepo = getDayFolderRepo();
-      const tasks = taskRepo.getCompletedForCleanup(retentionDays);
-      const dayFolders = dayFolderRepo.getCompletedForCleanup(retentionDays);
-      if (tasks.length === 0 && dayFolders.length === 0) return;
-      log.info(
-        `自动清理: 发现 ${dayFolders.length} 个日期目录和 ${tasks.length} 个独立任务可清理 (保留天数: ${retentionDays})`
-      );
-      let cleaned = 0;
-      for (const dayFolder of dayFolders) {
-        try {
-          if (!fs.existsSync(dayFolder.folderPath)) {
-            continue;
-          }
-          fs.rmSync(dayFolder.folderPath, { recursive: true, force: true });
-          cleaned++;
-          log.info(
-            `自动清理: 已删除日期目录 ${dayFolder.folderPath} (日期目录ID: ${dayFolder.id}, 完成于: ${dayFolder.completedAt})`
-          );
-        } catch (err) {
-          log.error(`自动清理日期目录失败: ${dayFolder.folderPath}`, err);
-        }
-      }
-      for (const task of tasks) {
-        try {
-          if (!fs.existsSync(task.folderPath)) {
-            continue;
-          }
-          fs.rmSync(task.folderPath, { recursive: true, force: true });
-          cleaned++;
-          log.info(`自动清理: 已删除 ${task.folderPath} (任务ID: ${task.id}, 完成于: ${task.completedAt})`);
-        } catch (err) {
-          log.error(`自动清理失败: ${task.folderPath}`, err);
-        }
-      }
-      if (cleaned > 0) {
-        log.info(`自动清理完成: 共删除 ${cleaned} 个文件夹`);
-      }
-    } catch (err) {
-      log.error("自动清理服务异常:", err);
-    } finally {
-      this.running = false;
-    }
-  }
-  normalizeRetentionDays(config) {
-    if (!Number.isFinite(config.retentionDays)) {
-      return 7;
-    }
-    return Math.max(0, Math.floor(config.retentionDays));
-  }
-}
-let instance$8 = null;
-function getCleanupService() {
-  if (!instance$8) instance$8 = new CleanupService();
-  return instance$8;
-}
-class TaskQueueService extends events.EventEmitter {
-  runningTasks = /* @__PURE__ */ new Map();
-  processTimer = null;
-  taskRunner = null;
-  setTaskRunner(runner) {
-    this.taskRunner = runner;
-  }
-  start() {
-    this.processTimer = setInterval(() => this.processQueue(), 2e3);
-    this.processQueue();
-    log.info("任务队列已启动");
-  }
-  stop() {
-    if (this.processTimer) {
-      clearInterval(this.processTimer);
-      this.processTimer = null;
-    }
-    log.info("任务队列已停止");
-  }
-  getRunningCount() {
-    return this.runningTasks.size;
-  }
-  isTaskRunning(taskId) {
-    return this.runningTasks.has(taskId);
-  }
-  cancelRunningTask(taskId) {
-    const running = this.runningTasks.get(taskId);
-    if (running) {
-      running.cancel();
-      this.runningTasks.delete(taskId);
-    }
-  }
-  async processQueue() {
-    if (!this.taskRunner) return;
-    const settings = getSettingsRepo();
-    const uploadConfig = settings.get("upload");
-    if (!this.isWithinUploadWindow(uploadConfig?.startAfterTime, uploadConfig?.endBeforeTime)) return;
-    const maxConcurrent = uploadConfig?.maxConcurrentTasks || 5;
-    const taskRepo = getTaskRepo();
-    const availableSlots = maxConcurrent - this.runningTasks.size;
-    if (availableSlots <= 0) return;
-    const pendingTasks = taskRepo.listByStatus("pending");
-    const eligibleTasks = pendingTasks.filter(
-      (task) => this.isTaskEligibleForCurrentStartCycle(task, uploadConfig?.startAfterTime)
-    );
-    const toRun = eligibleTasks.slice(0, availableSlots);
-    for (const task of toRun) {
-      this.executeTask(task);
-    }
-  }
-  async executeTask(task) {
-    const taskRepo = getTaskRepo();
-    const controller = new AbortController();
-    this.runningTasks.set(task.id, { cancel: () => controller.abort() });
-    try {
-      taskRepo.updateStatus(task.id, "uploading");
-      this.emit("task:status-change", {
-        taskId: task.id,
-        oldStatus: task.status,
-        newStatus: "uploading"
-      });
-      await this.taskRunner(task, controller.signal);
-      if (!controller.signal.aborted) {
-        taskRepo.updateStatus(task.id, "completed");
-        getDayFolderService().refreshForTask(task.id);
-        getCleanupService().scheduleCleanup();
-        this.emit("task:status-change", {
-          taskId: task.id,
-          oldStatus: "uploading",
-          newStatus: "completed"
-        });
-        log.info("任务完成:", task.folderPath);
-      }
-    } catch (err) {
-      if (!controller.signal.aborted) {
-        const errMsg = err instanceof Error ? err.message : String(err);
-        taskRepo.updateStatus(task.id, "failed", errMsg);
-        getTaskDestinationRepo().updateIncompleteStatuses(
-          task.id,
-          "failed",
-          errMsg
-        );
-        getDayFolderService().refreshForTask(task.id);
-        this.emit("task:status-change", {
-          taskId: task.id,
-          oldStatus: "uploading",
-          newStatus: "failed"
-        });
-        log.error("任务失败:", task.folderPath, errMsg);
-      }
-    } finally {
-      this.runningTasks.delete(task.id);
-    }
-  }
-  isWithinUploadWindow(startAfterTime, endBeforeTime) {
-    const startMinutes = this.parseMinutes(startAfterTime);
-    const endMinutes = this.parseMinutes(endBeforeTime);
-    const now = /* @__PURE__ */ new Date();
-    const currentMinutes = now.getHours() * 60 + now.getMinutes();
-    if (startMinutes === null && endMinutes === null) return true;
-    if (startMinutes !== null && endMinutes === null) {
-      return currentMinutes >= startMinutes;
-    }
-    if (startMinutes === null && endMinutes !== null) {
-      return currentMinutes <= endMinutes;
-    }
-    if (startMinutes === null || endMinutes === null) return true;
-    if (startMinutes === endMinutes) return true;
-    if (startMinutes < endMinutes) {
-      return currentMinutes >= startMinutes && currentMinutes <= endMinutes;
-    }
-    return currentMinutes >= startMinutes || currentMinutes <= endMinutes;
-  }
-  parseMinutes(time) {
-    if (!time || !time.trim()) return null;
-    const match = time.match(/^(\d{1,2}):(\d{1,2})$/);
-    if (!match) return null;
-    const hour = Number(match[1]);
-    const minute = Number(match[2]);
-    if (Number.isNaN(hour) || Number.isNaN(minute)) return null;
-    if (hour < 0 || hour > 23 || minute < 0 || minute > 59) return null;
-    return hour * 60 + minute;
-  }
-  isTaskEligibleForCurrentStartCycle(task, startAfterTime) {
-    const startMinutes = this.parseMinutes(startAfterTime);
-    if (startMinutes === null) return true;
-    const cycleStart = this.getCurrentStartCycleStart(startMinutes, /* @__PURE__ */ new Date());
-    const createdAtMs = new Date(task.createdAt).getTime();
-    if (Number.isNaN(createdAtMs)) return true;
-    return createdAtMs <= cycleStart.getTime();
-  }
-  getCurrentStartCycleStart(startMinutes, now) {
-    const todayStart = new Date(now);
-    todayStart.setHours(Math.floor(startMinutes / 60), startMinutes % 60, 0, 0);
-    if (now.getTime() >= todayStart.getTime()) {
-      return todayStart;
-    }
-    const previousStart = new Date(todayStart);
-    previousStart.setDate(previousStart.getDate() - 1);
-    return previousStart;
+  async yieldToEventLoop() {
+    await new Promise((resolve) => setTimeout(resolve, 0));
   }
 }
 let instance$7 = null;
-function getTaskQueueService() {
-  if (!instance$7) instance$7 = new TaskQueueService();
+function getScannerService() {
+  if (!instance$7) instance$7 = new ScannerService();
   return instance$7;
 }
 class OSSUploadService {
@@ -3100,13 +4146,21 @@ function registerAllIpc() {
   electron.ipcMain.handle(IPC.TASK_GET, (_event, args) => {
     return getTaskRepo().getById(args.taskId);
   });
+  electron.ipcMain.handle(IPC.TASK_DETAIL, (_event, args) => {
+    const task = getTaskRepo().getById(args.taskId);
+    if (!task) throw new Error("任务不存在");
+    return {
+      task,
+      files: getTaskRepo().listFileDetails(args.taskId)
+    };
+  });
   electron.ipcMain.handle(IPC.TASK_ADD_FOLDER, (_event, args) => {
     const taskRepo = getTaskRepo();
     const settingsRepo = getSettingsRepo();
     const snapshot = getUploadTargetSnapshot(settingsRepo.getAll());
     const folderName = path.basename(args.folderPath);
     const uploadRelativePath = resolveDirectoryUploadRelativePath(args.folderPath);
-    return taskRepo.create({
+    const task = taskRepo.create({
       folderPath: args.folderPath,
       folderName,
       ossPrefix: snapshot.prefixes.aliyun,
@@ -3115,6 +4169,8 @@ function registerAllIpc() {
       uploadRelativePath,
       sourceType: "manual"
     });
+    getScannerService().queueReconcileTask(task);
+    return getTaskRepo().getById(task.id);
   });
   electron.ipcMain.handle(IPC.TASK_PAUSE, (_event, args) => {
     getTaskQueueService().cancelRunningTask(args.taskId);
@@ -3130,10 +4186,25 @@ function registerAllIpc() {
   });
   electron.ipcMain.handle(IPC.TASK_CANCEL, (_event, args) => {
     getTaskQueueService().cancelRunningTask(args.taskId);
-    getTaskRepo().updateStatus(args.taskId, "failed", "用户取消");
-    getTaskDestinationRepo().updateIncompleteStatuses(args.taskId, "failed", "用户取消");
+    getTaskRepo().skip(args.taskId, "用户跳过");
     getDayFolderService().refreshForTask(args.taskId);
-    broadcastStatusChange(args.taskId, "failed");
+    broadcastStatusChange(args.taskId, "skipped");
+  });
+  electron.ipcMain.handle(IPC.TASK_SKIP, (_event, args) => {
+    getTaskQueueService().cancelRunningTask(args.taskId);
+    getTaskRepo().skip(args.taskId, "用户跳过");
+    getDayFolderService().refreshForTask(args.taskId);
+    broadcastStatusChange(args.taskId, "skipped");
+  });
+  electron.ipcMain.handle(IPC.TASK_RESTORE, (_event, args) => {
+    const task = getTaskRepo().getById(args.taskId);
+    if (!task) throw new Error("任务不存在");
+    if (!fs.existsSync(task.folderPath)) throw new Error("源目录不存在，无法恢复");
+    getTaskRepo().restore(args.taskId);
+    const restored = getTaskRepo().getById(args.taskId);
+    if (restored) getScannerService().queueReconcileTask(restored);
+    getDayFolderService().refreshForTask(args.taskId);
+    broadcastStatusChange(args.taskId, "scanning");
   });
   electron.ipcMain.handle(IPC.TASK_RETRY, (_event, args) => {
     getTaskRepo().retry(args.taskId, args.provider);
@@ -3158,6 +4229,29 @@ function registerAllIpc() {
   electron.ipcMain.handle(IPC.DAY_FOLDER_DELETE, (_event, args) => {
     getDayFolderRepo().deleteCompleted(args.id);
   });
+  electron.ipcMain.handle(IPC.DAY_FOLDER_IGNORE, (_event, args) => {
+    const repo = getDayFolderRepo();
+    repo.setIgnored(args.id, true);
+    for (const task of repo.getChildTasks(args.id)) {
+      if (task.status === "completed" || task.status === "synced") continue;
+      getTaskQueueService().cancelRunningTask(task.id);
+      getTaskRepo().skip(task.id, "用户忽略整个日期");
+      broadcastStatusChange(task.id, "skipped");
+    }
+    return getDayFolderService().refresh(args.id);
+  });
+  electron.ipcMain.handle(IPC.DAY_FOLDER_RESTORE, (_event, args) => {
+    const repo = getDayFolderRepo();
+    repo.setIgnored(args.id, false);
+    for (const task of repo.getChildTasks(args.id)) {
+      if (task.status !== "skipped" || !fs.existsSync(task.folderPath)) continue;
+      getTaskRepo().restore(task.id);
+      const restored = getTaskRepo().getById(task.id);
+      if (restored) getScannerService().queueReconcileTask(restored);
+      broadcastStatusChange(task.id, "scanning");
+    }
+    return getDayFolderService().refresh(args.id);
+  });
   electron.ipcMain.handle(IPC.SETTINGS_GET_ALL, () => {
     return getSettingsRepo().getAll();
   });
@@ -3165,6 +4259,10 @@ function registerAllIpc() {
     getSettingsRepo().saveAll(data);
     if (data.cleanup !== void 0) {
       getCleanupService().scheduleCleanup();
+    }
+    if (data.scan !== void 0 || data.stability !== void 0) {
+      getScannerService().stop();
+      getScannerService().start();
     }
     return { ok: true };
   });
@@ -3234,7 +4332,7 @@ function registerAllIpc() {
       );
       const existing = taskRepo.getByFolderPath(localDir);
       if (!existing || existing.status === "completed" || existing.status === "failed") {
-        taskRepo.create({
+        const task = taskRepo.create({
           folderPath: localDir,
           folderName: path.basename(localDir),
           ossPrefix: snapshot.prefixes.aliyun,
@@ -3244,6 +4342,7 @@ function registerAllIpc() {
           sourceType: "rsync",
           sourceMachineId: machine.id
         });
+        getScannerService().queueReconcileTask(task);
         log.info("rsync 完成, 自动创建上传任务:", localDir);
       } else if (existing.uploadRelativePath !== uploadRelativePath) {
         taskRepo.updateUploadRelativePath(existing.id, uploadRelativePath);
@@ -3364,211 +4463,6 @@ function registerAllIpc() {
     }
     return results;
   });
-  electron.ipcMain.handle(IPC.ANNOTATION_OPEN_WINDOW, () => {
-    createAnnotationWindow();
-  });
-  electron.ipcMain.handle(IPC.ANNOTATION_SELECT_IMAGE, async (event) => {
-    const win = electron.BrowserWindow.fromWebContents(event.sender);
-    if (!win) return null;
-    const result = await electron.dialog.showOpenDialog(win, {
-      filters: [{ name: "Images", extensions: ["png", "jpg", "jpeg", "bmp", "tiff", "tif"] }],
-      properties: ["openFile"]
-    });
-    if (result.canceled || result.filePaths.length === 0) return null;
-    return result.filePaths[0];
-  });
-  electron.ipcMain.handle(IPC.ANNOTATION_READ_IMAGE, (_event, args) => {
-    const { filePath } = args;
-    const ext = path.extname(filePath).toLowerCase().replace(".", "");
-    const mimeMap = {
-      png: "image/png",
-      jpg: "image/jpeg",
-      jpeg: "image/jpeg",
-      bmp: "image/bmp",
-      tiff: "image/tiff",
-      tif: "image/tiff"
-    };
-    const mime = mimeMap[ext] || "image/png";
-    const buf = fs.readFileSync(filePath);
-    const dataUrl = `data:${mime};base64,${buf.toString("base64")}`;
-    const img = electron.nativeImage.createFromPath(filePath);
-    const size = img.getSize();
-    return { dataUrl, width: size.width, height: size.height };
-  });
-  electron.ipcMain.handle(IPC.ANNOTATION_SAVE_EXPORT, async (event, args) => {
-    const win = electron.BrowserWindow.fromWebContents(event.sender);
-    if (!win) return null;
-    const result = await electron.dialog.showSaveDialog(win, {
-      defaultPath: `${args.defaultBaseName}.png`,
-      filters: [{ name: "PNG", extensions: ["png"] }]
-    });
-    if (result.canceled || !result.filePath) return null;
-    const base64Data = args.dataUrl.replace(/^data:image\/\w+;base64,/, "");
-    const pngPath = result.filePath;
-    fs.writeFileSync(pngPath, Buffer.from(base64Data, "base64"));
-    const parsed = path.parse(pngPath);
-    const jsonPath = path.format({ dir: parsed.dir, name: parsed.name, ext: ".json" });
-    fs.writeFileSync(jsonPath, args.jsonString, "utf-8");
-    log.info("[Annotation] Exported PNG:", pngPath);
-    log.info("[Annotation] Exported JSON:", jsonPath);
-    return { pngPath, jsonPath };
-  });
-  electron.ipcMain.handle(IPC.ANNOTATION_UPLOAD_OSS, async (_event, args) => {
-    const taskRepo = getTaskRepo();
-    const settings = getSettingsRepo().getAll();
-    const task = taskRepo.findTaskContainingFile(args.imagePath);
-    const pngBuffer = fs.readFileSync(args.pngPath);
-    const jsonBuffer = fs.readFileSync(args.jsonPath);
-    const results = [];
-    for (const provider of providersForMode(settings.cloud.targetMode)) {
-      const validationError = getCloudUploadService().validateProvider(provider, settings);
-      if (validationError) {
-        results.push({ provider, ok: false, error: validationError });
-        continue;
-      }
-      const taskDestination = task?.destinations.find(
-        (destination) => destination.provider === provider
-      );
-      const configPrefix = provider === "aliyun" ? settings.oss.prefix : settings.tencentS3.prefix;
-      const prefix = taskDestination?.prefix || configPrefix || "";
-      let basePath;
-      if (task) {
-        const relPath = path.relative(task.folderPath, args.imagePath).replace(/\\/g, "/");
-        const relParsed = path.parse(relPath);
-        const relBase = path.format({
-          dir: relParsed.dir,
-          name: relParsed.name,
-          ext: ""
-        });
-        basePath = [
-          prefix,
-          task.uploadRelativePath || task.folderName,
-          relBase
-        ].filter(Boolean).join("/").replace(/\/+/g, "/");
-      } else {
-        const image = path.parse(args.imagePath);
-        basePath = [prefix, image.name].filter(Boolean).join("/").replace(/\/+/g, "/");
-      }
-      const pngKey = `${basePath}_annotation.png`;
-      const jsonKey = `${basePath}_annotation.json`;
-      let uploader = null;
-      try {
-        uploader = await getCloudUploadService().createTaskUploader(
-          provider,
-          settings,
-          settings.upload.multipartThreshold
-        );
-        await Promise.all([
-          uploader.uploadBuffer(pngBuffer, pngKey),
-          uploader.uploadBuffer(jsonBuffer, jsonKey)
-        ]);
-        results.push({ provider, ok: true, keys: [pngKey, jsonKey] });
-      } catch (err) {
-        log.error(`[Annotation] ${provider} upload failed:`, err);
-        results.push({
-          provider,
-          ok: false,
-          error: err instanceof Error ? err.message : String(err)
-        });
-      } finally {
-        uploader?.dispose();
-      }
-    }
-    return {
-      ok: results.every((result) => result.ok),
-      results
-    };
-  });
-}
-class FileFilterService {
-  rules;
-  constructor(rules) {
-    this.rules = rules;
-  }
-  updateRules(rules) {
-    this.rules = rules;
-  }
-  /**
-   * 判断单个文件是否应该被包含
-   * @param relativePath 文件相对路径
-   * @returns true = 包含, false = 排除
-   */
-  shouldInclude(relativePath) {
-    const fileName = path.basename(relativePath);
-    const ext = path.extname(relativePath).toLowerCase();
-    if (this.rules.whitelist.length > 0) {
-      for (const pattern of this.rules.whitelist) {
-        if (this.matchPattern(fileName, relativePath, pattern)) {
-          return true;
-        }
-      }
-    }
-    if (this.rules.blacklist.length > 0) {
-      for (const pattern of this.rules.blacklist) {
-        if (this.matchPattern(fileName, relativePath, pattern)) {
-          return false;
-        }
-      }
-    }
-    if (this.rules.regex.length > 0) {
-      for (const pattern of this.rules.regex) {
-        try {
-          const re = new RegExp(pattern);
-          if (re.test(relativePath) || re.test(fileName)) {
-            return false;
-          }
-        } catch {
-        }
-      }
-    }
-    if (this.rules.suffixes.length > 0) {
-      return this.rules.suffixes.some((suffix) => ext === this.normalizeSuffix(suffix));
-    }
-    return true;
-  }
-  /**
-   * 递归扫描文件夹，返回过滤后的文件列表
-   */
-  scanFolder(folderPath) {
-    const results = [];
-    this.walkDir(folderPath, folderPath, results);
-    return results;
-  }
-  walkDir(basePath, currentPath, results) {
-    const entries = fs.readdirSync(currentPath, { withFileTypes: true });
-    for (const entry of entries) {
-      const fullPath = path.join(currentPath, entry.name);
-      if (entry.isDirectory()) {
-        if (entry.name.startsWith(".")) continue;
-        this.walkDir(basePath, fullPath, results);
-      } else if (entry.isFile()) {
-        const relativePath = fullPath.slice(basePath.length + 1);
-        if (entry.name === "tmp_upload.json" || entry.name === "process_task.json" || entry.name === "day_upload.json") continue;
-        if (this.shouldInclude(relativePath)) {
-          const stat = fs.statSync(fullPath);
-          results.push({ relativePath, absolutePath: fullPath, size: stat.size });
-        }
-      }
-    }
-  }
-  matchPattern(fileName, relativePath, pattern) {
-    if (fileName === pattern) return true;
-    if (pattern.startsWith(".") && path.extname(fileName).toLowerCase() === pattern.toLowerCase()) return true;
-    if (pattern.includes("*")) {
-      const regexStr = "^" + pattern.replace(/\./g, "\\.").replace(/\*/g, ".*") + "$";
-      try {
-        const re = new RegExp(regexStr, "i");
-        if (re.test(fileName) || re.test(relativePath)) return true;
-      } catch {
-      }
-    }
-    return false;
-  }
-  normalizeSuffix(suffix) {
-    const trimmed = suffix.trim().toLowerCase();
-    if (!trimmed) return "";
-    return trimmed.startsWith(".") ? trimmed : `.${trimmed}`;
-  }
 }
 class SpeedCalculator {
   samples = [];
@@ -3576,9 +4470,9 @@ class SpeedCalculator {
   constructor(windowMs = 5e3) {
     this.windowMs = windowMs;
   }
-  addSample(bytes) {
+  addSample(totalBytes) {
     const now = Date.now();
-    this.samples.push({ time: now, bytes });
+    this.samples.push({ time: now, bytes: totalBytes });
     const cutoff = now - this.windowMs;
     this.samples = this.samples.filter((s) => s.time >= cutoff);
   }
@@ -3592,8 +4486,7 @@ class SpeedCalculator {
     const last = recent[recent.length - 1];
     const timeDiff = (last.time - first.time) / 1e3;
     if (timeDiff <= 0) return 0;
-    const totalBytes = recent.reduce((sum, s) => sum + s.bytes, 0) - first.bytes;
-    return Math.max(0, totalBytes / timeDiff);
+    return Math.max(0, (last.bytes - first.bytes) / timeDiff);
   }
   reset() {
     this.samples = [];
@@ -3666,524 +4559,469 @@ function getUploadSemaphore(max) {
   }
   return instance$2;
 }
+const RETRY_DELAYS_MS = [1e3, 2e3, 5e3, 15e3, 3e4];
 class TaskRunnerService {
-  maxUploadRetries = 2;
   async run(task, signal) {
     const taskRepo = getTaskRepo();
     const destinationRepo = getTaskDestinationRepo();
     const settings = getSettingsRepo().getAll();
-    const uploadConfig = settings.upload;
-    const filter = new FileFilterService(settings.filter);
-    const semaphore = getUploadSemaphore(uploadConfig.maxConcurrentUploads || 30);
+    const stableChecks = task.sourceType === "local" && task.dayFolderId ? Math.max(2, settings.stability.checkCount || 2) : 1;
+    if (!fs.existsSync(task.folderPath)) {
+      destinationRepo.updateIncompleteStatuses(
+        task.id,
+        "skipped",
+        "源目录已删除"
+      );
+      return "skipped";
+    }
     const dateScopedUploadPath = deriveDateScopedUploadRelativePath(task.folderPath);
-    if (dateScopedUploadPath && task.status !== "completed" && task.uploadRelativePath !== dateScopedUploadPath) {
+    if (dateScopedUploadPath && task.uploadRelativePath !== dateScopedUploadPath && task.status !== "completed") {
       taskRepo.updateUploadRelativePath(task.id, dateScopedUploadPath);
       task.uploadRelativePath = dateScopedUploadPath;
     }
+    await this.reconcileBeforeUpload(task, stableChecks);
     const destinations = destinationRepo.listByTask(task.id);
     if (destinations.length === 0) {
       throw new Error("任务没有配置任何上传目标");
     }
-    const activeDestinations = destinations.filter(
-      (destination) => destination.status === "pending"
+    const jobs = destinationRepo.listReadyFileTargets(
+      task.id,
+      stableChecks
     );
-    if (activeDestinations.length === 0) {
-      const failed = destinations.filter(
-        (destination) => destination.status === "failed"
-      );
-      if (failed.length > 0) {
-        throw new Error(
-          `仍有未重试的失败云端: ${failed.map((destination) => destination.provider).join(", ")}`
-        );
-      }
-      return;
+    if (jobs.length === 0) {
+      taskRepo.recalculateProgress(task.id);
+      return this.updateDestinationFinalStates(task);
     }
-    const runtimes = /* @__PURE__ */ new Map();
-    for (const destination of activeDestinations) {
-      const validationError = getCloudUploadService().validateProvider(
+    const jobProviders = new Set(jobs.map((job) => job.provider));
+    for (const destination of destinations) {
+      if (!jobProviders.has(destination.provider)) continue;
+      const error = getCloudUploadService().validateProvider(
         destination.provider,
         settings
       );
-      if (validationError) throw new Error(validationError);
+      if (error) throw new Error(error);
     }
+    const completedLogicalFiles = taskRepo.listFiles(task.id, "completed");
+    const logicalProgress = {
+      completed: new Set(completedLogicalFiles.map((file) => file.id)),
+      uploadedBytes: completedLogicalFiles.reduce(
+        (sum, file) => sum + file.fileSize,
+        0
+      )
+    };
+    const providers = Array.from(new Set(jobs.map((job) => job.provider)));
+    const runtimes = /* @__PURE__ */ new Map();
     try {
-      for (const destination of activeDestinations) {
+      for (const provider of providers) {
+        const destination = destinations.find((item) => item.provider === provider);
+        if (!destination) continue;
         const uploader = await getCloudUploadService().createTaskUploader(
-          destination.provider,
+          provider,
           settings,
-          uploadConfig.multipartThreshold
+          settings.upload.multipartThreshold
         );
-        runtimes.set(destination.provider, {
+        const providerTargets = destinationRepo.listFileTargets(task.id, provider);
+        runtimes.set(provider, {
           uploader,
           speed: new SpeedCalculator(),
-          uploadedFiles: 0,
-          uploadedBytes: 0,
-          totalFiles: 0,
-          totalBytes: 0
+          uploadedFiles: providerTargets.filter(
+            (target) => target.status === "completed"
+          ).length,
+          uploadedBytes: providerTargets.filter((target) => target.status === "completed").reduce((sum, target) => sum + target.fileSize, 0),
+          totalFiles: providerTargets.length,
+          totalBytes: providerTargets.reduce(
+            (sum, target) => sum + target.fileSize,
+            0
+          ),
+          queuedFiles: providerTargets.filter(
+            (target) => target.status === "pending"
+          ).length,
+          failedFiles: providerTargets.filter(
+            (target) => target.status === "failed"
+          ).length,
+          skippedFiles: providerTargets.filter(
+            (target) => target.status === "skipped"
+          ).length,
+          activeUploads: /* @__PURE__ */ new Map(),
+          transferredBytes: 0,
+          lastBroadcastAt: 0
         });
+        destinationRepo.updateStatus(task.id, provider, "uploading");
+        this.broadcastDestinationStatus(task.id, provider, "uploading");
       }
-    } catch (err) {
+    } catch (error) {
       for (const runtime of runtimes.values()) runtime.uploader.dispose();
-      throw err;
+      throw error;
     }
     const abortUploaders = () => {
       for (const runtime of runtimes.values()) runtime.uploader.abort();
     };
     signal?.addEventListener("abort", abortUploaders, { once: true });
+    const marker = this.createCompactMarker(
+      { ...task, status: "uploading" },
+      destinations
+    );
+    this.writeMarker(task.folderPath, marker);
+    const markerTimer = setInterval(() => {
+      const currentTask2 = taskRepo.getById(task.id);
+      if (!currentTask2) return;
+      this.writeMarker(
+        task.folderPath,
+        this.createCompactMarker(
+          currentTask2,
+          destinationRepo.listByTask(task.id)
+        )
+      );
+    }, 2e3);
+    const semaphore = getUploadSemaphore(
+      settings.upload.maxConcurrentUploads || 24
+    );
+    let nextIndex = 0;
+    const workerCount = Math.max(
+      1,
+      Math.min(settings.upload.maxFilesPerTask || 12, jobs.length)
+    );
+    const runNext = async () => {
+      while (nextIndex < jobs.length && !signal?.aborted) {
+        const target = jobs[nextIndex++];
+        await this.uploadTarget(
+          task,
+          target,
+          destinations,
+          runtimes,
+          semaphore,
+          logicalProgress,
+          signal
+        );
+      }
+    };
     try {
-      if (signal?.aborted) throw new DOMException("Upload cancelled", "AbortError");
-      taskRepo.updateStatus(task.id, "scanning");
-      for (const destination of activeDestinations) {
-        destinationRepo.updateStatus(task.id, destination.provider, "scanning");
-        this.broadcastDestinationStatus(task.id, destination.provider, "scanning");
-      }
-      const files = filter.scanFolder(task.folderPath);
-      const totalBytes = files.reduce((sum, file) => sum + file.size, 0);
-      log.info(
-        `任务 ${task.id}: 扫描到 ${files.length} 个文件, 目标 ${destinations.map((item) => item.provider).join(",")}`
-      );
-      taskRepo.setTotals(task.id, files.length, totalBytes);
-      this.registerFiles(task, files);
-      destinationRepo.ensureForTaskFiles(task.id);
-      for (const destination of destinations) {
-        destinationRepo.setTotals(
-          task.id,
-          destination.provider,
-          files.length,
-          totalBytes
-        );
-      }
-      if (files.length === 0) {
-        this.completeEmptyTask(task, destinations.map((item) => item.provider));
-        return;
-      }
-      const allTargets = destinationRepo.listFileTargets(task.id);
-      const filesById = new Map(
-        taskRepo.listFiles(task.id).map((file) => [file.id, file])
-      );
-      const logicalCompleted = new Set(
-        taskRepo.listFiles(task.id, "completed").map((file) => file.id)
-      );
-      let logicalUploadedBytes = Array.from(logicalCompleted).reduce(
-        (sum, id) => sum + (filesById.get(id)?.fileSize || 0),
-        0
-      );
-      const processMarker = this.createProcessMarker(task, files, allTargets);
-      writeProcessTask(task.folderPath, processMarker);
-      const targetsByProvider = this.groupTargets(allTargets);
-      for (const destination of destinations) {
-        const providerTargets = targetsByProvider.get(destination.provider) || [];
-        const completed = providerTargets.filter(
-          (target) => target.status === "completed"
-        );
-        const runtime = runtimes.get(destination.provider);
-        if (runtime) {
-          runtime.totalFiles = files.length;
-          runtime.totalBytes = totalBytes;
-          runtime.uploadedFiles = completed.length;
-          runtime.uploadedBytes = completed.reduce(
-            (sum, target) => sum + target.fileSize,
-            0
-          );
-          destinationRepo.updateStatus(task.id, destination.provider, "uploading");
-          this.broadcastDestinationStatus(task.id, destination.provider, "uploading");
-          destinationRepo.updateProgress(
-            task.id,
-            destination.provider,
-            runtime.uploadedFiles,
-            runtime.uploadedBytes
-          );
-          this.broadcastProgress(
-            task.id,
-            destination.provider,
-            runtime,
-            null
-          );
-        }
-      }
-      taskRepo.updateStatus(task.id, "uploading");
-      taskRepo.updateProgress(
-        task.id,
-        logicalCompleted.size,
-        logicalUploadedBytes
-      );
-      const activeProviders = new Set(
-        activeDestinations.map((destination) => destination.provider)
-      );
-      const jobs = allTargets.filter(
-        (target) => activeProviders.has(target.provider) && target.status !== "completed"
-      );
-      let index = 0;
-      let completedRequests = allTargets.filter(
-        (target) => target.status === "completed"
-      ).length;
-      const workerCount = Math.max(
-        1,
-        Math.min(uploadConfig.maxFilesPerTask || 6, jobs.length || 1)
-      );
-      const runNext = async () => {
-        while (index < jobs.length && !signal?.aborted) {
-          const target = jobs[index++];
-          const runtime = runtimes.get(target.provider);
-          const destination = destinations.find(
-            (item) => item.provider === target.provider
-          );
-          if (!runtime || !destination) continue;
-          const objectKey = buildOssKey(
-            destination.prefix,
-            task.uploadRelativePath || task.folderName,
-            target.relativePath
-          );
-          const localPath = path.join(task.folderPath, target.relativePath);
-          let acquired = false;
-          try {
-            await semaphore.acquire(signal);
-            acquired = true;
-            destinationRepo.updateFileStatus(target.id, "uploading");
-            target.status = "uploading";
-            this.setMarkerFileStatus(
-              processMarker,
-              target.provider,
-              target.relativePath,
-              "uploading"
-            );
-            this.broadcastProgress(
-              task.id,
-              target.provider,
-              runtime,
-              target.relativePath
-            );
-            const uploadResult = await this.uploadWithRetry(
-              runtime.uploader,
-              localPath,
-              objectKey,
-              target.fileSize,
-              (fraction) => {
-                runtime.speed.addSample(Math.round(target.fileSize * fraction));
-                this.broadcastProgress(
-                  task.id,
-                  target.provider,
-                  runtime,
-                  target.relativePath
-                );
-              },
-              signal,
-              task.id,
-              target.relativePath,
-              target.provider
-            );
-            destinationRepo.updateFileStatus(
-              target.id,
-              "completed",
-              uploadResult.objectKey,
-              uploadResult.uploadId
-            );
-            target.status = "completed";
-            this.setMarkerFileStatus(
-              processMarker,
-              target.provider,
-              target.relativePath,
-              "completed"
-            );
-            runtime.uploadedFiles++;
-            runtime.uploadedBytes += target.fileSize;
-            completedRequests++;
-            destinationRepo.updateProgress(
-              task.id,
-              target.provider,
-              runtime.uploadedFiles,
-              runtime.uploadedBytes
-            );
-            const logicalStatus = destinationRepo.recalculateLogicalFile(
-              target.taskFileId
-            );
-            if (logicalStatus === "completed" && !logicalCompleted.has(target.taskFileId)) {
-              logicalCompleted.add(target.taskFileId);
-              logicalUploadedBytes += target.fileSize;
-              taskRepo.updateProgress(
-                task.id,
-                logicalCompleted.size,
-                logicalUploadedBytes
-              );
-            }
-            this.updateMarkerAggregate(
-              processMarker,
-              logicalCompleted.size,
-              allTargets
-            );
-            if (completedRequests % 10 === 0 || completedRequests === allTargets.length) {
-              writeProcessTask(task.folderPath, processMarker);
-            }
-            this.broadcastProgress(
-              task.id,
-              target.provider,
-              runtime,
-              null
-            );
-          } catch (err) {
-            if (err instanceof DOMException && err.name === "AbortError") {
-              destinationRepo.updateFileStatus(target.id, "pending");
-              target.status = "pending";
-              this.setMarkerFileStatus(
-                processMarker,
-                target.provider,
-                target.relativePath,
-                "pending"
-              );
-              break;
-            }
-            const message = err instanceof Error ? err.message : String(err);
-            destinationRepo.updateFileStatus(
-              target.id,
-              "failed",
-              void 0,
-              void 0,
-              message
-            );
-            target.status = "failed";
-            destinationRepo.recalculateLogicalFile(target.taskFileId);
-            this.setMarkerFileStatus(
-              processMarker,
-              target.provider,
-              target.relativePath,
-              "failed"
-            );
-            log.error(
-              `上传失败 [${target.provider}] ${target.relativePath}:`,
-              message
-            );
-          } finally {
-            if (acquired) semaphore.release();
-          }
-        }
-      };
       await Promise.all(
         Array.from({ length: workerCount }, () => runNext())
       );
-      if (signal?.aborted) {
-        processMarker.status = "paused";
-        processMarker.lastUpdated = (/* @__PURE__ */ new Date()).toISOString();
-        for (const destination of activeDestinations) {
-          destinationRepo.updateStatus(task.id, destination.provider, "paused");
-          this.broadcastDestinationStatus(task.id, destination.provider, "paused");
-          const marker = processMarker.destinations?.[destination.provider];
-          if (marker) marker.status = "paused";
-        }
-        writeProcessTask(task.folderPath, processMarker);
-        return;
-      }
-      this.updateMarkerAggregate(
-        processMarker,
-        logicalCompleted.size,
-        allTargets
-      );
-      const failures = [];
-      for (const destination of destinations) {
-        if (destination.status === "completed") continue;
-        const providerTargets = destinationRepo.listFileTargets(
-          task.id,
-          destination.provider
-        );
-        const failed = providerTargets.filter(
-          (target) => target.status === "failed"
-        );
-        const runtime = runtimes.get(destination.provider);
-        const marker = processMarker.destinations?.[destination.provider];
-        if (failed.length > 0) {
-          const summary = `${failed.length} 个文件上传失败，例如 ${failed.slice(0, 3).map(
-            (target) => `${target.relativePath}: ${target.errorMessage || "unknown error"}`
-          ).join(" | ")}`;
-          destinationRepo.updateStatus(
-            task.id,
-            destination.provider,
-            "failed",
-            summary
-          );
-          this.broadcastDestinationStatus(
-            task.id,
-            destination.provider,
-            "failed",
-            summary
-          );
-          if (marker) {
-            marker.status = "failed";
-            marker.error = summary;
-          }
-          failures.push(`${destination.provider}: ${summary}`);
-        } else {
-          destinationRepo.updateStatus(
-            task.id,
-            destination.provider,
-            "completed"
-          );
-          this.broadcastDestinationStatus(
-            task.id,
-            destination.provider,
-            "completed"
-          );
-          if (runtime) {
-            destinationRepo.updateProgress(
-              task.id,
-              destination.provider,
-              runtime.totalFiles,
-              runtime.totalBytes
-            );
-          }
-          if (marker) {
-            marker.status = "completed";
-            marker.uploadedFiles = marker.totalFiles;
-            marker.error = null;
-          }
-        }
-      }
-      processMarker.lastUpdated = (/* @__PURE__ */ new Date()).toISOString();
-      if (failures.length > 0) {
-        processMarker.status = "failed";
-        processMarker.error = failures.join(" || ");
-        writeProcessTask(task.folderPath, processMarker);
-        throw new Error(processMarker.error);
-      }
-      processMarker.status = "completed";
-      processMarker.uploadedFiles = files.length;
-      processMarker.error = null;
-      writeProcessTask(task.folderPath, processMarker);
     } finally {
+      clearInterval(markerTimer);
       signal?.removeEventListener("abort", abortUploaders);
       for (const runtime of runtimes.values()) runtime.uploader.dispose();
     }
-  }
-  registerFiles(task, files) {
-    const taskRepo = getTaskRepo();
-    const existingPaths = new Set(
-      taskRepo.listFiles(task.id).map((file) => file.relativePath)
-    );
-    const newFiles = files.filter(
-      (file) => !existingPaths.has(file.relativePath)
-    );
-    if (newFiles.length > 0) {
-      taskRepo.bulkCreateFiles(
-        task.id,
-        newFiles.map((file) => ({
-          relativePath: file.relativePath,
-          fileSize: file.size
-        }))
-      );
+    if (signal?.aborted) {
+      return getTaskRepo().getById(task.id)?.status || "paused";
     }
+    taskRepo.recalculateProgress(task.id);
+    const finalStatus = this.updateDestinationFinalStates(task);
+    const currentTask = taskRepo.getById(task.id) || task;
+    const finalTask = { ...currentTask, status: finalStatus };
+    this.writeMarker(
+      task.folderPath,
+      this.createCompactMarker(finalTask, destinationRepo.listByTask(task.id))
+    );
+    return finalStatus;
   }
-  completeEmptyTask(task, providers) {
+  async reconcileBeforeUpload(task, stableChecks) {
+    const settings = getSettingsRepo().getAll();
+    const files = await new FileFilterService(settings.filter).scanFolderAsync(
+      task.folderPath
+    );
+    getTaskRepo().reconcileFiles(
+      task.id,
+      files.map((file) => ({
+        relativePath: file.relativePath,
+        size: file.size,
+        mtimeMs: file.mtimeMs
+      })),
+      stableChecks
+    );
+  }
+  async uploadTarget(task, target, destinations, runtimes, semaphore, logicalProgress, signal) {
     const taskRepo = getTaskRepo();
     const destinationRepo = getTaskDestinationRepo();
-    taskRepo.updateProgress(task.id, 0, 0);
-    for (const provider of providers) {
-      destinationRepo.setTotals(task.id, provider, 0, 0);
-      destinationRepo.updateProgress(task.id, provider, 0, 0);
-      destinationRepo.updateStatus(task.id, provider, "completed");
+    const runtime = runtimes.get(target.provider);
+    const destination = destinations.find(
+      (item) => item.provider === target.provider
+    );
+    if (!runtime || !destination) return;
+    const localPath = path.join(task.folderPath, target.relativePath);
+    if (!fs.existsSync(localPath)) {
+      destinationRepo.updateFileStatus(
+        target.id,
+        "skipped",
+        void 0,
+        void 0,
+        "源文件已删除"
+      );
+      destinationRepo.recalculateLogicalFile(target.taskFileId);
+      runtime.skippedFiles++;
+      runtime.queuedFiles = Math.max(0, runtime.queuedFiles - 1);
+      this.broadcastProgress(task.id, target.provider, runtime, null, true);
+      return;
     }
-    writeProcessTask(task.folderPath, {
-      version: 2,
+    let acquired = false;
+    try {
+      await semaphore.acquire(signal);
+      acquired = true;
+      if (signal?.aborted) throw new DOMException("Upload aborted", "AbortError");
+      const before = fs.statSync(localPath);
+      if (before.size !== target.fileSize || before.mtimeMs !== target.mtimeMs) {
+        taskRepo.markFileChanged(
+          target.taskFileId,
+          before.size,
+          before.mtimeMs
+        );
+        log.info("文件在进入上传前发生变化，等待重新稳定:", localPath);
+        return;
+      }
+      destinationRepo.updateFileStatus(target.id, "uploading");
+      runtime.activeUploads.set(target.id, 0);
+      runtime.queuedFiles = Math.max(0, runtime.queuedFiles - 1);
+      this.broadcastProgress(
+        task.id,
+        target.provider,
+        runtime,
+        target.relativePath,
+        true
+      );
+      const objectKey = buildOssKey(
+        destination.prefix,
+        task.uploadRelativePath || task.folderName,
+        target.relativePath
+      );
+      let previousLoaded = 0;
+      const result = await runtime.uploader.uploadFile(
+        localPath,
+        objectKey,
+        target.fileSize,
+        (fraction) => {
+          const loaded = Math.min(
+            target.fileSize,
+            Math.max(0, Math.round(target.fileSize * fraction))
+          );
+          const delta = Math.max(0, loaded - previousLoaded);
+          previousLoaded = loaded;
+          runtime.transferredBytes += delta;
+          runtime.activeUploads.set(target.id, loaded);
+          runtime.speed.addSample(runtime.transferredBytes);
+          this.broadcastProgress(
+            task.id,
+            target.provider,
+            runtime,
+            target.relativePath
+          );
+        },
+        signal
+      );
+      if (fs.existsSync(localPath)) {
+        const after = fs.statSync(localPath);
+        if (after.size !== before.size || after.mtimeMs !== before.mtimeMs) {
+          taskRepo.markFileChanged(target.taskFileId, after.size, after.mtimeMs);
+          log.info("文件上传期间发生变化，重新排队:", localPath);
+          return;
+        }
+      }
+      destinationRepo.updateFileStatus(
+        target.id,
+        "completed",
+        result.objectKey,
+        result.uploadId
+      );
+      const logicalStatus = destinationRepo.recalculateLogicalFile(
+        target.taskFileId
+      );
+      if (logicalStatus === "completed") {
+        taskRepo.clearRetry(target.taskFileId);
+        if (!logicalProgress.completed.has(target.taskFileId)) {
+          logicalProgress.completed.add(target.taskFileId);
+          logicalProgress.uploadedBytes += target.fileSize;
+          taskRepo.updateProgress(
+            task.id,
+            logicalProgress.completed.size,
+            logicalProgress.uploadedBytes
+          );
+        }
+      }
+      runtime.uploadedFiles++;
+      runtime.uploadedBytes += target.fileSize;
+    } catch (error) {
+      if (error instanceof DOMException && error.name === "AbortError") {
+        if (taskRepo.getById(task.id)?.status !== "skipped") {
+          destinationRepo.updateFileStatus(target.id, "pending");
+        }
+        return;
+      }
+      const message = error instanceof Error ? error.message : String(error);
+      if (this.isRetriableUploadError(error) && target.retryCount < RETRY_DELAYS_MS.length) {
+        const delay = this.retryDelay(target.retryCount);
+        const nextRetryAt = new Date(Date.now() + delay).toISOString();
+        const retryCount = taskRepo.scheduleRetry(
+          target.taskFileId,
+          message,
+          nextRetryAt
+        );
+        destinationRepo.updateFileStatus(
+          target.id,
+          "pending",
+          void 0,
+          void 0,
+          `第 ${retryCount} 次重试等待中: ${message}`
+        );
+        log.warn(
+          `任务 ${task.id} [${target.provider}] 将在 ${delay}ms 后重试: ${target.relativePath}`
+        );
+      } else {
+        destinationRepo.updateFileStatus(
+          target.id,
+          "failed",
+          void 0,
+          void 0,
+          message
+        );
+        destinationRepo.recalculateLogicalFile(target.taskFileId);
+        runtime.failedFiles++;
+        log.error(
+          `上传失败 [${target.provider}] ${target.relativePath}:`,
+          message
+        );
+      }
+    } finally {
+      runtime.activeUploads.delete(target.id);
+      if (acquired) semaphore.release();
+      destinationRepo.updateProgress(
+        task.id,
+        target.provider,
+        runtime.uploadedFiles,
+        runtime.uploadedBytes
+      );
+      this.broadcastProgress(task.id, target.provider, runtime, null, true);
+    }
+  }
+  updateDestinationFinalStates(task) {
+    const repo = getTaskDestinationRepo();
+    let taskStatus = task.sourceType === "local" && task.dayFolderId ? "synced" : "completed";
+    for (const destination of repo.listByTask(task.id)) {
+      const targets = repo.listFileTargets(task.id, destination.provider);
+      const failed = targets.filter((target) => target.status === "failed");
+      const pending = targets.filter((target) => target.status === "pending");
+      const skipped = targets.filter((target) => target.status === "skipped");
+      if (failed.length > 0) {
+        const summary = `${failed.length} 个文件上传失败，例如 ${failed.slice(0, 3).map(
+          (target) => `${target.relativePath}: ${target.errorMessage || "unknown error"}`
+        ).join(" | ")}`;
+        repo.updateStatus(task.id, destination.provider, "failed", summary);
+        this.broadcastDestinationStatus(
+          task.id,
+          destination.provider,
+          "failed",
+          summary
+        );
+        taskStatus = "failed";
+      } else if (pending.length > 0) {
+        repo.updateStatus(
+          task.id,
+          destination.provider,
+          "retrying",
+          `${pending.length} 个文件等待自动重试或稳定`
+        );
+        this.broadcastDestinationStatus(
+          task.id,
+          destination.provider,
+          "retrying",
+          `${pending.length} 个文件等待自动重试或稳定`
+        );
+        if (taskStatus !== "failed") taskStatus = "retrying";
+      } else {
+        const status = task.sourceType === "local" && task.dayFolderId ? "synced" : "completed";
+        repo.updateStatus(
+          task.id,
+          destination.provider,
+          status,
+          skipped.length > 0 ? `${skipped.length} 个源文件已跳过` : void 0
+        );
+        this.broadcastDestinationStatus(
+          task.id,
+          destination.provider,
+          status,
+          skipped.length > 0 ? `${skipped.length} 个源文件已跳过` : void 0
+        );
+      }
+      repo.recalculateProgress(task.id, destination.provider);
+    }
+    return taskStatus;
+  }
+  createCompactMarker(task, destinations) {
+    const destinationRepo = getTaskDestinationRepo();
+    return {
+      version: 3,
       taskId: task.id,
-      status: "completed",
-      totalFiles: 0,
-      uploadedFiles: 0,
-      files: {},
+      status: task.status,
+      totalFiles: task.totalFiles,
+      uploadedFiles: task.uploadedFiles,
+      failedFiles: taskRepoCount(task.id, "failed"),
+      skippedFiles: taskRepoCount(task.id, "skipped"),
       lastUpdated: (/* @__PURE__ */ new Date()).toISOString(),
-      error: null,
+      error: task.errorMessage || destinations.map((destination) => destination.errorMessage).filter(Boolean).join(" || ") || null,
       uploadTargetMode: task.uploadTargetMode,
       destinations: Object.fromEntries(
-        providers.map((provider) => [
-          provider,
-          {
-            status: "completed",
-            totalFiles: 0,
-            uploadedFiles: 0,
-            files: {},
-            error: null
-          }
-        ])
+        destinations.map((destination) => {
+          const targets = destinationRepo.listFileTargets(
+            task.id,
+            destination.provider
+          );
+          return [
+            destination.provider,
+            {
+              status: destination.status,
+              totalFiles: targets.length,
+              uploadedFiles: targets.filter(
+                (target) => target.status === "completed"
+              ).length,
+              failedFiles: targets.filter(
+                (target) => target.status === "failed"
+              ).length,
+              skippedFiles: targets.filter(
+                (target) => target.status === "skipped"
+              ).length,
+              error: destination.errorMessage
+            }
+          ];
+        })
       )
-    });
-  }
-  createProcessMarker(task, files, targets) {
-    const destinations = {};
-    for (const destination of task.destinations) {
-      const providerTargets = targets.filter(
-        (target) => target.provider === destination.provider
-      );
-      destinations[destination.provider] = {
-        status: destination.status === "pending" ? "uploading" : destination.status,
-        totalFiles: files.length,
-        uploadedFiles: providerTargets.filter(
-          (target) => target.status === "completed"
-        ).length,
-        files: Object.fromEntries(
-          providerTargets.map((target) => [
-            target.relativePath,
-            target.status === "uploading" ? "pending" : target.status
-          ])
-        ),
-        error: null
-      };
-    }
-    return {
-      version: 2,
-      taskId: task.id,
-      status: "uploading",
-      totalFiles: files.length,
-      uploadedFiles: 0,
-      files: Object.fromEntries(
-        files.map((file) => [file.relativePath, "pending"])
-      ),
-      lastUpdated: (/* @__PURE__ */ new Date()).toISOString(),
-      error: null,
-      uploadTargetMode: task.uploadTargetMode,
-      destinations
     };
   }
-  groupTargets(targets) {
-    const result = /* @__PURE__ */ new Map();
-    for (const target of targets) {
-      const list = result.get(target.provider) || [];
-      list.push(target);
-      result.set(target.provider, list);
-    }
-    return result;
-  }
-  setMarkerFileStatus(marker, provider, relativePath, status) {
-    const destination = marker.destinations?.[provider];
-    if (destination) {
-      destination.files[relativePath] = status;
-      destination.uploadedFiles = Object.values(destination.files).filter(
-        (value) => value === "completed"
-      ).length;
-    }
-  }
-  updateMarkerAggregate(marker, uploadedFiles, allTargets) {
-    marker.uploadedFiles = uploadedFiles;
-    marker.lastUpdated = (/* @__PURE__ */ new Date()).toISOString();
-    const relativePaths = new Set(allTargets.map((target) => target.relativePath));
-    for (const relativePath of relativePaths) {
-      const targets = allTargets.filter(
-        (target) => target.relativePath === relativePath
-      );
-      const latestStatuses = targets.map((target) => target.status);
-      marker.files[relativePath] = latestStatuses.every(
-        (status) => status === "completed"
-      ) ? "completed" : latestStatuses.some((status) => status === "failed") ? "failed" : "pending";
-    }
-  }
-  broadcastProgress(taskId, provider, runtime, currentFile) {
+  broadcastProgress(taskId, provider, runtime, currentFile, force = false) {
+    const now = Date.now();
+    if (!force && now - runtime.lastBroadcastAt < 250) return;
+    runtime.lastBroadcastAt = now;
+    const inFlightBytes = Array.from(runtime.activeUploads.values()).reduce(
+      (sum, bytes) => sum + bytes,
+      0
+    );
     const progress = {
       taskId,
       provider,
       uploadedFiles: runtime.uploadedFiles,
       totalFiles: runtime.totalFiles,
-      uploadedBytes: runtime.uploadedBytes,
+      uploadedBytes: Math.min(
+        runtime.totalBytes,
+        runtime.uploadedBytes + inFlightBytes
+      ),
       totalBytes: runtime.totalBytes,
       speed: runtime.speed.getSpeed(),
-      currentFile
+      currentFile,
+      queuedFiles: runtime.queuedFiles,
+      activeUploads: runtime.activeUploads.size,
+      failedFiles: runtime.failedFiles,
+      skippedFiles: runtime.skippedFiles,
+      transferredBytes: runtime.transferredBytes
     };
     for (const win of electron.BrowserWindow.getAllWindows()) {
       win.webContents.send(IPC.TASK_PROGRESS, progress);
+    }
+  }
+  writeMarker(folderPath, marker) {
+    if (!fs.existsSync(folderPath)) return;
+    try {
+      writeProcessTask(folderPath, marker);
+    } catch (error) {
+      log.warn("写入任务汇总标记失败:", folderPath, error);
     }
   }
   broadcastDestinationStatus(taskId, provider, status, errorMessage) {
@@ -4196,34 +5034,13 @@ class TaskRunnerService {
       });
     }
   }
-  async uploadWithRetry(uploader, localPath, objectKey, fileSize, onProgress, signal, taskId, relativePath, provider) {
-    let attempt = 0;
-    while (true) {
-      try {
-        const result = await uploader.uploadFile(
-          localPath,
-          objectKey,
-          fileSize,
-          onProgress,
-          signal
-        );
-        return result;
-      } catch (err) {
-        if (err instanceof DOMException && err.name === "AbortError") throw err;
-        if (!this.isRetriableUploadError(err) || attempt >= this.maxUploadRetries) {
-          throw err;
-        }
-        attempt++;
-        const delayMs = Math.min(5e3, 500 * 2 ** (attempt - 1));
-        log.warn(
-          `任务 ${taskId} [${provider}] 文件重试 ${attempt}/${this.maxUploadRetries}: ${relativePath}`
-        );
-        await this.sleep(delayMs);
-      }
-    }
+  retryDelay(retryCount) {
+    const base = RETRY_DELAYS_MS[Math.min(retryCount, RETRY_DELAYS_MS.length - 1)];
+    const jitter = 0.8 + Math.random() * 0.4;
+    return Math.round(base * jitter);
   }
-  isRetriableUploadError(err) {
-    const error = err;
+  isRetriableUploadError(errorValue) {
+    const error = errorValue;
     const status = error.status || error.$metadata?.httpStatusCode;
     if (typeof status === "number" && (status === 429 || status >= 500)) {
       return true;
@@ -4234,15 +5051,16 @@ class TaskRunnerService {
       "ESOCKETTIMEDOUT",
       "EAI_AGAIN",
       "ENOTFOUND",
-      "EPIPE"
+      "EPIPE",
+      "ECONNREFUSED"
     ]);
     if (error.code && transientCodes.has(error.code)) return true;
     const text = `${error.name || ""} ${error.message || ""}`.toLowerCase();
-    return text.includes("timeout") || text.includes("temporarily unavailable");
+    return text.includes("timeout") || text.includes("temporarily unavailable") || text.includes("socket hang up");
   }
-  sleep(ms) {
-    return new Promise((resolve) => setTimeout(resolve, ms));
-  }
+}
+function taskRepoCount(taskId, status) {
+  return getTaskRepo().listFiles(taskId, status).length;
 }
 let instance$1 = null;
 function getTaskRunnerService() {
@@ -4285,6 +5103,9 @@ function getWebhookService() {
   return instance;
 }
 let logDir = "";
+let levelFileHookInstalled = false;
+const LEVEL_LOG_MAX_SIZE = 10 * 1024 * 1024;
+const LEVEL_LOG_DISCARD_SIZE = 50 * 1024 * 1024;
 function initLogger(config) {
   logDir = config?.directory || path.join(electron.app.getPath("userData"), "logs");
   if (!fs.existsSync(logDir)) {
@@ -4301,30 +5122,57 @@ function initLogger(config) {
   log.transports.file.level = "info";
   log.transports.file.format = "[{y}-{m}-{d} {h}:{i}:{s}.{ms}] [{level}] {text}";
   log.transports.file.maxSize = 10 * 1024 * 1024;
-  log.hooks.push((message) => {
-    if (!logDir) return message;
-    const level = message.level;
-    if (level === "error" || level === "warn") {
-      try {
-        const date = (/* @__PURE__ */ new Date()).toISOString().slice(0, 10);
-        const dir = path.join(logDir, date);
-        if (!fs.existsSync(dir)) {
-          fs.mkdirSync(dir, { recursive: true });
-        }
-        const fileName = level === "error" ? "error.log" : "warn.log";
-        const text = message.data?.map((d) => String(d)).join(" ") || "";
-        const ts = (/* @__PURE__ */ new Date()).toISOString().replace("T", " ").slice(0, 23);
-        const line = `[${ts}] [${level}] ${text}
+  prepareCurrentLevelLogs();
+  if (!levelFileHookInstalled) {
+    log.hooks.push((message) => {
+      if (!logDir) return message;
+      const level = message.level;
+      if (level === "error" || level === "warn") {
+        try {
+          const date = (/* @__PURE__ */ new Date()).toISOString().slice(0, 10);
+          const dir = path.join(logDir, date);
+          if (!fs.existsSync(dir)) {
+            fs.mkdirSync(dir, { recursive: true });
+          }
+          const fileName = level === "error" ? "error.log" : "warn.log";
+          const text = message.data?.map((d) => String(d)).join(" ") || "";
+          const ts = (/* @__PURE__ */ new Date()).toISOString().replace("T", " ").slice(0, 23);
+          const line = `[${ts}] [${level}] ${text}
 `;
-        fs.appendFileSync(path.join(dir, fileName), line);
-      } catch {
+          const filePath = path.join(dir, fileName);
+          rotateLevelLog(filePath);
+          fs.appendFileSync(filePath, line);
+        } catch {
+        }
       }
-    }
-    return message;
-  });
+      return message;
+    });
+    levelFileHookInstalled = true;
+  }
   const maxDays = config?.maxDays || 30;
   cleanOldLogs(logDir, maxDays);
   log.info("日志系统初始化完成, 目录:", logDir);
+}
+function prepareCurrentLevelLogs() {
+  const date = (/* @__PURE__ */ new Date()).toISOString().slice(0, 10);
+  const dir = path.join(logDir, date);
+  if (!fs.existsSync(dir)) return;
+  rotateLevelLog(path.join(dir, "warn.log"));
+  rotateLevelLog(path.join(dir, "error.log"));
+}
+function rotateLevelLog(filePath) {
+  if (!fs.existsSync(filePath)) {
+    return;
+  }
+  const size = fs.statSync(filePath).size;
+  if (size < LEVEL_LOG_MAX_SIZE) return;
+  if (size >= LEVEL_LOG_DISCARD_SIZE) {
+    fs.rmSync(filePath, { force: true });
+    return;
+  }
+  const oldPath = filePath.replace(/\.log$/, ".old.log");
+  fs.rmSync(oldPath, { force: true });
+  fs.renameSync(filePath, oldPath);
 }
 function cleanOldLogs(dir, maxDays) {
   try {
@@ -4346,8 +5194,50 @@ function cleanOldLogs(dir, maxDays) {
   }
 }
 let mainWindow = null;
-let annotationWindow = null;
+let startupWindow = null;
 let tray = null;
+let servicesStarted = false;
+const hasSingleInstanceLock = electron.app.requestSingleInstanceLock();
+if (!hasSingleInstanceLock) {
+  electron.app.quit();
+}
+electron.app.on("second-instance", () => {
+  const window = mainWindow || startupWindow;
+  if (!window || window.isDestroyed()) return;
+  if (window.isMinimized()) window.restore();
+  window.show();
+  window.focus();
+});
+async function createStartupWindow() {
+  startupWindow = new electron.BrowserWindow({
+    width: 460,
+    height: 220,
+    resizable: false,
+    minimizable: false,
+    maximizable: false,
+    show: false,
+    title: "数据采集上传工具正在启动",
+    backgroundColor: "#f8fafc",
+    webPreferences: {
+      sandbox: true,
+      contextIsolation: true,
+      nodeIntegration: false
+    }
+  });
+  startupWindow.once("ready-to-show", () => startupWindow?.show());
+  const html = `<!doctype html>
+    <html lang="zh-CN">
+      <head><meta charset="utf-8"><title>正在启动</title></head>
+      <body style="margin:0;font-family:sans-serif;background:#f8fafc;color:#0f172a">
+        <main style="height:220px;display:flex;flex-direction:column;align-items:center;justify-content:center">
+          <div style="font-size:18px;font-weight:600">数据采集上传工具正在启动</div>
+          <div style="margin-top:14px;font-size:14px;color:#475569">正在检查和升级本地数据库，请勿重复启动或强制关机。</div>
+          <div style="margin-top:8px;font-size:12px;color:#64748b">历史文件较多时首次升级可能需要几分钟。</div>
+        </main>
+      </body>
+    </html>`;
+  await startupWindow.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(html)}`);
+}
 function createWindow() {
   mainWindow = new electron.BrowserWindow({
     width: 1100,
@@ -4364,7 +5254,19 @@ function createWindow() {
     }
   });
   mainWindow.on("ready-to-show", () => {
+    startupWindow?.destroy();
+    startupWindow = null;
     mainWindow?.show();
+    if (!servicesStarted) {
+      servicesStarted = true;
+      setTimeout(() => {
+        try {
+          startServices();
+        } catch (error) {
+          log.error("后台服务启动失败:", error);
+        }
+      }, 500);
+    }
   });
   mainWindow.on("close", (e) => {
     if (!electron.app.isQuitting) {
@@ -4433,11 +5335,12 @@ function startServices() {
   const webhookService = getWebhookService();
   const taskRepo = getTaskRepo();
   const settingsRepo = getSettingsRepo();
+  const scanner = getScannerService();
   taskQueue.setTaskRunner(async (task, signal) => {
-    await taskRunner.run(task, signal);
-    if (signal.aborted) return;
+    const finalStatus = await taskRunner.run(task, signal);
+    if (signal.aborted) return finalStatus;
     const webhookConfig = settingsRepo.get("webhook");
-    if (webhookConfig?.enabled) {
+    if (webhookConfig?.enabled && finalStatus === "completed") {
       const updatedTask = taskRepo.getById(task.id);
       if (updatedTask) {
         const createdAt = new Date(updatedTask.createdAt).getTime();
@@ -4455,6 +5358,7 @@ function startServices() {
         });
       }
     }
+    return finalStatus;
   });
   taskQueue.on("task:status-change", (event) => {
     if (event.newStatus === "failed") {
@@ -4481,25 +5385,40 @@ function startServices() {
   });
   const unfinished = taskRepo.getUnfinishedTasks();
   if (unfinished.length > 0) {
-    log.info(`发现 ${unfinished.length} 个未完成任务，重新加入队列`);
-    for (const task of unfinished) {
-      if (task.status === "uploading" || task.status === "scanning") {
-        taskRepo.retry(task.id);
-      }
-    }
+    log.info(`发现 ${unfinished.length} 个未完成任务，等待后台队列分批恢复`);
   }
   taskQueue.start();
-  const scanner = getScannerService();
   scanner.start();
+  for (const task of unfinished) {
+    scanner.queueReconcileTask(task);
+  }
   getCleanupService().start();
   log.info("所有服务已启动");
 }
-electron.app.whenReady().then(() => {
+electron.app.whenReady().then(async () => {
+  if (!hasSingleInstanceLock) return;
   electronApp.setAppUserModelId("com.uploader.app");
   electron.app.on("browser-window-created", (_, window) => {
     optimizer.watchWindowShortcuts(window);
   });
   initLogger();
+  process.on("uncaughtException", (error) => {
+    log.error("主进程未捕获异常:", error);
+  });
+  process.on("unhandledRejection", (reason) => {
+    log.error("主进程未处理 Promise 异常:", reason);
+  });
+  electron.app.on("render-process-gone", (_event, webContents, details) => {
+    log.error("渲染进程异常退出:", {
+      reason: details.reason,
+      exitCode: details.exitCode,
+      url: webContents.getURL()
+    });
+  });
+  electron.app.on("child-process-gone", (_event, details) => {
+    log.error("Electron 子进程异常退出:", details);
+  });
+  await createStartupWindow();
   initDatabase();
   const logConfig = getSettingsRepo().get("log");
   if (logConfig?.directory) {
@@ -4509,8 +5428,7 @@ electron.app.whenReady().then(() => {
   createWindow();
   createTray();
   registerHotkey();
-  startServices();
-  log.info("应用启动完成");
+  log.info("应用界面初始化完成，后台服务将在窗口显示后启动");
   electron.app.on("activate", () => {
     if (electron.BrowserWindow.getAllWindows().length === 0) {
       createWindow();
@@ -4519,9 +5437,11 @@ electron.app.whenReady().then(() => {
 }).catch((error) => {
   const message = error instanceof Error ? error.message : String(error);
   log.error("应用启动失败:", error);
+  startupWindow?.destroy();
+  startupWindow = null;
   electron.dialog.showErrorBox(
     "数据采集上传工具启动失败",
-    `${message}
+    message.includes("database is locked") ? "数据库正在被另一个程序进程使用。请结束旧的数据采集上传工具进程后重试。" : `${message}
 
 请查看 ~/.config/electron-uploader/logs 下的日志。`
   );
@@ -4545,32 +5465,4 @@ electron.app.on("before-quit", () => {
 function getMainWindow() {
   return mainWindow;
 }
-function createAnnotationWindow() {
-  if (annotationWindow && !annotationWindow.isDestroyed()) {
-    annotationWindow.focus();
-    return;
-  }
-  annotationWindow = new electron.BrowserWindow({
-    width: 1200,
-    height: 800,
-    minWidth: 960,
-    minHeight: 640,
-    title: "图像标注",
-    webPreferences: {
-      preload: path.join(__dirname, "../preload/index.js"),
-      sandbox: false,
-      contextIsolation: true,
-      nodeIntegration: false
-    }
-  });
-  annotationWindow.on("closed", () => {
-    annotationWindow = null;
-  });
-  if (is.dev && process.env["ELECTRON_RENDERER_URL"]) {
-    annotationWindow.loadURL(process.env["ELECTRON_RENDERER_URL"] + "#/annotation");
-  } else {
-    annotationWindow.loadFile(path.join(__dirname, "../renderer/index.html"), { hash: "annotation" });
-  }
-}
-exports.createAnnotationWindow = createAnnotationWindow;
 exports.getMainWindow = getMainWindow;

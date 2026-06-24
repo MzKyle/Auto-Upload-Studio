@@ -1,4 +1,5 @@
 import { readdirSync, statSync } from 'fs'
+import { readdir, stat } from 'fs/promises'
 import { join, extname, basename } from 'path'
 import type { FilterRules } from '@shared/types'
 
@@ -70,16 +71,53 @@ export class FileFilterService {
   /**
    * 递归扫描文件夹，返回过滤后的文件列表
    */
-  scanFolder(folderPath: string): Array<{ relativePath: string; absolutePath: string; size: number }> {
-    const results: Array<{ relativePath: string; absolutePath: string; size: number }> = []
+  scanFolder(
+    folderPath: string
+  ): Array<{
+    relativePath: string
+    absolutePath: string
+    size: number
+    mtimeMs: number
+  }> {
+    const results: Array<{
+      relativePath: string
+      absolutePath: string
+      size: number
+      mtimeMs: number
+    }> = []
     this.walkDir(folderPath, folderPath, results)
+    return results
+  }
+
+  async scanFolderAsync(
+    folderPath: string
+  ): Promise<
+    Array<{
+      relativePath: string
+      absolutePath: string
+      size: number
+      mtimeMs: number
+    }>
+  > {
+    const results: Array<{
+      relativePath: string
+      absolutePath: string
+      size: number
+      mtimeMs: number
+    }> = []
+    await this.walkDirAsync(folderPath, folderPath, results)
     return results
   }
 
   private walkDir(
     basePath: string,
     currentPath: string,
-    results: Array<{ relativePath: string; absolutePath: string; size: number }>
+    results: Array<{
+      relativePath: string
+      absolutePath: string
+      size: number
+      mtimeMs: number
+    }>
   ): void {
     const entries = readdirSync(currentPath, { withFileTypes: true })
     for (const entry of entries) {
@@ -98,7 +136,52 @@ export class FileFilterService {
         ) continue
         if (this.shouldInclude(relativePath)) {
           const stat = statSync(fullPath)
-          results.push({ relativePath, absolutePath: fullPath, size: stat.size })
+          results.push({
+            relativePath,
+            absolutePath: fullPath,
+            size: stat.size,
+            mtimeMs: stat.mtimeMs
+          })
+        }
+      }
+    }
+  }
+
+  private async walkDirAsync(
+    basePath: string,
+    currentPath: string,
+    results: Array<{
+      relativePath: string
+      absolutePath: string
+      size: number
+      mtimeMs: number
+    }>
+  ): Promise<void> {
+    const entries = await readdir(currentPath, { withFileTypes: true })
+    for (const entry of entries) {
+      const fullPath = join(currentPath, entry.name)
+      if (entry.isDirectory()) {
+        if (entry.name.startsWith('.')) continue
+        await this.walkDirAsync(basePath, fullPath, results)
+      } else if (entry.isFile()) {
+        const relativePath = fullPath.slice(basePath.length + 1)
+        if (
+          entry.name === 'tmp_upload.json' ||
+          entry.name === 'process_task.json' ||
+          entry.name === 'day_upload.json'
+        ) continue
+        if (!this.shouldInclude(relativePath)) continue
+
+        try {
+          const fileStat = await stat(fullPath)
+          results.push({
+            relativePath,
+            absolutePath: fullPath,
+            size: fileStat.size,
+            mtimeMs: fileStat.mtimeMs
+          })
+        } catch {
+          // 文件可能在异步扫描期间被删除。
         }
       }
     }
