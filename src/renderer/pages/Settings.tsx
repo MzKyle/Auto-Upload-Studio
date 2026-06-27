@@ -10,7 +10,10 @@ import { useSettingsStore } from "@/stores/settings.store";
 import { testOSS, testTencentS3, selectFolder } from "@/lib/ipc-client";
 import { buildPathTreeFromPaths } from "@/lib/path-tree";
 import { showToast } from "@/components/ui/toast";
-import type { AppSettings } from "@shared/types";
+import { CLOUD_PROVIDER_LABELS } from "@shared/constants";
+import type { AppSettings, CloudProvider } from "@shared/types";
+
+type SettingsSection = "global" | CloudProvider;
 
 export default function Settings() {
   const { settings, loading, loadSettings, saveSettings } = useSettingsStore();
@@ -28,9 +31,18 @@ export default function Settings() {
   >("idle");
   const [lastSavedAt, setLastSavedAt] = useState<string | null>(null);
   const [suffixInput, setSuffixInput] = useState("");
-  const scanDirectoryTree = useMemo(
-    () => buildPathTreeFromPaths(local.scan.directories),
-    [local.scan.directories],
+  const [activeSection, setActiveSection] =
+    useState<SettingsSection>("global");
+  const scanDirectoryTrees = useMemo(
+    () => ({
+      aliyun: buildPathTreeFromPaths(
+        local.scan.providerDirectories?.aliyun ?? [],
+      ),
+      tencent: buildPathTreeFromPaths(
+        local.scan.providerDirectories?.tencent ?? [],
+      ),
+    }),
+    [local.scan.providerDirectories],
   );
 
   useEffect(() => {
@@ -80,25 +92,58 @@ export default function Settings() {
     setTencentTestResult(result);
   }, [local.tencentS3]);
 
-  const handleAddScanDir = useCallback(async () => {
-    const dir = await selectFolder();
-    if (dir && !local.scan.directories.includes(dir)) {
-      setLocal((prev) => ({
-        ...prev,
-        scan: { ...prev.scan, directories: [...prev.scan.directories, dir] },
-      }));
-    }
-  }, [local.scan.directories]);
+  const updateProviderDirectories = useCallback(
+    (
+      provider: CloudProvider,
+      updater: (directories: string[]) => string[],
+    ) => {
+      setLocal((prev) => {
+        const current = prev.scan.providerDirectories ?? {
+          aliyun: [],
+          tencent: [],
+        };
+        const providerDirectories = {
+          aliyun: current.aliyun ?? [],
+          tencent: current.tencent ?? [],
+          [provider]: updater(current[provider] ?? []),
+        };
+        const directories = Array.from(
+          new Set([
+            ...providerDirectories.aliyun,
+            ...providerDirectories.tencent,
+          ]),
+        );
 
-  const handleRemoveScanDir = useCallback((dir: string) => {
-    setLocal((prev) => ({
-      ...prev,
-      scan: {
-        ...prev.scan,
-        directories: prev.scan.directories.filter((d) => d !== dir),
-      },
-    }));
-  }, []);
+        return {
+          ...prev,
+          scan: {
+            ...prev.scan,
+            directories,
+            providerDirectories,
+          },
+        };
+      });
+    },
+    [],
+  );
+
+  const handleAddScanDir = useCallback(async (provider: CloudProvider) => {
+    const dir = await selectFolder();
+    if (dir) {
+      updateProviderDirectories(provider, (directories) =>
+        directories.includes(dir) ? directories : [...directories, dir],
+      );
+    }
+  }, [updateProviderDirectories]);
+
+  const handleRemoveScanDir = useCallback(
+    (provider: CloudProvider, dir: string) => {
+      updateProviderDirectories(provider, (directories) =>
+        directories.filter((d) => d !== dir),
+      );
+    },
+    [updateProviderDirectories],
+  );
 
   const handleAddSuffix = useCallback(() => {
     const s = suffixInput.trim();
@@ -130,6 +175,58 @@ export default function Settings() {
     }
   }, []);
 
+  const renderProviderDirectories = (provider: CloudProvider) => {
+    const directories = local.scan.providerDirectories?.[provider] ?? [];
+
+    return (
+      <Card>
+        <CardHeader>
+          <CardTitle className="text-base">
+            {CLOUD_PROVIDER_LABELS[provider]}监控目录 ({directories.length})
+          </CardTitle>
+        </CardHeader>
+        <CardContent>
+          <p className="text-xs text-muted-foreground">
+            根目录下仅自动扫描当天 YYYY-MM-DD 日期目录；旧日期需要手动添加具体工作次目录
+          </p>
+          <div className="mt-2 space-y-2">
+            <PathTree
+              nodes={scanDirectoryTrees[provider]}
+              className="rounded-md border bg-muted/20 p-1"
+              rowClassName="text-xs"
+              renderActions={({ node }) => {
+                const originalPath = node.items[0]?.originalPath;
+                if (!originalPath) return null;
+
+                return (
+                  <button
+                    type="button"
+                    title={`删除 ${originalPath}`}
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      handleRemoveScanDir(provider, originalPath);
+                    }}
+                    className="flex h-6 w-6 items-center justify-center rounded-sm text-muted-foreground hover:bg-background hover:text-destructive"
+                  >
+                    <X className="h-3.5 w-3.5" />
+                  </button>
+                );
+              }}
+            />
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => handleAddScanDir(provider)}
+            >
+              <Plus className="h-3 w-3 mr-1" />
+              添加目录
+            </Button>
+          </div>
+        </CardContent>
+      </Card>
+    );
+  };
+
   if (loading)
     return <div className="p-6 text-muted-foreground">加载中...</div>;
 
@@ -145,47 +242,30 @@ export default function Settings() {
         </div>
       </div>
 
+      <div className="inline-flex rounded-md border p-1 bg-muted/30">
+        {[
+          { id: "global" as const, label: "全局配置" },
+          { id: "aliyun" as const, label: "阿里云" },
+          { id: "tencent" as const, label: "腾讯云" },
+        ].map((item) => (
+          <Button
+            key={item.id}
+            variant={activeSection === item.id ? "default" : "ghost"}
+            size="sm"
+            onClick={() => setActiveSection(item.id)}
+          >
+            {item.label}
+          </Button>
+        ))}
+      </div>
+
       {/* 扫描配置 */}
+      {activeSection === "global" && (
       <Card>
         <CardHeader>
           <CardTitle className="text-base">扫描配置</CardTitle>
         </CardHeader>
         <CardContent className="space-y-4">
-          <div>
-            <Label>数据根目录 ({local.scan.directories.length})</Label>
-            <p className="text-xs text-muted-foreground mt-1">
-              根目录下仅自动扫描当天 YYYY-MM-DD 日期目录；旧日期需要手动添加具体工作次目录
-            </p>
-            <div className="mt-2 space-y-2">
-              <PathTree
-                nodes={scanDirectoryTree}
-                className="rounded-md border bg-muted/20 p-1"
-                rowClassName="text-xs"
-                renderActions={({ node }) => {
-                  const originalPath = node.items[0]?.originalPath;
-                  if (!originalPath) return null;
-
-                  return (
-                    <button
-                      type="button"
-                      title={`删除 ${originalPath}`}
-                      onClick={(event) => {
-                        event.stopPropagation();
-                        handleRemoveScanDir(originalPath);
-                      }}
-                      className="flex h-6 w-6 items-center justify-center rounded-sm text-muted-foreground hover:bg-background hover:text-destructive"
-                    >
-                      <X className="h-3.5 w-3.5" />
-                    </button>
-                  );
-                }}
-              />
-              <Button variant="outline" size="sm" onClick={handleAddScanDir}>
-                <Plus className="h-3 w-3 mr-1" />
-                添加目录
-              </Button>
-            </div>
-          </div>
           <div className="grid grid-cols-3 gap-4">
             <div>
               <Label>扫描间隔 (秒)</Label>
@@ -270,8 +350,10 @@ export default function Settings() {
           </div>
         </CardContent>
       </Card>
+      )}
 
       {/* 数采模式 */}
+      {activeSection === "global" && (
       <Card>
         <CardHeader>
           <CardTitle className="text-base">数采模式</CardTitle>
@@ -295,8 +377,10 @@ export default function Settings() {
           </div>
         </CardContent>
       </Card>
+      )}
 
       {/* 自动清理 */}
+      {activeSection === "global" && (
       <Card>
         <CardHeader>
           <CardTitle className="text-base">自动清理</CardTitle>
@@ -341,8 +425,10 @@ export default function Settings() {
           </div>
         </CardContent>
       </Card>
+      )}
 
       {/* 上传配置 */}
+      {activeSection === "global" && (
       <Card>
         <CardHeader>
           <CardTitle className="text-base">上传配置</CardTitle>
@@ -517,8 +603,12 @@ export default function Settings() {
           </div>
         </CardContent>
       </Card>
+      )}
 
       {/* OSS 配置 */}
+      {activeSection === "aliyun" && (
+      <>
+      {renderProviderDirectories("aliyun")}
       <Card>
         <CardHeader>
           <div className="flex items-center justify-between">
@@ -629,8 +719,13 @@ export default function Settings() {
           </div>
         </CardContent>
       </Card>
+      </>
+      )}
 
       {/* 腾讯云 TurboS3 配置 */}
+      {activeSection === "tencent" && (
+      <>
+      {renderProviderDirectories("tencent")}
       <Card>
         <CardHeader>
           <div className="flex items-center justify-between">
@@ -768,8 +863,11 @@ export default function Settings() {
           </label>
         </CardContent>
       </Card>
+      </>
+      )}
 
       {/* 文件过滤规则 */}
+      {activeSection === "global" && (
       <Card>
         <CardHeader>
           <CardTitle className="text-base">文件过滤规则</CardTitle>
@@ -853,8 +951,10 @@ export default function Settings() {
           </div>
         </CardContent>
       </Card>
+      )}
 
       {/* Webhook */}
+      {activeSection === "global" && (
       <Card>
         <CardHeader>
           <CardTitle className="text-base">Webhook 通知</CardTitle>
@@ -890,8 +990,10 @@ export default function Settings() {
           </div>
         </CardContent>
       </Card>
+      )}
 
       {/* 日志配置 */}
+      {activeSection === "global" && (
       <Card>
         <CardHeader>
           <CardTitle className="text-base">日志配置</CardTitle>
@@ -935,8 +1037,10 @@ export default function Settings() {
           </div>
         </CardContent>
       </Card>
+      )}
 
       {/* 快捷键 */}
+      {activeSection === "global" && (
       <Card>
         <CardHeader>
           <CardTitle className="text-base">快捷键</CardTitle>
@@ -955,6 +1059,7 @@ export default function Settings() {
           </div>
         </CardContent>
       </Card>
+      )}
     </div>
   );
 }

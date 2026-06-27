@@ -1,8 +1,11 @@
 import { getDb } from './database'
 import { DEFAULT_SETTINGS } from '@shared/constants'
-import type { AppSettings } from '@shared/types'
-import { basename, dirname, normalize } from 'path'
-import { isDateFolderName } from '@shared/day-folder'
+import {
+  normalizeScanConfig,
+  normalizeScanDirectories,
+  normalizeProviderDirectories
+} from '@shared/scan-config'
+import type { AppSettings, CloudConfig, ScanConfig } from '@shared/types'
 
 function normalizeSuffixes(suffixes: string[]): string[] {
   const normalized = suffixes
@@ -13,19 +16,6 @@ function normalizeSuffixes(suffixes: string[]): string[] {
   const unique = Array.from(new Set(normalized))
   if (!unique.includes('.csv')) unique.push('.csv')
   return unique
-}
-
-function normalizeScanDirectories(directories: string[]): string[] {
-  return Array.from(
-    new Set(
-      directories
-        .map((directory) => normalize(directory).replace(/[\\/]+$/, ''))
-        .filter(Boolean)
-        .map((directory) =>
-          isDateFolderName(basename(directory)) ? dirname(directory) : directory
-        )
-    )
-  )
 }
 
 export class SettingsRepo {
@@ -56,6 +46,15 @@ export class SettingsRepo {
       ) {
         const scan = parsed as Record<string, unknown>
         scan.directories = normalizeScanDirectories(scan.directories as string[])
+        if (
+          'providerDirectories' in scan &&
+          typeof scan.providerDirectories === 'object' &&
+          scan.providerDirectories !== null
+        ) {
+          scan.providerDirectories = normalizeProviderDirectories(
+            scan.providerDirectories as Partial<ScanConfig['providerDirectories']>
+          )
+        }
       }
       return parsed
     } catch {
@@ -89,9 +88,16 @@ export class SettingsRepo {
       Array.isArray((value as Record<string, unknown>).directories)
     ) {
       const scan = value as Record<string, unknown>
+      const cloud = this.get<CloudConfig>('cloud')
       persistedValue = {
         ...scan,
-        directories: normalizeScanDirectories(scan.directories as string[])
+        ...normalizeScanConfig(
+          {
+            ...(DEFAULT_SETTINGS.scan as ScanConfig),
+            ...(scan as Partial<ScanConfig>)
+          },
+          cloud?.targetMode || DEFAULT_SETTINGS.cloud.targetMode
+        )
       }
     }
 
@@ -102,7 +108,8 @@ export class SettingsRepo {
   }
 
   getAll(): AppSettings {
-    const settings = { ...DEFAULT_SETTINGS }
+    const settings = { ...DEFAULT_SETTINGS } as AppSettings
+    const settingsRecord = settings as unknown as Record<string, unknown>
 
     const keys: Array<{ section: keyof AppSettings; key: string }> = [
       { section: 'scan', key: 'scan' },
@@ -121,19 +128,19 @@ export class SettingsRepo {
     for (const { section, key } of keys) {
       const val = this.get(key)
       if (val !== null) {
-        const defaultSection = (settings as Record<string, unknown>)[section]
+        const defaultSection = settingsRecord[section]
         if (
           typeof defaultSection === 'object' &&
           defaultSection !== null &&
           typeof val === 'object' &&
           val !== null
         ) {
-          ; (settings as Record<string, unknown>)[section] = {
+          ; settingsRecord[section] = {
             ...(defaultSection as Record<string, unknown>),
             ...(val as Record<string, unknown>)
           }
         } else {
-          ; (settings as Record<string, unknown>)[section] = val
+          ; settingsRecord[section] = val
         }
       }
     }
@@ -144,6 +151,10 @@ export class SettingsRepo {
     if (settings.filter && Array.isArray(settings.filter.suffixes)) {
       settings.filter.suffixes = normalizeSuffixes(settings.filter.suffixes)
     }
+    settings.scan = normalizeScanConfig(
+      settings.scan,
+      settings.cloud.targetMode
+    )
 
     return settings
   }

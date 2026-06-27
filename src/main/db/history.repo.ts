@@ -57,18 +57,57 @@ export class HistoryRepo {
     return { items: rows.map(rowToHistory), total }
   }
 
-  clear(before?: string): void {
+  clear(before?: string, provider?: CloudProvider): void {
     const db = getDb()
-    if (before) {
-      db.prepare("DELETE FROM tasks WHERE status IN ('completed', 'failed') AND completed_at < ?").run(before)
-    } else {
-      db.prepare("DELETE FROM tasks WHERE status IN ('completed', 'failed')").run()
-    }
+    const transaction = db.transaction(() => {
+      if (provider) {
+        const params: unknown[] = [provider]
+        let beforeCondition = ''
+        if (before) {
+          beforeCondition = ' AND completed_at < ?'
+          params.push(before)
+        }
+        db.prepare(
+          `DELETE FROM task_destinations
+           WHERE provider = ?
+             AND status IN ('completed', 'failed')
+             AND completed_at IS NOT NULL${beforeCondition}`
+        ).run(...params)
+        db.prepare(
+          `DELETE FROM tasks
+           WHERE NOT EXISTS (
+             SELECT 1 FROM task_destinations td WHERE td.task_id = tasks.id
+           )`
+        ).run()
+      } else if (before) {
+        db.prepare("DELETE FROM tasks WHERE status IN ('completed', 'failed') AND completed_at < ?").run(before)
+      } else {
+        db.prepare("DELETE FROM tasks WHERE status IN ('completed', 'failed')").run()
+      }
+    })
+    transaction()
   }
 
-  deleteById(id: string): void {
+  deleteById(id: string, provider?: CloudProvider): void {
     const db = getDb()
-    db.prepare("DELETE FROM tasks WHERE id = ? AND status IN ('completed', 'failed')").run(id)
+    const transaction = db.transaction(() => {
+      if (provider) {
+        db.prepare(
+          `DELETE FROM task_destinations
+           WHERE task_id = ? AND provider = ? AND status IN ('completed', 'failed')`
+        ).run(id, provider)
+        db.prepare(
+          `DELETE FROM tasks
+           WHERE id = ?
+             AND NOT EXISTS (
+               SELECT 1 FROM task_destinations td WHERE td.task_id = tasks.id
+             )`
+        ).run(id)
+      } else {
+        db.prepare("DELETE FROM tasks WHERE id = ? AND status IN ('completed', 'failed')").run(id)
+      }
+    })
+    transaction()
   }
 }
 

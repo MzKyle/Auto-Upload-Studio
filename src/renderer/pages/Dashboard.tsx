@@ -24,6 +24,7 @@ import {
   fetchDayFolders,
   ignoreDayFolder,
   restoreDayFolder,
+  fetchSettings,
 } from "@/lib/ipc-client";
 import { IPC } from "@shared/ipc-channels";
 import type {
@@ -43,18 +44,29 @@ export default function Dashboard() {
   const [dataCollects, setDataCollects] = useState<DataCollectInfo[]>([]);
   const [dayFolders, setDayFolders] = useState<DayFolderSummary[]>([]);
   const [provider, setProvider] = useState<CloudProvider>("aliyun");
+  const [providerReady, setProviderReady] = useState(false);
 
   useTaskProgress();
 
   useEffect(() => {
+    fetchSettings()
+      .then((settings) => {
+        setProvider(settings.cloud.targetMode === "tencent" ? "tencent" : "aliyun");
+      })
+      .catch(() => {})
+      .finally(() => setProviderReady(true));
+  }, []);
+
+  useEffect(() => {
+    if (!providerReady) return;
     loadTasks();
     fetchDataCollectList()
       .then(setDataCollects)
       .catch(() => {});
-    fetchDayFolders({ limit: 30 })
+    fetchDayFolders({ limit: 30, provider })
       .then(setDayFolders)
       .catch(() => {});
-  }, [loadTasks]);
+  }, [loadTasks, provider, providerReady]);
 
   // 监听新的数采结果
   useEffect(() => {
@@ -77,18 +89,14 @@ export default function Dashboard() {
   useEffect(() => {
     const off = window.api.on(
       IPC.DAY_FOLDER_EVENT,
-      (_event: unknown, data: unknown) => {
-        const summary = data as DayFolderSummary;
-        setDayFolders((prev) => {
-          const next = [summary, ...prev.filter((item) => item.id !== summary.id)];
-          return next
-            .sort((a, b) => b.date.localeCompare(a.date))
-            .slice(0, 30);
-        });
+      () => {
+        fetchDayFolders({ limit: 30, provider })
+          .then(setDayFolders)
+          .catch(() => {});
       }
     );
     return () => off();
-  }, []);
+  }, [provider]);
 
   const handleAddFolder = useCallback(async () => {
     const folder = await selectFolder();
@@ -102,16 +110,16 @@ export default function Dashboard() {
     await triggerScan();
     await Promise.all([
       loadTasks(),
-      fetchDayFolders({ limit: 30 }).then(setDayFolders),
+      fetchDayFolders({ limit: 30, provider }).then(setDayFolders),
     ]);
-  }, [loadTasks]);
+  }, [loadTasks, provider]);
 
   const handleRefresh = useCallback(async () => {
     await Promise.all([
       loadTasks(),
-      fetchDayFolders({ limit: 30 }).then(setDayFolders),
+      fetchDayFolders({ limit: 30, provider }).then(setDayFolders),
     ]);
-  }, [loadTasks]);
+  }, [loadTasks, provider]);
 
   const handlePause = useCallback(async (taskId: string) => {
     try {
@@ -155,17 +163,17 @@ export default function Dashboard() {
     await ignoreDayFolder(id);
     await Promise.all([
       loadTasks(),
-      fetchDayFolders({ limit: 30 }).then(setDayFolders),
+      fetchDayFolders({ limit: 30, provider }).then(setDayFolders),
     ]);
-  }, [loadTasks]);
+  }, [loadTasks, provider]);
 
   const handleRestoreDay = useCallback(async (id: string) => {
     await restoreDayFolder(id);
     await Promise.all([
       loadTasks(),
-      fetchDayFolders({ limit: 30 }).then(setDayFolders),
+      fetchDayFolders({ limit: 30, provider }).then(setDayFolders),
     ]);
-  }, [loadTasks]);
+  }, [loadTasks, provider]);
 
   const handleRetry = useCallback(async (
     taskId: string,

@@ -54,8 +54,8 @@ export async function fetchDayFolders(query?: DayFolderListQuery): Promise<DayFo
   return (await api.invoke(IPC.DAY_FOLDER_LIST, query)) as DayFolderSummary[]
 }
 
-export async function deleteDayFolderHistory(id: string): Promise<void> {
-  await api.invoke(IPC.DAY_FOLDER_DELETE, { id })
+export async function deleteDayFolderHistory(id: string, provider?: CloudProvider): Promise<void> {
+  await api.invoke(IPC.DAY_FOLDER_DELETE, { id, provider })
 }
 
 export async function ignoreDayFolder(id: string): Promise<DayFolderSummary> {
@@ -151,12 +151,12 @@ export async function fetchHistory(query: HistoryQuery): Promise<HistoryResult> 
   return (await api.invoke(IPC.HISTORY_LIST, query)) as HistoryResult
 }
 
-export async function clearHistory(before?: string): Promise<void> {
-  await api.invoke(IPC.HISTORY_CLEAR, before ? { before } : undefined)
+export async function clearHistory(before?: string, provider?: CloudProvider): Promise<void> {
+  await api.invoke(IPC.HISTORY_CLEAR, before || provider ? { before, provider } : undefined)
 }
 
-export async function deleteHistoryItem(id: string): Promise<void> {
-  await api.invoke(IPC.HISTORY_DELETE, { id })
+export async function deleteHistoryItem(id: string, provider?: CloudProvider): Promise<void> {
+  await api.invoke(IPC.HISTORY_DELETE, { id, provider })
 }
 
 // ---- 对话框 ----

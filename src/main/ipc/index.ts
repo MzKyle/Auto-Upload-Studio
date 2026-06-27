@@ -16,7 +16,7 @@ import { getDb } from '../db/database'
 import { getDataCollectService } from '../services/data-collect.service'
 import { getTaskDestinationRepo } from '../db/task-destination.repo'
 import { v4 as uuid } from 'uuid'
-import type { AppSettings, CloudProvider, HistoryQuery, TaskStatus, SSHMachine, SSHMachineInput, RsyncProgress, TransferMode, DiskUsageInfo, ScanConfig, DayFolderListQuery } from '@shared/types'
+import type { AppSettings, CloudProvider, HistoryQuery, TaskStatus, SSHMachine, SSHMachineInput, RsyncProgress, TransferMode, DiskUsageInfo, DayFolderListQuery } from '@shared/types'
 import { getUploadTargetSnapshot } from '@shared/cloud-upload'
 import { resolveDirectoryUploadRelativePath } from '@shared/day-folder'
 import { basename, normalize, join } from 'path'
@@ -157,8 +157,8 @@ export function registerAllIpc(): void {
     return getDayFolderRepo().list(query)
   })
 
-  ipcMain.handle(IPC.DAY_FOLDER_DELETE, (_event, args: { id: string }) => {
-    getDayFolderRepo().deleteCompleted(args.id)
+  ipcMain.handle(IPC.DAY_FOLDER_DELETE, (_event, args: { id: string; provider?: CloudProvider }) => {
+    getDayFolderRepo().deleteCompleted(args.id, args.provider)
   })
 
   ipcMain.handle(IPC.DAY_FOLDER_IGNORE, (_event, args: { id: string }) => {
@@ -325,13 +325,13 @@ export function registerAllIpc(): void {
     return getHistoryRepo().list(query)
   })
 
-  ipcMain.handle(IPC.HISTORY_CLEAR, (_event, args?: { before?: string }) => {
-    getHistoryRepo().clear(args?.before)
-    getDayFolderRepo().clearCompleted(args?.before)
+  ipcMain.handle(IPC.HISTORY_CLEAR, (_event, args?: { before?: string; provider?: CloudProvider }) => {
+    getHistoryRepo().clear(args?.before, args?.provider)
+    getDayFolderRepo().clearCompleted(args?.before, args?.provider)
   })
 
-  ipcMain.handle(IPC.HISTORY_DELETE, (_event, args: { id: string }) => {
-    getHistoryRepo().deleteById(args.id)
+  ipcMain.handle(IPC.HISTORY_DELETE, (_event, args: { id: string; provider?: CloudProvider }) => {
+    getHistoryRepo().deleteById(args.id, args.provider)
   })
 
   // ---- 对话框 ----
@@ -405,7 +405,7 @@ export function registerAllIpc(): void {
   // ---- 磁盘用量 ----
   ipcMain.handle(IPC.DISK_USAGE, async () => {
     const settingsRepo = getSettingsRepo()
-    const scanConfig = settingsRepo.get<ScanConfig>('scan')
+    const scanConfig = settingsRepo.getAll().scan
     const db = getDb()
 
     // 收集所有需要检查的路径

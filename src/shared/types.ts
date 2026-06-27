@@ -157,6 +157,7 @@ export interface DayFolderListQuery {
   status?: DayFolderStatus
   includeCompleted?: boolean
   limit?: number
+  provider?: CloudProvider
 }
 
 // ---- SSH 机器 ----
@@ -240,6 +241,7 @@ export interface WebhookConfig {
 
 export interface ScanConfig {
   directories: string[]
+  providerDirectories: Record<CloudProvider, string[]>
   intervalSeconds: number
   workDirNamePattern?: string
 }
@@ -293,6 +295,7 @@ export interface ScannerStatus {
   lastScanAt: string | null
   nextScanAt: string | null
   watchedDirectories: string[]
+  watchedDirectoriesByProvider: Record<CloudProvider, string[]>
   pendingStabilityChecks: Array<{
     path: string
     checks: number

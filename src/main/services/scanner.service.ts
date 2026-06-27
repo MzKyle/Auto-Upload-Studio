@@ -6,7 +6,15 @@ import { BrowserWindow } from 'electron'
 import log from 'electron-log'
 import { IPC } from '@shared/ipc-channels'
 import { buildUploadRelativePath } from '@shared/day-folder'
-import { getUploadTargetSnapshot } from '@shared/cloud-upload'
+import {
+  getUploadTargetSnapshot,
+  getUploadTargetSnapshotForProviders
+} from '@shared/cloud-upload'
+import {
+  getActiveScanRoots,
+  getWatchedDirectoriesByProvider,
+  type ActiveScanRoot
+} from '@shared/scan-config'
 import { getTaskRepo } from '../db/task.repo'
 import { getTaskDestinationRepo } from '../db/task-destination.repo'
 import { getDayFolderRepo } from '../db/day-folder.repo'
@@ -24,7 +32,6 @@ import {
 } from '../utils/marker-file'
 import type {
   TmpUploadMarker,
-  ScanConfig,
   StabilityConfig,
   ScannerStatus,
   DataCollectConfig,
@@ -82,9 +89,13 @@ export class ScannerService {
     this.running = true
 
     const settings = getSettingsRepo()
-    const scanConfig = settings.get<ScanConfig>('scan')
-    const directories = scanConfig?.directories || []
-    const intervalMs = (scanConfig?.intervalSeconds || 30) * 1000
+    const allSettings = settings.getAll()
+    const activeRoots = getActiveScanRoots(
+      allSettings.scan,
+      allSettings.cloud.targetMode
+    )
+    const directories = activeRoots.map((root) => root.directory)
+    const intervalMs = (allSettings.scan.intervalSeconds || 30) * 1000
 
     this.startWatcher(directories)
     this.timer = setInterval(() => this.scheduleFullScan(), intervalMs)
@@ -129,9 +140,18 @@ export class ScannerService {
 
   getStatus(): ScannerStatus {
     const settings = getSettingsRepo()
-    const scanConfig = settings.get<ScanConfig>('scan')
+    const allSettings = settings.getAll()
+    const scanConfig = allSettings.scan
     const stabilityConfig = settings.get<StabilityConfig>('stability')
     const requiredChecks = stabilityConfig?.checkCount || 3
+    const activeRoots = getActiveScanRoots(
+      scanConfig,
+      allSettings.cloud.targetMode
+    )
+    const watchedDirectoriesByProvider = getWatchedDirectoriesByProvider(
+      scanConfig,
+      allSettings.cloud.targetMode
+    )
 
     const pendingStabilityChecks: ScannerStatus['pendingStabilityChecks'] = []
     for (const pending of this.pendingDirs.values()) {
@@ -147,7 +167,8 @@ export class ScannerService {
       running: this.running,
       lastScanAt: this.lastScanAt,
       nextScanAt: this.nextScanAt,
-      watchedDirectories: scanConfig?.directories || [],
+      watchedDirectories: activeRoots.map((root) => root.directory),
+      watchedDirectoriesByProvider,
       pendingStabilityChecks,
       lastScanResults: this.lastScanResults
     }
@@ -166,8 +187,13 @@ export class ScannerService {
 
     this.scanInProgress = true
     const settings = getSettingsRepo()
-    const scanConfig = settings.get<ScanConfig>('scan')
-    const directories = scanConfig?.directories || []
+    const allSettings = settings.getAll()
+    const scanConfig = allSettings.scan
+    const activeRoots = getActiveScanRoots(
+      scanConfig,
+      allSettings.cloud.targetMode
+    )
+    const directories = activeRoots.map((root) => root.directory)
     const intervalMs = (scanConfig?.intervalSeconds || 30) * 1000
     const today = this.formatLocalDate(new Date())
     const seenChildPaths = new Set<string>()
@@ -179,13 +205,13 @@ export class ScannerService {
     let skippedChildren = 0
 
     try {
-      for (const rootDir of directories) {
-        if (!(await this.pathExists(rootDir))) {
-          log.warn('扫描根目录不存在:', rootDir)
+      for (const root of activeRoots) {
+        if (!(await this.pathExists(root.directory))) {
+          log.warn('扫描根目录不存在:', root.directory)
           continue
         }
         const result = await this.scanRootDirectory(
-          rootDir,
+          root,
           today,
           scanConfig?.workDirNamePattern,
           seenChildPaths
@@ -227,7 +253,7 @@ export class ScannerService {
   }
 
   private async scanRootDirectory(
-    rootDir: string,
+    root: ActiveScanRoot,
     today: string,
     workDirNamePattern: string | undefined,
     seenChildPaths: Set<string>
@@ -240,7 +266,7 @@ export class ScannerService {
 
     try {
       const dayDirectory = await discoverCurrentDayDirectory(
-        rootDir,
+        root.directory,
         today,
         workDirNamePattern
       )
@@ -250,7 +276,8 @@ export class ScannerService {
           dayDirectory.dateName,
           dayDirectory.childFolderNames,
           dayDirectory.ignoredChildFolderNames,
-          seenChildPaths
+          seenChildPaths,
+          root.providers
         )
         scanned += result.scanned
         newFound += result.newFound
@@ -259,7 +286,7 @@ export class ScannerService {
         skipped += result.skipped
       }
     } catch (err) {
-      log.error('扫描数据根目录失败:', rootDir, err)
+      log.error('扫描数据根目录失败:', root.directory, err)
     }
 
     return { scanned, newFound, existing, ignored, skipped }
@@ -270,7 +297,8 @@ export class ScannerService {
     dateName: string,
     discoveredChildNames: string[],
     ignoredChildNames: string[],
-    seenChildPaths: Set<string>
+    seenChildPaths: Set<string>,
+    providers: CloudProvider[]
   ): Promise<{ scanned: number; newFound: number; existing: number; ignored: number; skipped: number }> {
     const dayFolder = getDayFolderRepo().ensure(dayFolderPath, dateName)
     const childNames = Array.from(
@@ -316,7 +344,8 @@ export class ScannerService {
             childPath,
             childName,
             dayFolder.id,
-            uploadRelativePath
+            uploadRelativePath,
+            providers
           )
           this.broadcastTaskStatus(task.id, task.status, 'skipped')
           ignored++
@@ -372,7 +401,8 @@ export class ScannerService {
             uploadRelativePath,
             checks: 0,
             discoveredAt: new Date().toISOString(),
-            lastSnapshot: new Map()
+            lastSnapshot: new Map(),
+            ...this.pendingTargetSnapshot(providers)
           }
           const task = this.registerNewDir(pending)
           if (dayFolder.ignored) {
@@ -461,13 +491,20 @@ export class ScannerService {
     dirPath: string,
     folderName: string,
     dayFolderId: string,
-    uploadRelativePath: string
+    uploadRelativePath: string,
+    providers?: CloudProvider[]
   ): Task {
     const task = this.ensureTaskRegistered(
       dirPath,
       folderName,
       dayFolderId,
-      uploadRelativePath
+      uploadRelativePath,
+      providers
+        ? getUploadTargetSnapshotForProviders(
+            providers,
+            getSettingsRepo().getAll()
+          )
+        : undefined
     )
     if (task.status !== 'skipped' || task.errorMessage !== NON_WORK_DIR_REASON) {
       getTaskRepo().skip(task.id, NON_WORK_DIR_REASON)
@@ -789,6 +826,20 @@ export class ScannerService {
       uploadRelativePath,
       sourceType: 'local'
     })
+  }
+
+  private pendingTargetSnapshot(providers: CloudProvider[]): {
+    uploadTargetMode: UploadTargetMode
+    destinationPrefixes: Record<CloudProvider, string>
+  } {
+    const snapshot = getUploadTargetSnapshotForProviders(
+      providers,
+      getSettingsRepo().getAll()
+    )
+    return {
+      uploadTargetMode: snapshot.mode,
+      destinationPrefixes: snapshot.prefixes
+    }
   }
 
   private attachTaskToDayFolder(

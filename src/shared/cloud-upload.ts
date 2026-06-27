@@ -21,8 +21,21 @@ export function getUploadTargetSnapshot(settings: AppSettings): {
   mode: UploadTargetMode
   prefixes: Record<CloudProvider, string>
 } {
+  return getUploadTargetSnapshotForProviders(
+    providersForMode(settings.cloud.targetMode),
+    settings
+  )
+}
+
+export function getUploadTargetSnapshotForProviders(
+  providers: CloudProvider[],
+  settings: AppSettings
+): {
+  mode: UploadTargetMode
+  prefixes: Record<CloudProvider, string>
+} {
   return {
-    mode: settings.cloud.targetMode,
+    mode: modeForProviders(providers),
     prefixes: {
       aliyun: settings.oss.prefix || '',
       tencent: settings.tencentS3.prefix || ''
