@@ -1,12 +1,14 @@
-import { useEffect, useState, useCallback } from "react";
+import { useEffect, useState, useCallback, useMemo } from "react";
 import { TestTube, Plus, X, FolderOpen } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
+import { PathTree } from "@/components/PathTree";
 import { useSettingsStore } from "@/stores/settings.store";
 import { testOSS, testTencentS3, selectFolder } from "@/lib/ipc-client";
+import { buildPathTreeFromPaths } from "@/lib/path-tree";
 import { showToast } from "@/components/ui/toast";
 import type { AppSettings } from "@shared/types";
 
@@ -26,6 +28,10 @@ export default function Settings() {
   >("idle");
   const [lastSavedAt, setLastSavedAt] = useState<string | null>(null);
   const [suffixInput, setSuffixInput] = useState("");
+  const scanDirectoryTree = useMemo(
+    () => buildPathTreeFromPaths(local.scan.directories),
+    [local.scan.directories],
+  );
 
   useEffect(() => {
     loadSettings();
@@ -146,22 +152,34 @@ export default function Settings() {
         </CardHeader>
         <CardContent className="space-y-4">
           <div>
-            <Label>数据根目录</Label>
+            <Label>数据根目录 ({local.scan.directories.length})</Label>
             <p className="text-xs text-muted-foreground mt-1">
               根目录下仅自动扫描当天 YYYY-MM-DD 日期目录；旧日期需要手动添加具体工作次目录
             </p>
-            <div className="flex flex-wrap gap-2 mt-2">
-              {local.scan.directories.map((dir) => (
-                <Badge key={dir} variant="secondary" className="gap-1 pr-1">
-                  {dir}
-                  <button
-                    onClick={() => handleRemoveScanDir(dir)}
-                    className="ml-1 hover:text-destructive"
-                  >
-                    <X className="h-3 w-3" />
-                  </button>
-                </Badge>
-              ))}
+            <div className="mt-2 space-y-2">
+              <PathTree
+                nodes={scanDirectoryTree}
+                className="rounded-md border bg-muted/20 p-1"
+                rowClassName="text-xs"
+                renderActions={({ node }) => {
+                  const originalPath = node.items[0]?.originalPath;
+                  if (!originalPath) return null;
+
+                  return (
+                    <button
+                      type="button"
+                      title={`删除 ${originalPath}`}
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        handleRemoveScanDir(originalPath);
+                      }}
+                      className="flex h-6 w-6 items-center justify-center rounded-sm text-muted-foreground hover:bg-background hover:text-destructive"
+                    >
+                      <X className="h-3.5 w-3.5" />
+                    </button>
+                  );
+                }}
+              />
               <Button variant="outline" size="sm" onClick={handleAddScanDir}>
                 <Plus className="h-3 w-3 mr-1" />
                 添加目录

@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useMemo } from "react";
 import {
   Radar,
   ChevronDown,
@@ -11,7 +11,9 @@ import {
 import { Card, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Progress } from "@/components/ui/progress";
+import { PathTree } from "@/components/PathTree";
 import { getScannerStatus } from "@/lib/ipc-client";
+import { buildPathTreeFromPaths } from "@/lib/path-tree";
 import type { ScannerStatus } from "@shared/types";
 import { IPC } from "@shared/ipc-channels";
 
@@ -19,6 +21,10 @@ export function ScanSchedulePanel() {
   const [status, setStatus] = useState<ScannerStatus | null>(null);
   const [collapsed, setCollapsed] = useState(false);
   const [countdown, setCountdown] = useState("");
+  const watchedDirectoryTree = useMemo(
+    () => buildPathTreeFromPaths(status?.watchedDirectories ?? []),
+    [status?.watchedDirectories],
+  );
 
   const loadStatus = useCallback(async () => {
     const s = await getScannerStatus();
@@ -142,15 +148,13 @@ export function ScanSchedulePanel() {
             {status.watchedDirectories.length > 0 && (
               <div>
                 <div className="text-xs font-medium text-muted-foreground mb-1">
-                  监控目录
+                  监控目录 ({status.watchedDirectories.length})
                 </div>
-                <div className="flex flex-wrap gap-1">
-                  {status.watchedDirectories.map((dir) => (
-                    <Badge key={dir} variant="outline" className="text-xs">
-                      {dir}
-                    </Badge>
-                  ))}
-                </div>
+                <PathTree
+                  nodes={watchedDirectoryTree}
+                  className="rounded-md border bg-muted/20 p-1"
+                  rowClassName="text-xs"
+                />
               </div>
             )}
 

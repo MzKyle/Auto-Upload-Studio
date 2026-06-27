@@ -1,4 +1,4 @@
-import { useEffect, useCallback, useState } from "react";
+import { useEffect, useCallback, useMemo, useState } from "react";
 import { FolderPlus, RefreshCw, PlayCircle } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { TaskCard } from "@/components/TaskCard";
@@ -6,9 +6,11 @@ import { DataCollectCard } from "@/components/DataCollectCard";
 import { ScanSchedulePanel } from "@/components/ScanSchedulePanel";
 import { DiskUsagePanel } from "@/components/DiskUsagePanel";
 import { DayFolderCard } from "@/components/DayFolderCard";
+import { PathTree } from "@/components/PathTree";
 import { useTaskStore } from "@/stores/task.store";
 import { useTaskProgress } from "@/hooks/useTaskProgress";
 import { showToast } from "@/components/ui/toast";
+import { buildPathTree } from "@/lib/path-tree";
 import {
   selectFolder,
   addFolder as addFolderApi,
@@ -28,8 +30,13 @@ import type {
   CloudProvider,
   DataCollectInfo,
   DayFolderSummary,
+  Task,
 } from "@shared/types";
 import { progressKey } from "@shared/cloud-upload";
+
+type DashboardTreeItem =
+  | { kind: "dayFolder"; dayFolder: DayFolderSummary }
+  | { kind: "task"; task: Task };
 
 export default function Dashboard() {
   const { tasks, progress, loading, loadTasks } = useTaskStore();
@@ -172,10 +179,56 @@ export default function Dashboard() {
     }
   }, []);
 
-  const providerTasks = tasks.filter((task) =>
-    task.destinations.some((destination) => destination.provider === provider)
+  const providerTasks = useMemo(
+    () =>
+      tasks.filter((task) =>
+        task.destinations.some((destination) => destination.provider === provider),
+      ),
+    [tasks, provider],
   );
-  const independentTasks = providerTasks.filter((task) => !task.dayFolderId);
+  const independentTasks = useMemo(
+    () => providerTasks.filter((task) => !task.dayFolderId),
+    [providerTasks],
+  );
+  const tasksByDayFolderId = useMemo(() => {
+    const grouped = new Map<string, Task[]>();
+    for (const task of providerTasks) {
+      if (!task.dayFolderId) continue;
+      const current = grouped.get(task.dayFolderId) ?? [];
+      current.push(task);
+      grouped.set(task.dayFolderId, current);
+    }
+    return grouped;
+  }, [providerTasks]);
+  const speedByDayFolderId = useMemo(() => {
+    const grouped = new Map<string, number>();
+    for (const task of providerTasks) {
+      if (!task.dayFolderId) continue;
+      const current = grouped.get(task.dayFolderId) ?? 0;
+      grouped.set(
+        task.dayFolderId,
+        current + (progress[progressKey(task.id, provider)]?.speed || 0),
+      );
+    }
+    return grouped;
+  }, [providerTasks, progress, provider]);
+  const taskDirectoryTree = useMemo(
+    () =>
+      buildPathTree<DashboardTreeItem>([
+        ...dayFolders.map((dayFolder) => ({
+          id: `day:${dayFolder.id}`,
+          path: dayFolder.folderPath,
+          value: { kind: "dayFolder" as const, dayFolder },
+        })),
+        ...providerTasks.map((task) => ({
+          id: `task:${task.id}`,
+          path: task.folderPath,
+          value: { kind: "task" as const, task },
+        })),
+      ]),
+    [dayFolders, providerTasks],
+  );
+  const hasTaskDirectories = taskDirectoryTree.length > 0;
 
   return (
     <div className="p-6 space-y-6">
@@ -221,36 +274,56 @@ export default function Dashboard() {
       {/* 磁盘用量 */}
       <DiskUsagePanel />
 
-      {dayFolders.length > 0 && (
+      {hasTaskDirectories && (
         <section>
           <h2 className="text-sm font-semibold text-muted-foreground mb-3">
-            日期与工作次 ({dayFolders.length})
+            任务目录 ({dayFolders.length} 日期 / {providerTasks.length} 任务)
           </h2>
-          {dayFolders.map((dayFolder) => {
-            const childTasks = providerTasks.filter(
-              (task) => task.dayFolderId === dayFolder.id,
-            );
-            const daySpeed = childTasks.reduce(
-              (sum, task) =>
-                sum + (progress[progressKey(task.id, provider)]?.speed || 0),
-              0,
-            );
-            return (
-              <div key={dayFolder.id} className="mb-5">
-                <DayFolderCard
-                  dayFolder={dayFolder}
-                  tasks={childTasks}
-                  speed={daySpeed}
-                  onIgnore={handleIgnoreDay}
-                  onRestore={handleRestoreDay}
-                />
-                <div className="ml-5 border-l pl-4">
-                  {childTasks.length === 0 ? (
-                    <div className="text-xs text-muted-foreground py-2">
-                      尚未发现工作次
-                    </div>
-                  ) : (
-                    childTasks.map((task) => (
+          <PathTree
+            nodes={taskDirectoryTree}
+            className="rounded-md border bg-muted/10 p-2"
+            renderNodeBody={({ node }) => {
+              const dayItems = node.items.filter(
+                (item) => item.value.kind === "dayFolder",
+              );
+              const taskItems = node.items.filter(
+                (item) => item.value.kind === "task",
+              );
+
+              if (dayItems.length === 0 && taskItems.length === 0) {
+                return null;
+              }
+
+              return (
+                <div className="space-y-3">
+                  {dayItems.map((item) => {
+                    if (item.value.kind !== "dayFolder") return null;
+                    const dayFolder = item.value.dayFolder;
+                    const childTasks = tasksByDayFolderId.get(dayFolder.id) ?? [];
+
+                    return (
+                      <div key={dayFolder.id}>
+                        <DayFolderCard
+                          dayFolder={dayFolder}
+                          tasks={childTasks}
+                          speed={speedByDayFolderId.get(dayFolder.id) ?? 0}
+                          onIgnore={handleIgnoreDay}
+                          onRestore={handleRestoreDay}
+                        />
+                        {childTasks.length === 0 && (
+                          <div className="ml-5 border-l pl-4 text-xs text-muted-foreground py-2">
+                            尚未发现工作次
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
+
+                  {taskItems.map((item) => {
+                    if (item.value.kind !== "task") return null;
+                    const task = item.value.task;
+
+                    return (
                       <TaskCard
                         key={task.id}
                         task={task}
@@ -262,12 +335,17 @@ export default function Dashboard() {
                         onRetry={handleRetry}
                         onRestore={handleRestore}
                       />
-                    ))
-                  )}
+                    );
+                  })}
                 </div>
-              </div>
-            );
-          })}
+              );
+            }}
+          />
+          {independentTasks.length > 0 && (
+            <div className="text-xs text-muted-foreground mt-2">
+              独立任务 {independentTasks.length} 个
+            </div>
+          )}
         </section>
       )}
 
@@ -288,26 +366,6 @@ export default function Dashboard() {
         </section>
       )}
 
-      {independentTasks.length > 0 && (
-        <section>
-          <h2 className="text-sm font-semibold text-muted-foreground mb-3">
-            独立任务
-          </h2>
-          {independentTasks.map((task) => (
-            <TaskCard
-              key={task.id}
-              task={task}
-              provider={provider}
-              progress={progress[progressKey(task.id, provider)]}
-              onPause={handlePause}
-              onResume={handleResume}
-              onCancel={handleCancel}
-              onRetry={handleRetry}
-              onRestore={handleRestore}
-            />
-          ))}
-        </section>
-      )}
     </div>
   );
 }
