@@ -102,6 +102,7 @@ export function runMigrations(db: Database.Database): void {
       provider TEXT NOT NULL,
       status TEXT NOT NULL DEFAULT 'pending',
       prefix TEXT NOT NULL DEFAULT '',
+      upload_relative_path TEXT NOT NULL DEFAULT '',
       total_files INTEGER NOT NULL DEFAULT 0,
       uploaded_files INTEGER NOT NULL DEFAULT 0,
       total_bytes INTEGER NOT NULL DEFAULT 0,
@@ -179,6 +180,15 @@ export function runMigrations(db: Database.Database): void {
   }
   db.exec(`CREATE INDEX IF NOT EXISTS idx_tasks_day_folder_id ON tasks(day_folder_id)`)
 
+  const taskDestinationColumns = db.pragma('table_info(task_destinations)') as Array<{ name: string }>
+  const addedDestinationUploadPath = !taskDestinationColumns.some(
+    (c) => c.name === 'upload_relative_path'
+  )
+  if (addedDestinationUploadPath) {
+    db.exec(`ALTER TABLE task_destinations ADD COLUMN upload_relative_path TEXT NOT NULL DEFAULT ''`)
+    log.info('迁移: task_destinations 表添加 upload_relative_path 列')
+  }
+
   const dayFolderColumns = db.pragma('table_info(day_folders)') as Array<{ name: string }>
   if (!dayFolderColumns.some((c) => c.name === 'ignored')) {
     db.exec(`ALTER TABLE day_folders ADD COLUMN ignored INTEGER NOT NULL DEFAULT 0`)
@@ -254,14 +264,27 @@ export function runMigrations(db: Database.Database): void {
     log.info(`日期层路径迁移完成: ${migratedDatePaths} 个未完成任务`)
   }
 
+  if (addedDestinationUploadPath) {
+    db.exec(`
+      UPDATE task_destinations
+      SET upload_relative_path = COALESCE((
+        SELECT upload_relative_path
+        FROM tasks
+        WHERE tasks.id = task_destinations.task_id
+      ), '')
+    `)
+    log.info('迁移: 已回填任务目标上传相对路径')
+  }
+
   const migratedDestinations = db.prepare(
     `INSERT OR IGNORE INTO task_destinations (
       id, task_id, provider, status, prefix, total_files, uploaded_files,
-      total_bytes, uploaded_bytes, error_message, created_at, updated_at, completed_at
+      total_bytes, uploaded_bytes, error_message, created_at, updated_at,
+      completed_at, upload_relative_path
     )
     SELECT lower(hex(randomblob(16))), id, 'aliyun', status, COALESCE(oss_prefix, ''),
       total_files, uploaded_files, total_bytes, uploaded_bytes, error_message,
-      created_at, updated_at, completed_at
+      created_at, updated_at, completed_at, COALESCE(upload_relative_path, '')
     FROM tasks t
     WHERE NOT EXISTS (
       SELECT 1 FROM task_destinations existing WHERE existing.task_id = t.id

@@ -31,6 +31,8 @@ export const DEFAULT_SETTINGS = {
     bucket: '',
     region: '',
     prefix: '',
+    pathMode: 'target-root' as const,
+    pathSegmentCount: 2,
     accessKeyId: '',
     accessKeySecret: ''
   },
@@ -39,6 +41,8 @@ export const DEFAULT_SETTINGS = {
     bucket: '',
     region: '',
     prefix: '',
+    pathMode: 'target-root' as const,
+    pathSegmentCount: 2,
     accessKeyId: '',
     accessKeySecret: '',
     allowInsecureTls: false

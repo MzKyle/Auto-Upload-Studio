@@ -18,8 +18,7 @@ import { getTaskDestinationRepo } from '../db/task-destination.repo'
 import { v4 as uuid } from 'uuid'
 import type { AppSettings, CloudProvider, HistoryQuery, TaskStatus, SSHMachine, SSHMachineInput, RsyncProgress, TransferMode, DiskUsageInfo, DayFolderListQuery } from '@shared/types'
 import { getUploadTargetSnapshot } from '@shared/cloud-upload'
-import { resolveDirectoryUploadRelativePath } from '@shared/day-folder'
-import { basename, normalize, join } from 'path'
+import { basename, normalize } from 'path'
 import { existsSync } from 'fs'
 import { statfs } from 'fs/promises'
 import log from 'electron-log'
@@ -74,16 +73,18 @@ export function registerAllIpc(): void {
   ipcMain.handle(IPC.TASK_ADD_FOLDER, (_event, args: { folderPath: string }) => {
     const taskRepo = getTaskRepo()
     const settingsRepo = getSettingsRepo()
-    const snapshot = getUploadTargetSnapshot(settingsRepo.getAll())
+    const snapshot = getUploadTargetSnapshot(settingsRepo.getAll(), {
+      sourcePath: args.folderPath
+    })
     const folderName = basename(args.folderPath)
-    const uploadRelativePath = resolveDirectoryUploadRelativePath(args.folderPath)
     const task = taskRepo.create({
       folderPath: args.folderPath,
       folderName,
       ossPrefix: snapshot.prefixes.aliyun,
       uploadTargetMode: snapshot.mode,
       destinationPrefixes: snapshot.prefixes,
-      uploadRelativePath,
+      destinationUploadRelativePaths: snapshot.uploadRelativePaths,
+      uploadRelativePath: snapshot.uploadRelativePath,
       sourceType: 'manual'
     })
     getScannerService().queueReconcileTask(task)
@@ -273,13 +274,16 @@ export function registerAllIpc(): void {
       // rsync 完成后自动注册本地目录为上传任务
       const taskRepo = getTaskRepo()
       const settingsRepo = getSettingsRepo()
-      const snapshot = getUploadTargetSnapshot(settingsRepo.getAll())
       const localDir = normalize(machine.localDir).replace(/[\\/]+$/, '')
-      const uploadRelativePath = resolveDirectoryUploadRelativePath(
-        machine.remoteDir,
-        localDir
-      )
+      const snapshot = getUploadTargetSnapshot(settingsRepo.getAll(), {
+        sourcePath: machine.remoteDir,
+        fallbackDirectoryPath: localDir
+      })
       const existing = taskRepo.getByFolderPath(localDir)
+      let markerMode = snapshot.mode
+      let markerPrefixes = snapshot.prefixes
+      let markerUploadRelativePath = snapshot.uploadRelativePath
+      let markerUploadRelativePaths = snapshot.uploadRelativePaths
       if (!existing || existing.status === 'completed' || existing.status === 'failed') {
         const task = taskRepo.create({
           folderPath: localDir,
@@ -287,14 +291,31 @@ export function registerAllIpc(): void {
           ossPrefix: snapshot.prefixes.aliyun,
           uploadTargetMode: snapshot.mode,
           destinationPrefixes: snapshot.prefixes,
-          uploadRelativePath,
+          destinationUploadRelativePaths: snapshot.uploadRelativePaths,
+          uploadRelativePath: snapshot.uploadRelativePath,
           sourceType: 'rsync',
           sourceMachineId: machine.id
         })
         getScannerService().queueReconcileTask(task)
         log.info('rsync 完成, 自动创建上传任务:', localDir)
-      } else if (existing.uploadRelativePath !== uploadRelativePath) {
-        taskRepo.updateUploadRelativePath(existing.id, uploadRelativePath)
+      } else {
+        const current = taskRepo.getById(existing.id) || existing
+        markerMode = current.uploadTargetMode
+        markerPrefixes = {
+          aliyun:
+            current.destinations.find((item) => item.provider === 'aliyun')?.prefix ||
+            '',
+          tencent:
+            current.destinations.find((item) => item.provider === 'tencent')?.prefix ||
+            ''
+        }
+        markerUploadRelativePaths = Object.fromEntries(
+          current.destinations.map((destination) => [
+            destination.provider,
+            destination.uploadRelativePath
+          ])
+        ) as Partial<Record<CloudProvider, string>>
+        markerUploadRelativePath = current.uploadRelativePath
       }
 
       // 写入标记文件，防止 scanner 重复做稳定性检查
@@ -305,9 +326,10 @@ export function registerAllIpc(): void {
         metadata: {
           source: 'rsync',
           machineId: machine.id,
-          uploadRelativePath,
-          uploadTargetMode: snapshot.mode,
-          destinationPrefixes: snapshot.prefixes
+          uploadRelativePath: markerUploadRelativePath,
+          uploadTargetMode: markerMode,
+          destinationPrefixes: markerPrefixes,
+          destinationUploadRelativePaths: markerUploadRelativePaths
         }
       })
     } catch (err) {

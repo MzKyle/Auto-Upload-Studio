@@ -5,11 +5,13 @@ import { watch, type FSWatcher } from 'chokidar'
 import { BrowserWindow } from 'electron'
 import log from 'electron-log'
 import { IPC } from '@shared/ipc-channels'
-import { buildUploadRelativePath } from '@shared/day-folder'
 import {
   getUploadTargetSnapshot,
-  getUploadTargetSnapshotForProviders
+  getUploadTargetSnapshotForProviders,
+  providersForMode,
+  type UploadTargetSnapshot
 } from '@shared/cloud-upload'
+import type { UploadPathResolveContext } from '@shared/upload-path'
 import {
   getActiveScanRoots,
   getWatchedDirectoriesByProvider,
@@ -37,7 +39,8 @@ import type {
   DataCollectConfig,
   Task,
   UploadTargetMode,
-  CloudProvider
+  CloudProvider,
+  AppSettings
 } from '@shared/types'
 
 interface PendingDir {
@@ -51,6 +54,7 @@ interface PendingDir {
   lastSnapshot: Map<string, { size: number; mtimeMs: number }>
   uploadTargetMode?: UploadTargetMode
   destinationPrefixes?: Partial<Record<CloudProvider, string>>
+  destinationUploadRelativePaths?: Partial<Record<CloudProvider, string>>
 }
 
 const NON_WORK_DIR_REASON = '非工作次目录'
@@ -272,6 +276,7 @@ export class ScannerService {
       )
       if (dayDirectory) {
         const result = await this.scanDayDirectory(
+          root.directory,
           dayDirectory.folderPath,
           dayDirectory.dateName,
           dayDirectory.childFolderNames,
@@ -293,6 +298,7 @@ export class ScannerService {
   }
 
   private async scanDayDirectory(
+    sourceRootDir: string,
     dayFolderPath: string,
     dateName: string,
     discoveredChildNames: string[],
@@ -315,13 +321,20 @@ export class ScannerService {
       for (let index = 0; index < childNames.length; index++) {
         const childName = childNames[index]
         const childPath = join(dayFolderPath, childName)
-        const uploadRelativePath = buildUploadRelativePath(dateName, childName)
+        const pathContext: UploadPathResolveContext = {
+          sourcePath: childPath,
+          basePath: sourceRootDir,
+          dateName,
+          workDirName: childName
+        }
+        const targetSnapshot = this.pendingTargetSnapshot(providers, pathContext)
+        const uploadRelativePath = targetSnapshot.uploadRelativePath
         seenChildPaths.add(childPath)
         scanned++
 
         const existingTask = getTaskRepo().getByFolderPath(childPath)
         if (existingTask) {
-          this.attachTaskToDayFolder(existingTask, dayFolder.id, uploadRelativePath)
+          this.attachTaskToDayFolder(existingTask, dayFolder.id)
           this.pendingDirs.delete(childPath)
           if (
             dayFolder.ignored &&
@@ -345,7 +358,8 @@ export class ScannerService {
             childName,
             dayFolder.id,
             uploadRelativePath,
-            providers
+            providers,
+            targetSnapshot
           )
           this.broadcastTaskStatus(task.id, task.status, 'skipped')
           ignored++
@@ -369,17 +383,25 @@ export class ScannerService {
 
         const tmpMarker = readTmpUpload(childPath)
         if (tmpMarker) {
+          const markerUploadRelativePath =
+            tmpMarker.metadata.uploadRelativePath ?? uploadRelativePath
           const task = this.registerNewDir({
             path: childPath,
             dayFolderId: dayFolder.id,
             dateName,
             folderName: childName,
-            uploadRelativePath,
+            uploadRelativePath: markerUploadRelativePath,
             checks: 0,
             discoveredAt: tmpMarker.createdAt || new Date().toISOString(),
             lastSnapshot: new Map(),
             uploadTargetMode: tmpMarker.metadata.uploadTargetMode,
-            destinationPrefixes: tmpMarker.metadata.destinationPrefixes
+            destinationPrefixes: tmpMarker.metadata.destinationPrefixes,
+            destinationUploadRelativePaths:
+              tmpMarker.metadata.destinationUploadRelativePaths ||
+              this.legacyDestinationUploadRelativePaths(
+                tmpMarker.metadata.uploadTargetMode,
+                markerUploadRelativePath
+              )
           })
           if (dayFolder.ignored) {
             getTaskRepo().skip(task.id, '用户忽略整个日期')
@@ -402,7 +424,9 @@ export class ScannerService {
             checks: 0,
             discoveredAt: new Date().toISOString(),
             lastSnapshot: new Map(),
-            ...this.pendingTargetSnapshot(providers)
+            uploadTargetMode: targetSnapshot.mode,
+            destinationPrefixes: targetSnapshot.prefixes,
+            destinationUploadRelativePaths: targetSnapshot.uploadRelativePaths
           }
           const task = this.registerNewDir(pending)
           if (dayFolder.ignored) {
@@ -456,9 +480,16 @@ export class ScannerService {
             prefixes: {
               aliyun: pending.destinationPrefixes.aliyun || '',
               tencent: pending.destinationPrefixes.tencent || ''
-            }
+            },
+            uploadRelativePaths:
+              pending.destinationUploadRelativePaths ||
+              this.legacyDestinationUploadRelativePaths(
+                pending.uploadTargetMode,
+                pending.uploadRelativePath
+              ),
+            uploadRelativePath: pending.uploadRelativePath
           }
-        : getUploadTargetSnapshot(settings)
+        : this.legacySnapshotForPendingDir(pending, settings)
     const marker: TmpUploadMarker = {
       version: 2,
       createdAt: new Date().toISOString(),
@@ -469,7 +500,8 @@ export class ScannerService {
         date: pending.dateName,
         uploadRelativePath: pending.uploadRelativePath,
         uploadTargetMode: snapshot.mode,
-        destinationPrefixes: snapshot.prefixes
+        destinationPrefixes: snapshot.prefixes,
+        destinationUploadRelativePaths: snapshot.uploadRelativePaths
       }
     }
 
@@ -492,19 +524,20 @@ export class ScannerService {
     folderName: string,
     dayFolderId: string,
     uploadRelativePath: string,
-    providers?: CloudProvider[]
+    providers?: CloudProvider[],
+    targetSnapshot?: UploadTargetSnapshot
   ): Task {
     const task = this.ensureTaskRegistered(
       dirPath,
       folderName,
       dayFolderId,
       uploadRelativePath,
-      providers
+      targetSnapshot || (providers
         ? getUploadTargetSnapshotForProviders(
             providers,
             getSettingsRepo().getAll()
           )
-        : undefined
+        : undefined)
     )
     if (task.status !== 'skipped' || task.errorMessage !== NON_WORK_DIR_REASON) {
       getTaskRepo().skip(task.id, NON_WORK_DIR_REASON)
@@ -739,6 +772,9 @@ export class ScannerService {
         currentSettings.tencentS3.prefix ||
         ''
     }
+    const uploadRelativePaths =
+      tmpMarker?.metadata.destinationUploadRelativePaths ||
+      this.legacyDestinationUploadRelativePaths(mode, legacyUploadRelativePath)
     const task = this.ensureTaskRegistered(
       dirPath,
       folderName,
@@ -746,7 +782,9 @@ export class ScannerService {
       legacyUploadRelativePath,
       {
         mode,
-        prefixes
+        prefixes,
+        uploadRelativePaths,
+        uploadRelativePath: legacyUploadRelativePath
       }
     )
     const taskRepo = getTaskRepo()
@@ -784,7 +822,8 @@ export class ScannerService {
         date: dateName,
         uploadRelativePath: legacyUploadRelativePath,
         uploadTargetMode: mode,
-        destinationPrefixes: prefixes
+        destinationPrefixes: prefixes,
+        destinationUploadRelativePaths: uploadRelativePaths
       }
     })
     writeProcessTask(dirPath, {
@@ -802,15 +841,12 @@ export class ScannerService {
     folderName: string,
     dayFolderId: string,
     uploadRelativePath: string,
-    targetSnapshot?: {
-      mode: UploadTargetMode
-      prefixes: Record<CloudProvider, string>
-    }
+    targetSnapshot?: UploadTargetSnapshot
   ): Task {
     const taskRepo = getTaskRepo()
     const existing = taskRepo.getByFolderPath(dirPath)
     if (existing) {
-      this.attachTaskToDayFolder(existing, dayFolderId, uploadRelativePath)
+      this.attachTaskToDayFolder(existing, dayFolderId)
       return taskRepo.getById(existing.id)!
     }
 
@@ -822,42 +858,75 @@ export class ScannerService {
       ossPrefix: snapshot.prefixes.aliyun,
       uploadTargetMode: snapshot.mode,
       destinationPrefixes: snapshot.prefixes,
+      destinationUploadRelativePaths: snapshot.uploadRelativePaths,
       dayFolderId,
       uploadRelativePath,
       sourceType: 'local'
     })
   }
 
-  private pendingTargetSnapshot(providers: CloudProvider[]): {
+  private pendingTargetSnapshot(
+    providers: CloudProvider[],
+    context: UploadPathResolveContext
+  ): {
     uploadTargetMode: UploadTargetMode
     destinationPrefixes: Record<CloudProvider, string>
+    destinationUploadRelativePaths: Partial<Record<CloudProvider, string>>
+    uploadRelativePath: string
+    mode: UploadTargetMode
+    prefixes: Record<CloudProvider, string>
+    uploadRelativePaths: Partial<Record<CloudProvider, string>>
   } {
     const snapshot = getUploadTargetSnapshotForProviders(
       providers,
-      getSettingsRepo().getAll()
+      getSettingsRepo().getAll(),
+      context
     )
     return {
       uploadTargetMode: snapshot.mode,
-      destinationPrefixes: snapshot.prefixes
+      destinationPrefixes: snapshot.prefixes,
+      destinationUploadRelativePaths: snapshot.uploadRelativePaths,
+      uploadRelativePath: snapshot.uploadRelativePath,
+      mode: snapshot.mode,
+      prefixes: snapshot.prefixes,
+      uploadRelativePaths: snapshot.uploadRelativePaths
+    }
+  }
+
+  private legacySnapshotForPendingDir(
+    pending: PendingDir,
+    settings: AppSettings
+  ): UploadTargetSnapshot {
+    const snapshot = getUploadTargetSnapshot(settings)
+    return {
+      ...snapshot,
+      uploadRelativePath: pending.uploadRelativePath,
+      uploadRelativePaths: this.legacyDestinationUploadRelativePaths(
+        snapshot.mode,
+        pending.uploadRelativePath
+      )
     }
   }
 
   private attachTaskToDayFolder(
     task: Task,
-    dayFolderId: string,
-    uploadRelativePath: string
+    dayFolderId: string
   ): void {
-    const targetUploadRelativePath =
-      task.status === 'completed' && task.uploadRelativePath === task.folderName
-        ? task.uploadRelativePath
-        : uploadRelativePath
-
-    if (
-      task.dayFolderId !== dayFolderId ||
-      task.uploadRelativePath !== targetUploadRelativePath
-    ) {
-      getTaskRepo().updateDayFolderMetadata(task.id, dayFolderId, targetUploadRelativePath)
+    if (task.dayFolderId !== dayFolderId) {
+      getTaskRepo().updateDayFolderId(task.id, dayFolderId)
     }
+  }
+
+  private legacyDestinationUploadRelativePaths(
+    mode: UploadTargetMode | undefined,
+    uploadRelativePath: string | undefined
+  ): Partial<Record<CloudProvider, string>> {
+    if (uploadRelativePath === undefined) return {}
+    const paths: Partial<Record<CloudProvider, string>> = {}
+    for (const provider of providersForMode(mode || 'aliyun')) {
+      paths[provider] = uploadRelativePath
+    }
+    return paths
   }
 
   private collectDataInfo(dirPath: string): void {

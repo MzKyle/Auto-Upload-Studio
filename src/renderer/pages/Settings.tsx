@@ -11,9 +11,16 @@ import { testOSS, testTencentS3, selectFolder } from "@/lib/ipc-client";
 import { buildPathTreeFromPaths } from "@/lib/path-tree";
 import { showToast } from "@/components/ui/toast";
 import { CLOUD_PROVIDER_LABELS } from "@shared/constants";
-import type { AppSettings, CloudProvider } from "@shared/types";
+import type { AppSettings, CloudProvider, UploadPathMode } from "@shared/types";
 
 type SettingsSection = "global" | CloudProvider;
+
+const uploadPathModeOptions: Array<{ value: UploadPathMode; label: string }> = [
+  { value: "target-root", label: "上传到目标路径" },
+  { value: "date-workdir", label: "日期/工作次" },
+  { value: "keep-source", label: "保持本地结构" },
+  { value: "last-segments", label: "保留末 N 级" },
+];
 
 export default function Settings() {
   const { settings, loading, loadSettings, saveSettings } = useSettingsStore();
@@ -174,6 +181,65 @@ export default function Settings() {
       setLocal((p) => ({ ...p, log: { ...p.log, directory: dir } }));
     }
   }, []);
+
+  const updateProviderCloudConfig = useCallback(
+    (
+      provider: CloudProvider,
+      patch: Partial<
+        Pick<AppSettings["oss"], "prefix" | "pathMode" | "pathSegmentCount">
+      >,
+    ) => {
+      setLocal((prev) =>
+        provider === "aliyun"
+          ? { ...prev, oss: { ...prev.oss, ...patch } }
+          : { ...prev, tencentS3: { ...prev.tencentS3, ...patch } },
+      );
+    },
+    [],
+  );
+
+  const renderUploadPathControls = (provider: CloudProvider) => {
+    const config = provider === "aliyun" ? local.oss : local.tencentS3;
+
+    return (
+      <div className="grid grid-cols-2 gap-4 border-t pt-4">
+        <div>
+          <Label>上传路径模式</Label>
+          <select
+            value={config.pathMode}
+            onChange={(e) =>
+              updateProviderCloudConfig(provider, {
+                pathMode: e.target.value as UploadPathMode,
+              })
+            }
+            className="mt-1 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+          >
+            {uploadPathModeOptions.map((option) => (
+              <option key={option.value} value={option.value}>
+                {option.label}
+              </option>
+            ))}
+          </select>
+        </div>
+        <div>
+          <Label>保留末 N 级</Label>
+          <Input
+            type="number"
+            min={0}
+            max={20}
+            value={config.pathSegmentCount}
+            disabled={config.pathMode !== "last-segments"}
+            onChange={(e) =>
+              updateProviderCloudConfig(provider, {
+                pathSegmentCount: Number(e.target.value),
+              })
+            }
+            className="mt-1"
+          />
+        </div>
+      </div>
+    );
+  };
 
   const renderProviderDirectories = (provider: CloudProvider) => {
     const directories = local.scan.providerDirectories?.[provider] ?? [];
@@ -676,17 +742,14 @@ export default function Settings() {
               />
             </div>
             <div>
-              <Label>前缀 (Prefix)</Label>
+              <Label>固定前缀 (Prefix，可为空)</Label>
               <Input
                 value={local.oss.prefix}
                 onChange={(e) =>
-                  setLocal((p) => ({
-                    ...p,
-                    oss: { ...p.oss, prefix: e.target.value },
-                  }))
+                  updateProviderCloudConfig("aliyun", { prefix: e.target.value })
                 }
                 className="mt-1"
-                placeholder="upload/"
+                placeholder="例如 upload/"
               />
             </div>
             <div>
@@ -717,6 +780,7 @@ export default function Settings() {
               />
             </div>
           </div>
+          {renderUploadPathControls("aliyun")}
         </CardContent>
       </Card>
       </>
@@ -798,17 +862,16 @@ export default function Settings() {
               />
             </div>
             <div>
-              <Label>前缀 (Prefix)</Label>
+              <Label>固定前缀 (Prefix，可为空)</Label>
               <Input
                 value={local.tencentS3.prefix}
                 onChange={(e) =>
-                  setLocal((p) => ({
-                    ...p,
-                    tencentS3: { ...p.tencentS3, prefix: e.target.value },
-                  }))
+                  updateProviderCloudConfig("tencent", {
+                    prefix: e.target.value,
+                  })
                 }
                 className="mt-1"
-                placeholder="upload/<user-id>/"
+                placeholder="例如 upload/<user-id>/"
               />
             </div>
             <div>
@@ -842,6 +905,7 @@ export default function Settings() {
               />
             </div>
           </div>
+          {renderUploadPathControls("tencent")}
           <label className="flex items-start gap-2 text-sm">
             <input
               type="checkbox"

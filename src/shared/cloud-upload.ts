@@ -5,6 +5,18 @@ import type {
   TaskStatus,
   UploadTargetMode
 } from './types'
+import {
+  firstProviderUploadRelativePath,
+  resolveProviderUploadRelativePaths,
+  type UploadPathResolveContext
+} from './upload-path'
+
+export interface UploadTargetSnapshot {
+  mode: UploadTargetMode
+  prefixes: Record<CloudProvider, string>
+  uploadRelativePaths: Partial<Record<CloudProvider, string>>
+  uploadRelativePath: string
+}
 
 export function providersForMode(mode: UploadTargetMode): CloudProvider[] {
   if (mode === 'both') return ['aliyun', 'tencent']
@@ -17,29 +29,38 @@ export function modeForProviders(providers: CloudProvider[]): UploadTargetMode {
   return set.has('tencent') ? 'tencent' : 'aliyun'
 }
 
-export function getUploadTargetSnapshot(settings: AppSettings): {
-  mode: UploadTargetMode
-  prefixes: Record<CloudProvider, string>
-} {
+export function getUploadTargetSnapshot(
+  settings: AppSettings,
+  context?: UploadPathResolveContext
+): UploadTargetSnapshot {
   return getUploadTargetSnapshotForProviders(
     providersForMode(settings.cloud.targetMode),
-    settings
+    settings,
+    context
   )
 }
 
 export function getUploadTargetSnapshotForProviders(
   providers: CloudProvider[],
-  settings: AppSettings
-): {
-  mode: UploadTargetMode
-  prefixes: Record<CloudProvider, string>
-} {
+  settings: AppSettings,
+  context?: UploadPathResolveContext
+): UploadTargetSnapshot {
+  const uploadRelativePaths = context
+    ? resolveProviderUploadRelativePaths(settings, providers, context)
+    : {}
+
   return {
     mode: modeForProviders(providers),
     prefixes: {
       aliyun: settings.oss.prefix || '',
       tencent: settings.tencentS3.prefix || ''
-    }
+    },
+    uploadRelativePaths,
+    uploadRelativePath: firstProviderUploadRelativePath(
+      providers,
+      uploadRelativePaths,
+      ''
+    )
   }
 }
 

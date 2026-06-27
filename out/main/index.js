@@ -244,11 +244,11 @@ function joinOssPath(...parts) {
 function buildUploadRelativePath(dateFolder, childFolder) {
   return joinOssPath(dateFolder, childFolder);
 }
-function pathSegments(directoryPath) {
+function pathSegments$1(directoryPath) {
   return directoryPath.replace(/\\/g, "/").split("/").map((part) => part.trim()).filter((part) => part.length > 0 && part !== ".");
 }
 function deriveDateScopedUploadRelativePath(directoryPath) {
-  const segments = pathSegments(directoryPath);
+  const segments = pathSegments$1(directoryPath);
   const folderName = segments.at(-1);
   if (!folderName) return null;
   if (isDateFolderName(folderName)) {
@@ -259,13 +259,6 @@ function deriveDateScopedUploadRelativePath(directoryPath) {
     return buildUploadRelativePath(parentName, folderName);
   }
   return null;
-}
-function resolveDirectoryUploadRelativePath(directoryPath, fallbackDirectoryPath) {
-  const dateScopedPath = deriveDateScopedUploadRelativePath(directoryPath) || (fallbackDirectoryPath ? deriveDateScopedUploadRelativePath(fallbackDirectoryPath) : null);
-  if (dateScopedPath) return dateScopedPath;
-  const primaryFolderName = pathSegments(directoryPath).at(-1);
-  const fallbackFolderName = fallbackDirectoryPath ? pathSegments(fallbackDirectoryPath).at(-1) : null;
-  return primaryFolderName || fallbackFolderName || "";
 }
 function buildOssKey(prefix, uploadRelativePath, fileRelativePath) {
   return joinOssPath(prefix, uploadRelativePath, fileRelativePath);
@@ -358,6 +351,7 @@ function runMigrations(db2) {
       provider TEXT NOT NULL,
       status TEXT NOT NULL DEFAULT 'pending',
       prefix TEXT NOT NULL DEFAULT '',
+      upload_relative_path TEXT NOT NULL DEFAULT '',
       total_files INTEGER NOT NULL DEFAULT 0,
       uploaded_files INTEGER NOT NULL DEFAULT 0,
       total_bytes INTEGER NOT NULL DEFAULT 0,
@@ -433,6 +427,14 @@ function runMigrations(db2) {
     log.info("迁移: tasks 表添加 upload_target_mode 列");
   }
   db2.exec(`CREATE INDEX IF NOT EXISTS idx_tasks_day_folder_id ON tasks(day_folder_id)`);
+  const taskDestinationColumns = db2.pragma("table_info(task_destinations)");
+  const addedDestinationUploadPath = !taskDestinationColumns.some(
+    (c) => c.name === "upload_relative_path"
+  );
+  if (addedDestinationUploadPath) {
+    db2.exec(`ALTER TABLE task_destinations ADD COLUMN upload_relative_path TEXT NOT NULL DEFAULT ''`);
+    log.info("迁移: task_destinations 表添加 upload_relative_path 列");
+  }
   const dayFolderColumns = db2.pragma("table_info(day_folders)");
   if (!dayFolderColumns.some((c) => c.name === "ignored")) {
     db2.exec(`ALTER TABLE day_folders ADD COLUMN ignored INTEGER NOT NULL DEFAULT 0`);
@@ -491,14 +493,26 @@ function runMigrations(db2) {
   if (migratedDatePaths > 0) {
     log.info(`日期层路径迁移完成: ${migratedDatePaths} 个未完成任务`);
   }
+  if (addedDestinationUploadPath) {
+    db2.exec(`
+      UPDATE task_destinations
+      SET upload_relative_path = COALESCE((
+        SELECT upload_relative_path
+        FROM tasks
+        WHERE tasks.id = task_destinations.task_id
+      ), '')
+    `);
+    log.info("迁移: 已回填任务目标上传相对路径");
+  }
   const migratedDestinations = db2.prepare(
     `INSERT OR IGNORE INTO task_destinations (
       id, task_id, provider, status, prefix, total_files, uploaded_files,
-      total_bytes, uploaded_bytes, error_message, created_at, updated_at, completed_at
+      total_bytes, uploaded_bytes, error_message, created_at, updated_at,
+      completed_at, upload_relative_path
     )
     SELECT lower(hex(randomblob(16))), id, 'aliyun', status, COALESCE(oss_prefix, ''),
       total_files, uploaded_files, total_bytes, uploaded_bytes, error_message,
-      created_at, updated_at, completed_at
+      created_at, updated_at, completed_at, COALESCE(upload_relative_path, '')
     FROM tasks t
     WHERE NOT EXISTS (
       SELECT 1 FROM task_destinations existing WHERE existing.task_id = t.id
@@ -661,17 +675,126 @@ function reconcileStartupState(db2) {
   });
   transaction();
 }
+const DEFAULT_UPLOAD_PATH_MODE = "target-root";
+const DEFAULT_UPLOAD_PATH_SEGMENT_COUNT = 2;
+const UPLOAD_PATH_MODES = /* @__PURE__ */ new Set([
+  "target-root",
+  "date-workdir",
+  "keep-source",
+  "last-segments"
+]);
+function normalizeUploadPathMode(value) {
+  return typeof value === "string" && UPLOAD_PATH_MODES.has(value) ? value : DEFAULT_UPLOAD_PATH_MODE;
+}
+function normalizeUploadPathSegmentCount(value) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return DEFAULT_UPLOAD_PATH_SEGMENT_COUNT;
+  return Math.max(0, Math.min(20, Math.floor(parsed)));
+}
+function normalizeUploadPathConfig(config) {
+  return {
+    ...config,
+    pathMode: normalizeUploadPathMode(config.pathMode),
+    pathSegmentCount: normalizeUploadPathSegmentCount(config.pathSegmentCount)
+  };
+}
+function getProviderUploadPathConfig(settings, provider) {
+  const config = provider === "aliyun" ? settings.oss : settings.tencentS3;
+  return normalizeUploadPathConfig(config);
+}
+function resolveProviderUploadRelativePaths(settings, providers, context) {
+  const paths = {};
+  for (const provider of providers) {
+    paths[provider] = resolveUploadRelativePath(
+      getProviderUploadPathConfig(settings, provider),
+      context
+    );
+  }
+  return paths;
+}
+function firstProviderUploadRelativePath(providers, paths, fallback = "") {
+  for (const provider of providers) {
+    const path2 = paths[provider];
+    if (path2 !== void 0) return path2;
+  }
+  return fallback;
+}
+function resolveUploadRelativePath(config, context) {
+  const normalized = normalizeUploadPathConfig(
+    config
+  );
+  const sourcePath = context.sourcePath;
+  if (normalized.pathMode === "target-root") return "";
+  if (normalized.pathMode === "date-workdir") {
+    if (context.dateName && context.workDirName) {
+      return joinOssPath(context.dateName, context.workDirName);
+    }
+    return deriveDateScopedUploadRelativePath(sourcePath) || (context.fallbackDirectoryPath ? deriveDateScopedUploadRelativePath(context.fallbackDirectoryPath) : null) || lastPathSegment(sourcePath);
+  }
+  if (normalized.pathMode === "keep-source") {
+    const basePath = context.basePath || parentDirectoryPath(sourcePath);
+    return relativePathFromBase(sourcePath, basePath);
+  }
+  if (normalized.pathSegmentCount <= 0) return "";
+  return joinOssPath(...pathSegments(sourcePath).slice(-normalized.pathSegmentCount));
+}
+function relativePathFromBase(sourcePath, basePath) {
+  const source = pathSegments(sourcePath);
+  const base = pathSegments(basePath);
+  if (source.length === 0) return "";
+  let index = 0;
+  while (index < source.length && index < base.length && segmentEquals(source[index], base[index])) {
+    index++;
+  }
+  if (index === base.length && index < source.length) {
+    return joinOssPath(...source.slice(index));
+  }
+  return lastPathSegment(sourcePath);
+}
+function pathSegments(path2) {
+  return path2.replace(/\\/g, "/").split("/").map((part) => part.trim()).filter((part) => part.length > 0 && part !== ".");
+}
+function parentDirectoryPath(path2) {
+  const segments = pathSegments(path2);
+  return joinOssPath(...segments.slice(0, -1));
+}
+function lastPathSegment(path2) {
+  return pathSegments(path2).at(-1) || "";
+}
+function segmentEquals(a, b) {
+  if (a.endsWith(":") || b.endsWith(":")) return a.toLowerCase() === b.toLowerCase();
+  return a === b;
+}
 function providersForMode(mode) {
   if (mode === "both") return ["aliyun", "tencent"];
   return [mode];
 }
-function getUploadTargetSnapshot(settings) {
+function modeForProviders(providers) {
+  const set = new Set(providers);
+  if (set.has("aliyun") && set.has("tencent")) return "both";
+  return set.has("tencent") ? "tencent" : "aliyun";
+}
+function getUploadTargetSnapshot(settings, context) {
+  return getUploadTargetSnapshotForProviders(
+    providersForMode(settings.cloud.targetMode),
+    settings,
+    context
+  );
+}
+function getUploadTargetSnapshotForProviders(providers, settings, context) {
+  const uploadRelativePaths = context ? resolveProviderUploadRelativePaths(settings, providers, context) : {};
   return {
-    mode: settings.cloud.targetMode,
+    mode: modeForProviders(providers),
     prefixes: {
       aliyun: settings.oss.prefix || "",
       tencent: settings.tencentS3.prefix || ""
-    }
+    },
+    uploadRelativePaths,
+    uploadRelativePath: firstProviderUploadRelativePath(
+      providers,
+      uploadRelativePaths,
+      ""
+    )
   };
 }
 function deriveLogicalFileStatus(statuses) {
@@ -692,6 +815,7 @@ function rowToDestination(row) {
     provider: row.provider,
     status: row.status,
     prefix: row.prefix || "",
+    uploadRelativePath: row.upload_relative_path ?? "",
     totalFiles: row.total_files,
     uploadedFiles: row.uploaded_files,
     totalBytes: row.total_bytes,
@@ -717,13 +841,14 @@ function rowToFileDestination(row) {
   };
 }
 class TaskDestinationRepo {
-  ensureForTask(taskId, mode, prefixes, initialStatus = "pending") {
+  ensureForTask(taskId, mode, prefixes, initialStatus = "pending", uploadRelativePaths = {}) {
     const db2 = getDb();
     const now = (/* @__PURE__ */ new Date()).toISOString();
     const stmt = db2.prepare(
       `INSERT OR IGNORE INTO task_destinations (
-        id, task_id, provider, status, prefix, created_at, updated_at, completed_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+        id, task_id, provider, status, prefix, upload_relative_path,
+        created_at, updated_at, completed_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
     );
     const completedAt = initialStatus === "completed" || initialStatus === "failed" || initialStatus === "skipped" ? now : null;
     const transaction = db2.transaction(() => {
@@ -734,6 +859,7 @@ class TaskDestinationRepo {
           provider,
           initialStatus,
           prefixes[provider] || "",
+          uploadRelativePaths[provider] ?? "",
           now,
           now,
           completedAt
@@ -758,6 +884,13 @@ class TaskDestinationRepo {
          SET status = ?, error_message = ?, updated_at = ?, completed_at = ?
          WHERE task_id = ? AND provider = ?`
     ).run(status, errorMessage || null, now, completedAt, taskId, provider);
+  }
+  updateUploadRelativePath(taskId, provider, uploadRelativePath) {
+    getDb().prepare(
+      `UPDATE task_destinations
+         SET upload_relative_path = ?, updated_at = ?
+         WHERE task_id = ? AND provider = ?`
+    ).run(uploadRelativePath, (/* @__PURE__ */ new Date()).toISOString(), taskId, provider);
   }
   updateIncompleteStatuses(taskId, status, errorMessage) {
     const now = (/* @__PURE__ */ new Date()).toISOString();
@@ -965,7 +1098,7 @@ function rowToTask(row) {
     uploadTargetMode: row.upload_target_mode || "aliyun",
     destinations: getTaskDestinationRepo().listByTask(row.id),
     dayFolderId: row.day_folder_id || null,
-    uploadRelativePath: row.upload_relative_path || row.folder_name,
+    uploadRelativePath: row.upload_relative_path ?? row.folder_name,
     errorMessage: row.error_message || null,
     sourceType: row.source_type,
     sourceMachineId: row.source_machine_id || null,
@@ -1004,13 +1137,15 @@ class TaskRepo {
   }
   listContinuouslyMonitored(dateName) {
     const rows = getDb().prepare(
-      `SELECT * FROM tasks
-       WHERE source_type = 'local'
-         AND day_folder_id IS NOT NULL
-         AND replace(upload_relative_path, '\\', '/') LIKE ?
-         AND status NOT IN ('skipped', 'paused', 'completed')
-       ORDER BY created_at ASC`
-    ).all(`${dateName}/%`);
+      `SELECT t.*
+       FROM tasks t
+       INNER JOIN day_folders df ON df.id = t.day_folder_id
+       WHERE t.source_type = 'local'
+         AND t.day_folder_id IS NOT NULL
+         AND df.date_value = ?
+         AND t.status NOT IN ('skipped', 'paused', 'completed')
+       ORDER BY t.created_at ASC`
+    ).all(dateName);
     return rows.map(rowToTask);
   }
   listRunnable(now = (/* @__PURE__ */ new Date()).toISOString()) {
@@ -1057,6 +1192,14 @@ class TaskRepo {
     const id = uuid.v4();
     const now = (/* @__PURE__ */ new Date()).toISOString();
     const normalizedPath = normalizeFolderPath$1(params.folderPath);
+    const uploadTargetMode = params.uploadTargetMode || "aliyun";
+    const uploadRelativePath = params.uploadRelativePath ?? params.folderName;
+    const destinationUploadRelativePaths = params.destinationUploadRelativePaths || Object.fromEntries(
+      providersForMode(uploadTargetMode).map((provider) => [
+        provider,
+        uploadRelativePath
+      ])
+    );
     db2.prepare(
       `INSERT INTO tasks (
         id, folder_path, folder_name, status, oss_prefix, upload_target_mode,
@@ -1068,9 +1211,9 @@ class TaskRepo {
       normalizedPath,
       params.folderName,
       params.ossPrefix || "",
-      params.uploadTargetMode || "aliyun",
+      uploadTargetMode,
       params.dayFolderId || null,
-      params.uploadRelativePath || params.folderName,
+      uploadRelativePath,
       params.sourceType || "local",
       params.sourceMachineId || null,
       now,
@@ -1078,10 +1221,19 @@ class TaskRepo {
     );
     getTaskDestinationRepo().ensureForTask(
       id,
-      params.uploadTargetMode || "aliyun",
-      params.destinationPrefixes || { aliyun: params.ossPrefix || "" }
+      uploadTargetMode,
+      params.destinationPrefixes || { aliyun: params.ossPrefix || "" },
+      "pending",
+      destinationUploadRelativePaths
     );
     return this.getById(id);
+  }
+  updateDayFolderId(id, dayFolderId) {
+    getDb().prepare(
+      `UPDATE tasks
+       SET day_folder_id = ?, updated_at = ?
+       WHERE id = ?`
+    ).run(dayFolderId, (/* @__PURE__ */ new Date()).toISOString(), id);
   }
   updateDayFolderMetadata(id, dayFolderId, uploadRelativePath) {
     getDb().prepare(
@@ -1578,6 +1730,10 @@ const DEFAULT_WORK_DIR_NAME_PATTERN = "^\\d{2}-\\d{2}-\\d{2}$";
 const DEFAULT_SETTINGS = {
   scan: {
     directories: [],
+    providerDirectories: {
+      aliyun: [],
+      tencent: []
+    },
     intervalSeconds: 30,
     workDirNamePattern: DEFAULT_WORK_DIR_NAME_PATTERN
   },
@@ -1598,6 +1754,8 @@ const DEFAULT_SETTINGS = {
     bucket: "",
     region: "",
     prefix: "",
+    pathMode: "target-root",
+    pathSegmentCount: 2,
     accessKeyId: "",
     accessKeySecret: ""
   },
@@ -1606,6 +1764,8 @@ const DEFAULT_SETTINGS = {
     bucket: "",
     region: "",
     prefix: "",
+    pathMode: "target-root",
+    pathSegmentCount: 2,
     accessKeyId: "",
     accessKeySecret: "",
     allowInsecureTls: false
@@ -1644,20 +1804,98 @@ const MARKER_FILES = {
   PROCESS_TASK: "process_task.json",
   DAY_UPLOAD: "day_upload.json"
 };
+const CLOUD_PROVIDERS = ["aliyun", "tencent"];
+function emptyProviderDirectories() {
+  return {
+    aliyun: [],
+    tencent: []
+  };
+}
+function normalizeScanDirectory(directory) {
+  const trimmed = directory.trim().replace(/[\\/]+$/, "");
+  if (!trimmed) return "";
+  const parts = trimmed.split(/[\\/]+/);
+  const last = parts[parts.length - 1];
+  if (last && isDateFolderName(last) && parts.length > 1) {
+    return trimmed.slice(0, trimmed.length - last.length).replace(/[\\/]+$/, "");
+  }
+  return trimmed;
+}
+function normalizeScanDirectories(directories) {
+  return Array.from(
+    new Set(
+      directories.map(normalizeScanDirectory).filter(Boolean)
+    )
+  );
+}
+function normalizeProviderDirectories(providerDirectories) {
+  return {
+    aliyun: normalizeScanDirectories(providerDirectories?.aliyun ?? []),
+    tencent: normalizeScanDirectories(providerDirectories?.tencent ?? [])
+  };
+}
+function migrateLegacyScanDirectories(legacyDirectories, targetMode) {
+  const normalized = normalizeScanDirectories(legacyDirectories);
+  const providerDirectories = emptyProviderDirectories();
+  for (const provider of providersForMode(targetMode)) {
+    providerDirectories[provider] = normalized;
+  }
+  return providerDirectories;
+}
+function normalizeScanConfig(scan, targetMode) {
+  const hasProviderDirectories = Boolean(
+    scan.providerDirectories && CLOUD_PROVIDERS.some(
+      (provider) => scan.providerDirectories[provider]?.length > 0
+    )
+  );
+  const providerDirectories = hasProviderDirectories ? normalizeProviderDirectories(scan.providerDirectories) : migrateLegacyScanDirectories(scan.directories ?? [], targetMode);
+  const directories = normalizeScanDirectories([
+    ...providerDirectories.aliyun,
+    ...providerDirectories.tencent
+  ]);
+  return {
+    ...scan,
+    directories,
+    providerDirectories
+  };
+}
+function getActiveScanRoots(scan, targetMode) {
+  const activeProviders = new Set(providersForMode(targetMode));
+  const roots = /* @__PURE__ */ new Map();
+  const providerDirectories = normalizeProviderDirectories(scan.providerDirectories);
+  for (const provider of CLOUD_PROVIDERS) {
+    if (!activeProviders.has(provider)) continue;
+    for (const directory of providerDirectories[provider]) {
+      const key = scanDirectoryKey(directory);
+      const current = roots.get(key);
+      if (current) {
+        if (!current.providers.includes(provider)) {
+          current.providers.push(provider);
+          current.providers = providersForMode(modeForProviders(current.providers));
+        }
+      } else {
+        roots.set(key, { directory, providers: [provider] });
+      }
+    }
+  }
+  return Array.from(roots.values());
+}
+function getWatchedDirectoriesByProvider(scan, targetMode) {
+  const activeProviders = new Set(providersForMode(targetMode));
+  const providerDirectories = normalizeProviderDirectories(scan.providerDirectories);
+  return {
+    aliyun: activeProviders.has("aliyun") ? providerDirectories.aliyun : [],
+    tencent: activeProviders.has("tencent") ? providerDirectories.tencent : []
+  };
+}
+function scanDirectoryKey(directory) {
+  return normalizeScanDirectory(directory).replace(/\\/g, "/");
+}
 function normalizeSuffixes(suffixes) {
   const normalized = suffixes.map((suffix) => suffix.trim().toLowerCase()).filter(Boolean).map((suffix) => suffix.startsWith(".") ? suffix : `.${suffix}`);
   const unique = Array.from(new Set(normalized));
   if (!unique.includes(".csv")) unique.push(".csv");
   return unique;
-}
-function normalizeScanDirectories(directories) {
-  return Array.from(
-    new Set(
-      directories.map((directory) => path.normalize(directory).replace(/[\\/]+$/, "")).filter(Boolean).map(
-        (directory) => isDateFolderName(path.basename(directory)) ? path.dirname(directory) : directory
-      )
-    )
-  );
 }
 class SettingsRepo {
   get(key) {
@@ -1673,6 +1911,16 @@ class SettingsRepo {
       if (key === "scan" && typeof parsed === "object" && parsed !== null && "directories" in parsed && Array.isArray(parsed.directories)) {
         const scan = parsed;
         scan.directories = normalizeScanDirectories(scan.directories);
+        if ("providerDirectories" in scan && typeof scan.providerDirectories === "object" && scan.providerDirectories !== null) {
+          scan.providerDirectories = normalizeProviderDirectories(
+            scan.providerDirectories
+          );
+        }
+      }
+      if ((key === "oss" || key === "tencentS3") && typeof parsed === "object" && parsed !== null) {
+        return normalizeUploadPathConfig(
+          parsed
+        );
       }
       return parsed;
     } catch {
@@ -1692,10 +1940,22 @@ class SettingsRepo {
     }
     if (key === "scan" && typeof value === "object" && value !== null && "directories" in value && Array.isArray(value.directories)) {
       const scan = value;
+      const cloud = this.get("cloud");
       persistedValue = {
         ...scan,
-        directories: normalizeScanDirectories(scan.directories)
+        ...normalizeScanConfig(
+          {
+            ...DEFAULT_SETTINGS.scan,
+            ...scan
+          },
+          cloud?.targetMode || DEFAULT_SETTINGS.cloud.targetMode
+        )
       };
+    }
+    if ((key === "oss" || key === "tencentS3") && typeof value === "object" && value !== null) {
+      persistedValue = normalizeUploadPathConfig(
+        value
+      );
     }
     const serialized = typeof persistedValue === "string" ? persistedValue : JSON.stringify(persistedValue);
     db2.prepare(
@@ -1704,6 +1964,7 @@ class SettingsRepo {
   }
   getAll() {
     const settings = { ...DEFAULT_SETTINGS };
+    const settingsRecord = settings;
     const keys = [
       { section: "scan", key: "scan" },
       { section: "upload", key: "upload" },
@@ -1720,14 +1981,14 @@ class SettingsRepo {
     for (const { section, key } of keys) {
       const val = this.get(key);
       if (val !== null) {
-        const defaultSection = settings[section];
+        const defaultSection = settingsRecord[section];
         if (typeof defaultSection === "object" && defaultSection !== null && typeof val === "object" && val !== null) {
-          settings[section] = {
+          settingsRecord[section] = {
             ...defaultSection,
             ...val
           };
         } else {
-          settings[section] = val;
+          settingsRecord[section] = val;
         }
       }
     }
@@ -1736,6 +1997,16 @@ class SettingsRepo {
     if (settings.filter && Array.isArray(settings.filter.suffixes)) {
       settings.filter.suffixes = normalizeSuffixes(settings.filter.suffixes);
     }
+    settings.oss = normalizeUploadPathConfig(
+      settings.oss
+    );
+    settings.tencentS3 = normalizeUploadPathConfig(
+      settings.tencentS3
+    );
+    settings.scan = normalizeScanConfig(
+      settings.scan,
+      settings.cloud.targetMode
+    );
     return settings;
   }
   saveAll(partial) {
@@ -1800,17 +2071,56 @@ class HistoryRepo {
     ).all(...params, pageSize, offset);
     return { items: rows.map(rowToHistory), total };
   }
-  clear(before) {
+  clear(before, provider) {
     const db2 = getDb();
-    if (before) {
-      db2.prepare("DELETE FROM tasks WHERE status IN ('completed', 'failed') AND completed_at < ?").run(before);
-    } else {
-      db2.prepare("DELETE FROM tasks WHERE status IN ('completed', 'failed')").run();
-    }
+    const transaction = db2.transaction(() => {
+      if (provider) {
+        const params = [provider];
+        let beforeCondition = "";
+        if (before) {
+          beforeCondition = " AND completed_at < ?";
+          params.push(before);
+        }
+        db2.prepare(
+          `DELETE FROM task_destinations
+           WHERE provider = ?
+             AND status IN ('completed', 'failed')
+             AND completed_at IS NOT NULL${beforeCondition}`
+        ).run(...params);
+        db2.prepare(
+          `DELETE FROM tasks
+           WHERE NOT EXISTS (
+             SELECT 1 FROM task_destinations td WHERE td.task_id = tasks.id
+           )`
+        ).run();
+      } else if (before) {
+        db2.prepare("DELETE FROM tasks WHERE status IN ('completed', 'failed') AND completed_at < ?").run(before);
+      } else {
+        db2.prepare("DELETE FROM tasks WHERE status IN ('completed', 'failed')").run();
+      }
+    });
+    transaction();
   }
-  deleteById(id) {
+  deleteById(id, provider) {
     const db2 = getDb();
-    db2.prepare("DELETE FROM tasks WHERE id = ? AND status IN ('completed', 'failed')").run(id);
+    const transaction = db2.transaction(() => {
+      if (provider) {
+        db2.prepare(
+          `DELETE FROM task_destinations
+           WHERE task_id = ? AND provider = ? AND status IN ('completed', 'failed')`
+        ).run(id, provider);
+        db2.prepare(
+          `DELETE FROM tasks
+           WHERE id = ?
+             AND NOT EXISTS (
+               SELECT 1 FROM task_destinations td WHERE td.task_id = tasks.id
+             )`
+        ).run(id);
+      } else {
+        db2.prepare("DELETE FROM tasks WHERE id = ? AND status IN ('completed', 'failed')").run(id);
+      }
+    });
+    transaction();
   }
 }
 let instance$d = null;
@@ -1883,6 +2193,18 @@ class DayFolderRepo {
       params.push(query.status);
     } else if (query.includeCompleted === false) {
       conditions.push("status NOT IN ('completed', 'completed_with_skips')");
+    }
+    if (query.provider) {
+      conditions.push(
+        `EXISTS (
+          SELECT 1
+          FROM tasks t
+          INNER JOIN task_destinations td ON td.task_id = t.id
+          WHERE t.day_folder_id = day_folders.id
+            AND td.provider = ?
+        )`
+      );
+      params.push(query.provider);
     }
     const where = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
     const limit = Math.max(1, Math.min(query.limit || 100, 1e3));
@@ -1972,8 +2294,48 @@ class DayFolderRepo {
     ).all(cutoff);
     return rows.map((row) => this.toSummary(rowToRecord(row)));
   }
-  clearCompleted(before) {
+  clearCompleted(before, provider) {
     const db2 = getDb();
+    if (provider) {
+      const transaction = db2.transaction(() => {
+        const params = [provider];
+        let beforeCondition = "";
+        if (before) {
+          beforeCondition = " AND df.completed_at < ?";
+          params.push(before);
+        }
+        db2.prepare(
+          `DELETE FROM task_destinations
+           WHERE provider = ?
+             AND task_id IN (
+               SELECT t.id
+               FROM tasks t
+               INNER JOIN day_folders df ON df.id = t.day_folder_id
+               WHERE df.status IN ('completed', 'completed_with_skips')
+                 AND df.completed_at IS NOT NULL${beforeCondition}
+             )`
+        ).run(...params);
+        db2.prepare(
+          `DELETE FROM tasks
+           WHERE day_folder_id IS NOT NULL
+             AND NOT EXISTS (
+               SELECT 1 FROM task_destinations td WHERE td.task_id = tasks.id
+             )`
+        ).run();
+        db2.prepare(
+          `DELETE FROM day_folders
+           WHERE status IN ('completed', 'completed_with_skips')
+             AND NOT EXISTS (
+               SELECT 1
+               FROM tasks t
+               INNER JOIN task_destinations td ON td.task_id = t.id
+               WHERE t.day_folder_id = day_folders.id
+             )`
+        ).run();
+      });
+      transaction();
+      return;
+    }
     if (before) {
       db2.prepare(
         "DELETE FROM day_folders WHERE status IN ('completed', 'completed_with_skips') AND completed_at < ?"
@@ -1984,8 +2346,38 @@ class DayFolderRepo {
       ).run();
     }
   }
-  deleteCompleted(id) {
-    getDb().prepare(
+  deleteCompleted(id, provider) {
+    const db2 = getDb();
+    if (provider) {
+      const transaction = db2.transaction(() => {
+        db2.prepare(
+          `DELETE FROM task_destinations
+           WHERE provider = ?
+             AND task_id IN (SELECT id FROM tasks WHERE day_folder_id = ?)`
+        ).run(provider, id);
+        db2.prepare(
+          `DELETE FROM tasks
+           WHERE day_folder_id = ?
+             AND NOT EXISTS (
+               SELECT 1 FROM task_destinations td WHERE td.task_id = tasks.id
+             )`
+        ).run(id);
+        db2.prepare(
+          `DELETE FROM day_folders
+           WHERE id = ?
+             AND status IN ('completed', 'completed_with_skips')
+             AND NOT EXISTS (
+               SELECT 1
+               FROM tasks t
+               INNER JOIN task_destinations td ON td.task_id = t.id
+               WHERE t.day_folder_id = day_folders.id
+             )`
+        ).run(id);
+      });
+      transaction();
+      return;
+    }
+    db2.prepare(
       "DELETE FROM day_folders WHERE id = ? AND status IN ('completed', 'completed_with_skips')"
     ).run(id);
   }
@@ -2801,9 +3193,13 @@ class ScannerService {
     if (this.running) return;
     this.running = true;
     const settings = getSettingsRepo();
-    const scanConfig = settings.get("scan");
-    const directories = scanConfig?.directories || [];
-    const intervalMs = (scanConfig?.intervalSeconds || 30) * 1e3;
+    const allSettings = settings.getAll();
+    const activeRoots = getActiveScanRoots(
+      allSettings.scan,
+      allSettings.cloud.targetMode
+    );
+    const directories = activeRoots.map((root) => root.directory);
+    const intervalMs = (allSettings.scan.intervalSeconds || 30) * 1e3;
     this.startWatcher(directories);
     this.timer = setInterval(() => this.scheduleFullScan(), intervalMs);
     this.scheduleFullScan(INITIAL_SCAN_DELAY_MS);
@@ -2842,9 +3238,18 @@ class ScannerService {
   }
   getStatus() {
     const settings = getSettingsRepo();
-    const scanConfig = settings.get("scan");
+    const allSettings = settings.getAll();
+    const scanConfig = allSettings.scan;
     const stabilityConfig = settings.get("stability");
     const requiredChecks = stabilityConfig?.checkCount || 3;
+    const activeRoots = getActiveScanRoots(
+      scanConfig,
+      allSettings.cloud.targetMode
+    );
+    const watchedDirectoriesByProvider = getWatchedDirectoriesByProvider(
+      scanConfig,
+      allSettings.cloud.targetMode
+    );
     const pendingStabilityChecks = [];
     for (const pending of this.pendingDirs.values()) {
       pendingStabilityChecks.push({
@@ -2858,7 +3263,8 @@ class ScannerService {
       running: this.running,
       lastScanAt: this.lastScanAt,
       nextScanAt: this.nextScanAt,
-      watchedDirectories: scanConfig?.directories || [],
+      watchedDirectories: activeRoots.map((root) => root.directory),
+      watchedDirectoriesByProvider,
       pendingStabilityChecks,
       lastScanResults: this.lastScanResults
     };
@@ -2874,8 +3280,13 @@ class ScannerService {
     }
     this.scanInProgress = true;
     const settings = getSettingsRepo();
-    const scanConfig = settings.get("scan");
-    const directories = scanConfig?.directories || [];
+    const allSettings = settings.getAll();
+    const scanConfig = allSettings.scan;
+    const activeRoots = getActiveScanRoots(
+      scanConfig,
+      allSettings.cloud.targetMode
+    );
+    const directories = activeRoots.map((root) => root.directory);
     const intervalMs = (scanConfig?.intervalSeconds || 30) * 1e3;
     const today = this.formatLocalDate(/* @__PURE__ */ new Date());
     const seenChildPaths = /* @__PURE__ */ new Set();
@@ -2885,13 +3296,13 @@ class ScannerService {
     let ignoredDirectories = 0;
     let skippedChildren = 0;
     try {
-      for (const rootDir of directories) {
-        if (!await this.pathExists(rootDir)) {
-          log.warn("扫描根目录不存在:", rootDir);
+      for (const root of activeRoots) {
+        if (!await this.pathExists(root.directory)) {
+          log.warn("扫描根目录不存在:", root.directory);
           continue;
         }
         const result = await this.scanRootDirectory(
-          rootDir,
+          root,
           today,
           scanConfig?.workDirNamePattern,
           seenChildPaths
@@ -2928,7 +3339,7 @@ class ScannerService {
       }
     }
   }
-  async scanRootDirectory(rootDir, today, workDirNamePattern, seenChildPaths) {
+  async scanRootDirectory(root, today, workDirNamePattern, seenChildPaths) {
     let scanned = 0;
     let newFound = 0;
     let existing = 0;
@@ -2936,17 +3347,19 @@ class ScannerService {
     let skipped = 0;
     try {
       const dayDirectory = await discoverCurrentDayDirectory(
-        rootDir,
+        root.directory,
         today,
         workDirNamePattern
       );
       if (dayDirectory) {
         const result = await this.scanDayDirectory(
+          root.directory,
           dayDirectory.folderPath,
           dayDirectory.dateName,
           dayDirectory.childFolderNames,
           dayDirectory.ignoredChildFolderNames,
-          seenChildPaths
+          seenChildPaths,
+          root.providers
         );
         scanned += result.scanned;
         newFound += result.newFound;
@@ -2955,11 +3368,11 @@ class ScannerService {
         skipped += result.skipped;
       }
     } catch (err) {
-      log.error("扫描数据根目录失败:", rootDir, err);
+      log.error("扫描数据根目录失败:", root.directory, err);
     }
     return { scanned, newFound, existing, ignored, skipped };
   }
-  async scanDayDirectory(dayFolderPath, dateName, discoveredChildNames, ignoredChildNames, seenChildPaths) {
+  async scanDayDirectory(sourceRootDir, dayFolderPath, dateName, discoveredChildNames, ignoredChildNames, seenChildPaths, providers) {
     const dayFolder = getDayFolderRepo().ensure(dayFolderPath, dateName);
     const childNames = Array.from(
       /* @__PURE__ */ new Set([...discoveredChildNames, ...ignoredChildNames])
@@ -2974,12 +3387,19 @@ class ScannerService {
       for (let index = 0; index < childNames.length; index++) {
         const childName = childNames[index];
         const childPath = path.join(dayFolderPath, childName);
-        const uploadRelativePath = buildUploadRelativePath(dateName, childName);
+        const pathContext = {
+          sourcePath: childPath,
+          basePath: sourceRootDir,
+          dateName,
+          workDirName: childName
+        };
+        const targetSnapshot = this.pendingTargetSnapshot(providers, pathContext);
+        const uploadRelativePath = targetSnapshot.uploadRelativePath;
         seenChildPaths.add(childPath);
         scanned++;
         const existingTask = getTaskRepo().getByFolderPath(childPath);
         if (existingTask) {
-          this.attachTaskToDayFolder(existingTask, dayFolder.id, uploadRelativePath);
+          this.attachTaskToDayFolder(existingTask, dayFolder.id);
           this.pendingDirs.delete(childPath);
           if (dayFolder.ignored && existingTask.status !== "completed" && existingTask.status !== "synced") {
             getTaskRepo().skip(existingTask.id, "用户忽略整个日期");
@@ -2997,7 +3417,9 @@ class ScannerService {
             childPath,
             childName,
             dayFolder.id,
-            uploadRelativePath
+            uploadRelativePath,
+            providers,
+            targetSnapshot
           );
           this.broadcastTaskStatus(task.id, task.status, "skipped");
           ignored++;
@@ -3019,17 +3441,22 @@ class ScannerService {
         }
         const tmpMarker = readTmpUpload(childPath);
         if (tmpMarker) {
+          const markerUploadRelativePath = tmpMarker.metadata.uploadRelativePath ?? uploadRelativePath;
           const task = this.registerNewDir({
             path: childPath,
             dayFolderId: dayFolder.id,
             dateName,
             folderName: childName,
-            uploadRelativePath,
+            uploadRelativePath: markerUploadRelativePath,
             checks: 0,
             discoveredAt: tmpMarker.createdAt || (/* @__PURE__ */ new Date()).toISOString(),
             lastSnapshot: /* @__PURE__ */ new Map(),
             uploadTargetMode: tmpMarker.metadata.uploadTargetMode,
-            destinationPrefixes: tmpMarker.metadata.destinationPrefixes
+            destinationPrefixes: tmpMarker.metadata.destinationPrefixes,
+            destinationUploadRelativePaths: tmpMarker.metadata.destinationUploadRelativePaths || this.legacyDestinationUploadRelativePaths(
+              tmpMarker.metadata.uploadTargetMode,
+              markerUploadRelativePath
+            )
           });
           if (dayFolder.ignored) {
             getTaskRepo().skip(task.id, "用户忽略整个日期");
@@ -3050,7 +3477,10 @@ class ScannerService {
             uploadRelativePath,
             checks: 0,
             discoveredAt: (/* @__PURE__ */ new Date()).toISOString(),
-            lastSnapshot: /* @__PURE__ */ new Map()
+            lastSnapshot: /* @__PURE__ */ new Map(),
+            uploadTargetMode: targetSnapshot.mode,
+            destinationPrefixes: targetSnapshot.prefixes,
+            destinationUploadRelativePaths: targetSnapshot.uploadRelativePaths
           };
           const task = this.registerNewDir(pending);
           if (dayFolder.ignored) {
@@ -3097,8 +3527,13 @@ class ScannerService {
       prefixes: {
         aliyun: pending.destinationPrefixes.aliyun || "",
         tencent: pending.destinationPrefixes.tencent || ""
-      }
-    } : getUploadTargetSnapshot(settings);
+      },
+      uploadRelativePaths: pending.destinationUploadRelativePaths || this.legacyDestinationUploadRelativePaths(
+        pending.uploadTargetMode,
+        pending.uploadRelativePath
+      ),
+      uploadRelativePath: pending.uploadRelativePath
+    } : this.legacySnapshotForPendingDir(pending, settings);
     const marker = {
       version: 2,
       createdAt: (/* @__PURE__ */ new Date()).toISOString(),
@@ -3109,7 +3544,8 @@ class ScannerService {
         date: pending.dateName,
         uploadRelativePath: pending.uploadRelativePath,
         uploadTargetMode: snapshot.mode,
-        destinationPrefixes: snapshot.prefixes
+        destinationPrefixes: snapshot.prefixes,
+        destinationUploadRelativePaths: snapshot.uploadRelativePaths
       }
     };
     writeTmpUpload(pending.path, marker);
@@ -3125,12 +3561,16 @@ class ScannerService {
     getDayFolderService().refresh(pending.dayFolderId);
     return task;
   }
-  registerIgnoredDir(dirPath, folderName, dayFolderId, uploadRelativePath) {
+  registerIgnoredDir(dirPath, folderName, dayFolderId, uploadRelativePath, providers, targetSnapshot) {
     const task = this.ensureTaskRegistered(
       dirPath,
       folderName,
       dayFolderId,
-      uploadRelativePath
+      uploadRelativePath,
+      targetSnapshot || (providers ? getUploadTargetSnapshotForProviders(
+        providers,
+        getSettingsRepo().getAll()
+      ) : void 0)
     );
     if (task.status !== "skipped" || task.errorMessage !== NON_WORK_DIR_REASON) {
       getTaskRepo().skip(task.id, NON_WORK_DIR_REASON);
@@ -3296,6 +3736,7 @@ class ScannerService {
       aliyun: tmpMarker?.metadata.destinationPrefixes?.aliyun || currentSettings.oss.prefix || "",
       tencent: tmpMarker?.metadata.destinationPrefixes?.tencent || currentSettings.tencentS3.prefix || ""
     };
+    const uploadRelativePaths = tmpMarker?.metadata.destinationUploadRelativePaths || this.legacyDestinationUploadRelativePaths(mode, legacyUploadRelativePath);
     const task = this.ensureTaskRegistered(
       dirPath,
       folderName,
@@ -3303,7 +3744,9 @@ class ScannerService {
       legacyUploadRelativePath,
       {
         mode,
-        prefixes
+        prefixes,
+        uploadRelativePaths,
+        uploadRelativePath: legacyUploadRelativePath
       }
     );
     const taskRepo = getTaskRepo();
@@ -3340,7 +3783,8 @@ class ScannerService {
         date: dateName,
         uploadRelativePath: legacyUploadRelativePath,
         uploadTargetMode: mode,
-        destinationPrefixes: prefixes
+        destinationPrefixes: prefixes,
+        destinationUploadRelativePaths: uploadRelativePaths
       }
     });
     writeProcessTask(dirPath, {
@@ -3356,7 +3800,7 @@ class ScannerService {
     const taskRepo = getTaskRepo();
     const existing = taskRepo.getByFolderPath(dirPath);
     if (existing) {
-      this.attachTaskToDayFolder(existing, dayFolderId, uploadRelativePath);
+      this.attachTaskToDayFolder(existing, dayFolderId);
       return taskRepo.getById(existing.id);
     }
     const settings = getSettingsRepo().getAll();
@@ -3367,16 +3811,51 @@ class ScannerService {
       ossPrefix: snapshot.prefixes.aliyun,
       uploadTargetMode: snapshot.mode,
       destinationPrefixes: snapshot.prefixes,
+      destinationUploadRelativePaths: snapshot.uploadRelativePaths,
       dayFolderId,
       uploadRelativePath,
       sourceType: "local"
     });
   }
-  attachTaskToDayFolder(task, dayFolderId, uploadRelativePath) {
-    const targetUploadRelativePath = task.status === "completed" && task.uploadRelativePath === task.folderName ? task.uploadRelativePath : uploadRelativePath;
-    if (task.dayFolderId !== dayFolderId || task.uploadRelativePath !== targetUploadRelativePath) {
-      getTaskRepo().updateDayFolderMetadata(task.id, dayFolderId, targetUploadRelativePath);
+  pendingTargetSnapshot(providers, context) {
+    const snapshot = getUploadTargetSnapshotForProviders(
+      providers,
+      getSettingsRepo().getAll(),
+      context
+    );
+    return {
+      uploadTargetMode: snapshot.mode,
+      destinationPrefixes: snapshot.prefixes,
+      destinationUploadRelativePaths: snapshot.uploadRelativePaths,
+      uploadRelativePath: snapshot.uploadRelativePath,
+      mode: snapshot.mode,
+      prefixes: snapshot.prefixes,
+      uploadRelativePaths: snapshot.uploadRelativePaths
+    };
+  }
+  legacySnapshotForPendingDir(pending, settings) {
+    const snapshot = getUploadTargetSnapshot(settings);
+    return {
+      ...snapshot,
+      uploadRelativePath: pending.uploadRelativePath,
+      uploadRelativePaths: this.legacyDestinationUploadRelativePaths(
+        snapshot.mode,
+        pending.uploadRelativePath
+      )
+    };
+  }
+  attachTaskToDayFolder(task, dayFolderId) {
+    if (task.dayFolderId !== dayFolderId) {
+      getTaskRepo().updateDayFolderId(task.id, dayFolderId);
     }
+  }
+  legacyDestinationUploadRelativePaths(mode, uploadRelativePath) {
+    if (uploadRelativePath === void 0) return {};
+    const paths = {};
+    for (const provider of providersForMode(mode || "aliyun")) {
+      paths[provider] = uploadRelativePath;
+    }
+    return paths;
   }
   collectDataInfo(dirPath) {
     const settings = getSettingsRepo();
@@ -3974,7 +4453,12 @@ class SSHRsyncService {
   async sftpUploadDir(sftp, machine, settings, uploaders, onProgress) {
     const files = await this.sftpListFiles(sftp, machine.remoteDir, machine.remoteDir);
     log.info(`SFTP 发现 ${files.length} 个文件`);
-    const uploadRelativePath = resolveDirectoryUploadRelativePath(machine.remoteDir);
+    const providers = Array.from(uploaders.keys());
+    const uploadRelativePaths = resolveProviderUploadRelativePaths(
+      settings,
+      providers,
+      { sourcePath: machine.remoteDir }
+    );
     let uploadedCount = 0;
     const providerResults = /* @__PURE__ */ new Map();
     for (const provider of uploaders.keys()) {
@@ -4006,7 +4490,7 @@ class SSHRsyncService {
                 const prefix = provider === "aliyun" ? settings.oss.prefix : settings.tencentS3.prefix;
                 const objectKey = buildOssKey(
                   prefix,
-                  uploadRelativePath,
+                  uploadRelativePaths[provider] ?? "",
                   relativePath
                 );
                 try {
@@ -4157,16 +4641,18 @@ function registerAllIpc() {
   electron.ipcMain.handle(IPC.TASK_ADD_FOLDER, (_event, args) => {
     const taskRepo = getTaskRepo();
     const settingsRepo = getSettingsRepo();
-    const snapshot = getUploadTargetSnapshot(settingsRepo.getAll());
+    const snapshot = getUploadTargetSnapshot(settingsRepo.getAll(), {
+      sourcePath: args.folderPath
+    });
     const folderName = path.basename(args.folderPath);
-    const uploadRelativePath = resolveDirectoryUploadRelativePath(args.folderPath);
     const task = taskRepo.create({
       folderPath: args.folderPath,
       folderName,
       ossPrefix: snapshot.prefixes.aliyun,
       uploadTargetMode: snapshot.mode,
       destinationPrefixes: snapshot.prefixes,
-      uploadRelativePath,
+      destinationUploadRelativePaths: snapshot.uploadRelativePaths,
+      uploadRelativePath: snapshot.uploadRelativePath,
       sourceType: "manual"
     });
     getScannerService().queueReconcileTask(task);
@@ -4227,7 +4713,7 @@ function registerAllIpc() {
     return getDayFolderRepo().list(query);
   });
   electron.ipcMain.handle(IPC.DAY_FOLDER_DELETE, (_event, args) => {
-    getDayFolderRepo().deleteCompleted(args.id);
+    getDayFolderRepo().deleteCompleted(args.id, args.provider);
   });
   electron.ipcMain.handle(IPC.DAY_FOLDER_IGNORE, (_event, args) => {
     const repo = getDayFolderRepo();
@@ -4324,13 +4810,16 @@ function registerAllIpc() {
       db2.prepare("UPDATE ssh_machines SET last_sync_at = ? WHERE id = ?").run((/* @__PURE__ */ new Date()).toISOString(), args.machineId);
       const taskRepo = getTaskRepo();
       const settingsRepo = getSettingsRepo();
-      const snapshot = getUploadTargetSnapshot(settingsRepo.getAll());
       const localDir = path.normalize(machine.localDir).replace(/[\\/]+$/, "");
-      const uploadRelativePath = resolveDirectoryUploadRelativePath(
-        machine.remoteDir,
-        localDir
-      );
+      const snapshot = getUploadTargetSnapshot(settingsRepo.getAll(), {
+        sourcePath: machine.remoteDir,
+        fallbackDirectoryPath: localDir
+      });
       const existing = taskRepo.getByFolderPath(localDir);
+      let markerMode = snapshot.mode;
+      let markerPrefixes = snapshot.prefixes;
+      let markerUploadRelativePath = snapshot.uploadRelativePath;
+      let markerUploadRelativePaths = snapshot.uploadRelativePaths;
       if (!existing || existing.status === "completed" || existing.status === "failed") {
         const task = taskRepo.create({
           folderPath: localDir,
@@ -4338,14 +4827,27 @@ function registerAllIpc() {
           ossPrefix: snapshot.prefixes.aliyun,
           uploadTargetMode: snapshot.mode,
           destinationPrefixes: snapshot.prefixes,
-          uploadRelativePath,
+          destinationUploadRelativePaths: snapshot.uploadRelativePaths,
+          uploadRelativePath: snapshot.uploadRelativePath,
           sourceType: "rsync",
           sourceMachineId: machine.id
         });
         getScannerService().queueReconcileTask(task);
         log.info("rsync 完成, 自动创建上传任务:", localDir);
-      } else if (existing.uploadRelativePath !== uploadRelativePath) {
-        taskRepo.updateUploadRelativePath(existing.id, uploadRelativePath);
+      } else {
+        const current = taskRepo.getById(existing.id) || existing;
+        markerMode = current.uploadTargetMode;
+        markerPrefixes = {
+          aliyun: current.destinations.find((item) => item.provider === "aliyun")?.prefix || "",
+          tencent: current.destinations.find((item) => item.provider === "tencent")?.prefix || ""
+        };
+        markerUploadRelativePaths = Object.fromEntries(
+          current.destinations.map((destination) => [
+            destination.provider,
+            destination.uploadRelativePath
+          ])
+        );
+        markerUploadRelativePath = current.uploadRelativePath;
       }
       writeTmpUpload(localDir, {
         version: 2,
@@ -4354,9 +4856,10 @@ function registerAllIpc() {
         metadata: {
           source: "rsync",
           machineId: machine.id,
-          uploadRelativePath,
-          uploadTargetMode: snapshot.mode,
-          destinationPrefixes: snapshot.prefixes
+          uploadRelativePath: markerUploadRelativePath,
+          uploadTargetMode: markerMode,
+          destinationPrefixes: markerPrefixes,
+          destinationUploadRelativePaths: markerUploadRelativePaths
         }
       });
     } catch (err) {
@@ -4371,11 +4874,11 @@ function registerAllIpc() {
     return getHistoryRepo().list(query);
   });
   electron.ipcMain.handle(IPC.HISTORY_CLEAR, (_event, args) => {
-    getHistoryRepo().clear(args?.before);
-    getDayFolderRepo().clearCompleted(args?.before);
+    getHistoryRepo().clear(args?.before, args?.provider);
+    getDayFolderRepo().clearCompleted(args?.before, args?.provider);
   });
   electron.ipcMain.handle(IPC.HISTORY_DELETE, (_event, args) => {
-    getHistoryRepo().deleteById(args.id);
+    getHistoryRepo().deleteById(args.id, args.provider);
   });
   electron.ipcMain.handle(IPC.DIALOG_SELECT_FOLDER, async () => {
     const win = getMainWindow();
@@ -4437,7 +4940,7 @@ function registerAllIpc() {
   });
   electron.ipcMain.handle(IPC.DISK_USAGE, async () => {
     const settingsRepo = getSettingsRepo();
-    const scanConfig = settingsRepo.get("scan");
+    const scanConfig = settingsRepo.getAll().scan;
     const db2 = getDb();
     const paths = /* @__PURE__ */ new Set();
     if (scanConfig?.directories) {
@@ -4573,11 +5076,6 @@ class TaskRunnerService {
         "源目录已删除"
       );
       return "skipped";
-    }
-    const dateScopedUploadPath = deriveDateScopedUploadRelativePath(task.folderPath);
-    if (dateScopedUploadPath && task.uploadRelativePath !== dateScopedUploadPath && task.status !== "completed") {
-      taskRepo.updateUploadRelativePath(task.id, dateScopedUploadPath);
-      task.uploadRelativePath = dateScopedUploadPath;
     }
     await this.reconcileBeforeUpload(task, stableChecks);
     const destinations = destinationRepo.listByTask(task.id);
@@ -4782,7 +5280,7 @@ class TaskRunnerService {
       );
       const objectKey = buildOssKey(
         destination.prefix,
-        task.uploadRelativePath || task.folderName,
+        destination.uploadRelativePath,
         target.relativePath
       );
       let previousLoaded = 0;
@@ -4969,6 +5467,7 @@ class TaskRunnerService {
             destination.provider,
             {
               status: destination.status,
+              uploadRelativePath: destination.uploadRelativePath,
               totalFiles: targets.length,
               uploadedFiles: targets.filter(
                 (target) => target.status === "completed"

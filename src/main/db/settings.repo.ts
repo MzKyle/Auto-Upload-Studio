@@ -5,6 +5,7 @@ import {
   normalizeScanDirectories,
   normalizeProviderDirectories
 } from '@shared/scan-config'
+import { normalizeUploadPathConfig } from '@shared/upload-path'
 import type { AppSettings, CloudConfig, ScanConfig } from '@shared/types'
 
 function normalizeSuffixes(suffixes: string[]): string[] {
@@ -56,6 +57,15 @@ export class SettingsRepo {
           )
         }
       }
+      if (
+        (key === 'oss' || key === 'tencentS3') &&
+        typeof parsed === 'object' &&
+        parsed !== null
+      ) {
+        return normalizeUploadPathConfig(
+          parsed as unknown as Record<string, unknown>
+        ) as T
+      }
       return parsed
     } catch {
       return row.value as unknown as T
@@ -99,6 +109,15 @@ export class SettingsRepo {
           cloud?.targetMode || DEFAULT_SETTINGS.cloud.targetMode
         )
       }
+    }
+    if (
+      (key === 'oss' || key === 'tencentS3') &&
+      typeof value === 'object' &&
+      value !== null
+    ) {
+      persistedValue = normalizeUploadPathConfig(
+        value as unknown as Record<string, unknown>
+      )
     }
 
     const serialized = typeof persistedValue === 'string' ? persistedValue : JSON.stringify(persistedValue)
@@ -151,6 +170,12 @@ export class SettingsRepo {
     if (settings.filter && Array.isArray(settings.filter.suffixes)) {
       settings.filter.suffixes = normalizeSuffixes(settings.filter.suffixes)
     }
+    settings.oss = normalizeUploadPathConfig(
+      settings.oss as unknown as Record<string, unknown>
+    ) as unknown as AppSettings['oss']
+    settings.tencentS3 = normalizeUploadPathConfig(
+      settings.tencentS3 as unknown as Record<string, unknown>
+    ) as unknown as AppSettings['tencentS3']
     settings.scan = normalizeScanConfig(
       settings.scan,
       settings.cloud.targetMode

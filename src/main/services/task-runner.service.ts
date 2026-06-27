@@ -3,7 +3,7 @@ import { join } from 'path'
 import { BrowserWindow } from 'electron'
 import log from 'electron-log'
 import { IPC } from '@shared/ipc-channels'
-import { buildOssKey, deriveDateScopedUploadRelativePath } from '@shared/day-folder'
+import { buildOssKey } from '@shared/day-folder'
 import { getTaskRepo } from '../db/task.repo'
 import {
   getTaskDestinationRepo,
@@ -63,16 +63,6 @@ export class TaskRunnerService {
         '源目录已删除'
       )
       return 'skipped'
-    }
-
-    const dateScopedUploadPath = deriveDateScopedUploadRelativePath(task.folderPath)
-    if (
-      dateScopedUploadPath &&
-      task.uploadRelativePath !== dateScopedUploadPath &&
-      task.status !== 'completed'
-    ) {
-      taskRepo.updateUploadRelativePath(task.id, dateScopedUploadPath)
-      task.uploadRelativePath = dateScopedUploadPath
     }
 
     await this.reconcileBeforeUpload(task, stableChecks)
@@ -309,7 +299,7 @@ export class TaskRunnerService {
 
       const objectKey = buildOssKey(
         destination.prefix,
-        task.uploadRelativePath || task.folderName,
+        destination.uploadRelativePath,
         target.relativePath
       )
       let previousLoaded = 0
@@ -527,6 +517,7 @@ export class TaskRunnerService {
             destination.provider,
             {
               status: destination.status,
+              uploadRelativePath: destination.uploadRelativePath,
               totalFiles: targets.length,
               uploadedFiles: targets.filter(
                 (target) => target.status === 'completed'

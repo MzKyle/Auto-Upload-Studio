@@ -26,6 +26,11 @@ export type SSHAuthType = 'key' | 'password'
 export type TransferMode = 'rsync' | 'sftp'
 export type CloudProvider = 'aliyun' | 'tencent'
 export type UploadTargetMode = 'aliyun' | 'tencent' | 'both'
+export type UploadPathMode =
+  | 'target-root'
+  | 'date-workdir'
+  | 'keep-source'
+  | 'last-segments'
 
 export interface Task {
   id: string
@@ -83,6 +88,7 @@ export interface TaskDestination {
   provider: CloudProvider
   status: TaskStatus
   prefix: string
+  uploadRelativePath: string
   totalFiles: number
   uploadedFiles: number
   totalBytes: number
@@ -215,6 +221,8 @@ export interface OSSConfig {
   bucket: string
   region: string
   prefix: string
+  pathMode: UploadPathMode
+  pathSegmentCount: number
   accessKeyId: string
   accessKeySecret: string
 }
@@ -224,6 +232,8 @@ export interface TencentS3Config {
   bucket: string
   region: string
   prefix: string
+  pathMode: UploadPathMode
+  pathSegmentCount: number
   accessKeyId: string
   accessKeySecret: string
   allowInsecureTls: boolean
@@ -387,11 +397,13 @@ export interface TmpUploadMarker {
     uploadRelativePath?: string
     uploadTargetMode?: UploadTargetMode
     destinationPrefixes?: Partial<Record<CloudProvider, string>>
+    destinationUploadRelativePaths?: Partial<Record<CloudProvider, string>>
   }
 }
 
 export interface ProcessTaskDestinationMarker {
   status: TaskStatus
+  uploadRelativePath?: string
   totalFiles: number
   uploadedFiles: number
   files?: Record<string, FileStatus>

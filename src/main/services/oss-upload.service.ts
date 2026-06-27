@@ -1,5 +1,4 @@
 import { createReadStream } from 'fs'
-import log from 'electron-log'
 import type { AppSettings } from '@shared/types'
 import type { CloudTaskUploader } from './cloud-upload.types'
 

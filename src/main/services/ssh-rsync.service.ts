@@ -1,7 +1,7 @@
 import { spawn, type ChildProcess } from 'child_process'
 import { Client as SSHClient, type SFTPWrapper } from 'ssh2'
 import { readFileSync } from 'fs'
-import { join, posix } from 'path'
+import { posix } from 'path'
 import log from 'electron-log'
 import type {
   CloudOperationResult,
@@ -9,13 +9,12 @@ import type {
   SSHMachine,
   RsyncProgress,
   SftpProgress,
-  AppSettings
+  AppSettings,
+  CloudProvider
 } from '@shared/types'
 import { providersForMode } from '@shared/cloud-upload'
-import {
-  buildOssKey,
-  resolveDirectoryUploadRelativePath
-} from '@shared/day-folder'
+import { buildOssKey } from '@shared/day-folder'
+import { resolveProviderUploadRelativePaths } from '@shared/upload-path'
 import { getCloudUploadService } from './cloud-upload.service'
 import type { CloudTaskUploader } from './cloud-upload.types'
 
@@ -149,7 +148,7 @@ export class SSHRsyncService {
     }
 
     const providers = providersForMode(settings.cloud.targetMode)
-    const uploaders = new Map<string, CloudTaskUploader>()
+    const uploaders = new Map<CloudProvider, CloudTaskUploader>()
     try {
       for (const provider of providers) {
         const validationError = getCloudUploadService().validateProvider(provider, settings)
@@ -233,14 +232,19 @@ export class SSHRsyncService {
     sftp: SFTPWrapper,
     machine: SSHMachine,
     settings: AppSettings,
-    uploaders: Map<string, CloudTaskUploader>,
+    uploaders: Map<CloudProvider, CloudTaskUploader>,
     onProgress?: (progress: SftpProgress) => void
   ): Promise<MultiCloudOperationResult> {
     // 递归列出所有远程文件
     const files = await this.sftpListFiles(sftp, machine.remoteDir, machine.remoteDir)
     log.info(`SFTP 发现 ${files.length} 个文件`)
 
-    const uploadRelativePath = resolveDirectoryUploadRelativePath(machine.remoteDir)
+    const providers = Array.from(uploaders.keys())
+    const uploadRelativePaths = resolveProviderUploadRelativePaths(
+      settings,
+      providers,
+      { sourcePath: machine.remoteDir }
+    )
     let uploadedCount = 0
     const providerResults = new Map<string, CloudOperationResult>()
     for (const provider of uploaders.keys()) {
@@ -280,7 +284,7 @@ export class SSHRsyncService {
                     : settings.tencentS3.prefix
                 const objectKey = buildOssKey(
                   prefix,
-                  uploadRelativePath,
+                  uploadRelativePaths[provider] ?? '',
                   relativePath
                 )
                 try {

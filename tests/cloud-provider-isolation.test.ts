@@ -82,6 +82,8 @@ test('scanner task registration creates provider-specific destinations', () => {
         targetSnapshot: {
           mode: UploadTargetMode
           prefixes: Record<CloudProvider, string>
+          uploadRelativePaths: Partial<Record<CloudProvider, string>>
+          uploadRelativePath: string
         }
       ) => Task
     }
@@ -91,21 +93,39 @@ test('scanner task registration creates provider-specific destinations', () => {
       'a',
       dayFolder.id,
       '2026-06-27/a',
-      { mode: 'aliyun', prefixes: { aliyun: 'ali/', tencent: 'ten/' } }
+      {
+        mode: 'aliyun',
+        prefixes: { aliyun: 'ali/', tencent: 'ten/' },
+        uploadRelativePaths: { aliyun: '' },
+        uploadRelativePath: ''
+      }
     )
     const tencentTask = scanner.ensureTaskRegistered(
       '/data/2026-06-27/t',
       't',
       dayFolder.id,
       '2026-06-27/t',
-      { mode: 'tencent', prefixes: { aliyun: 'ali/', tencent: 'ten/' } }
+      {
+        mode: 'tencent',
+        prefixes: { aliyun: 'ali/', tencent: 'ten/' },
+        uploadRelativePaths: { tencent: 'custom/tencent' },
+        uploadRelativePath: 'custom/tencent'
+      }
     )
     const bothTask = scanner.ensureTaskRegistered(
       '/data/2026-06-27/both',
       'both',
       dayFolder.id,
       '2026-06-27/both',
-      { mode: 'both', prefixes: { aliyun: 'ali/', tencent: 'ten/' } }
+      {
+        mode: 'both',
+        prefixes: { aliyun: 'ali/', tencent: 'ten/' },
+        uploadRelativePaths: {
+          aliyun: 'ali/path',
+          tencent: 'tencent/path'
+        },
+        uploadRelativePath: 'ali/path'
+      }
     )
 
     assert.deepEqual(
@@ -119,6 +139,16 @@ test('scanner task registration creates provider-specific destinations', () => {
     assert.deepEqual(
       getTaskDestinationRepo().listByTask(bothTask.id).map((item) => item.provider),
       ['aliyun', 'tencent']
+    )
+    assert.deepEqual(
+      getTaskDestinationRepo().listByTask(bothTask.id).map((item) => ({
+        provider: item.provider,
+        uploadRelativePath: item.uploadRelativePath
+      })),
+      [
+        { provider: 'aliyun', uploadRelativePath: 'ali/path' },
+        { provider: 'tencent', uploadRelativePath: 'tencent/path' }
+      ]
     )
   } finally {
     closeTestDb(db)
