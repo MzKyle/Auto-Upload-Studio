@@ -27,7 +27,7 @@ function MainLayout() {
       <nav className="w-48 border-r bg-muted/30 flex flex-col py-4 flex-shrink-0">
         <div className="px-4 mb-6">
           <h1 className="text-sm font-bold text-foreground">
-            数据采集上传工具
+            云桥上传器
           </h1>
         </div>
         <div className="flex flex-col gap-1 px-2">

@@ -24,8 +24,8 @@ sudo apt-get -f install -y
 没有系统管理员权限时，可以直接运行或放置 Linux AppImage：
 
 ```bash
-chmod +x dist/数据采集上传工具-2.2.0.AppImage
-dist/数据采集上传工具-2.2.0.AppImage
+chmod +x dist/云桥上传器-2.2.0.AppImage
+dist/云桥上传器-2.2.0.AppImage
 ```
 
 ## 安装后验证

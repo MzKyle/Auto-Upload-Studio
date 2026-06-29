@@ -1,5 +1,5 @@
 appId: com.uploader.app
-productName: 数据采集上传工具
+productName: 云桥上传器
 directories:
   buildResources: resources
   output: dist

@@ -1,13 +1,13 @@
 {
   "name": "electron-uploader",
   "version": "2.2.0",
-  "description": "数据采集文件夹上传工具",
+  "description": "云桥上传器：工业采集数据多云归档工具",
   "author": {
     "name": "WeldingTeam",
     "email": "welding@example.com"
   },
   "license": "MIT",
-  "homepage": "https://github.com/welding/electron-uploader",
+  "homepage": "https://github.com/MzKyle/Auto-Upload-Studio",
   "main": "./out/main/index.js",
   "scripts": {
     "dev": "electron-vite dev",

@@ -1,10 +1,10 @@
-# Data Collection Uploader
+# CloudBridge Uploader
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
-![Data Collection Uploader](docs/assets/cover.svg)
+![CloudBridge Uploader](docs/assets/cover.svg)
 
-Data Collection Uploader is an Electron desktop application for reliably archiving
+CloudBridge Uploader is an Electron desktop application for reliably archiving
 industrial collection data to Aliyun OSS, Tencent TurboS3, or both clouds. It discovers
 stable welding-session directories, schedules resumable upload tasks, tracks each cloud
 independently, and closes completed date directories for retention and cleanup.

@@ -6375,7 +6375,7 @@ async function createStartupWindow() {
     minimizable: false,
     maximizable: false,
     show: false,
-    title: "数据采集上传工具正在启动",
+    title: "云桥上传器正在启动",
     backgroundColor: "#f8fafc",
     webPreferences: {
       sandbox: true,
@@ -6389,7 +6389,7 @@ async function createStartupWindow() {
       <head><meta charset="utf-8"><title>正在启动</title></head>
       <body style="margin:0;font-family:sans-serif;background:#f8fafc;color:#0f172a">
         <main style="height:220px;display:flex;flex-direction:column;align-items:center;justify-content:center">
-          <div style="font-size:18px;font-weight:600">数据采集上传工具正在启动</div>
+          <div style="font-size:18px;font-weight:600">云桥上传器正在启动</div>
           <div style="margin-top:14px;font-size:14px;color:#475569">正在检查和升级本地数据库，请勿重复启动或强制关机。</div>
           <div style="margin-top:8px;font-size:12px;color:#64748b">历史文件较多时首次升级可能需要几分钟。</div>
         </main>
@@ -6404,7 +6404,7 @@ function createWindow() {
     minWidth: 900,
     minHeight: 600,
     show: false,
-    title: "数据采集上传工具",
+    title: "云桥上传器",
     webPreferences: {
       preload: path.join(__dirname, "../preload/index.js"),
       sandbox: false,
@@ -6463,7 +6463,7 @@ function createTray() {
       }
     }
   ]);
-  tray.setToolTip("数据采集上传工具");
+  tray.setToolTip("云桥上传器");
   tray.setContextMenu(contextMenu);
   tray.on("click", () => {
     mainWindow?.show();
@@ -6599,8 +6599,8 @@ electron.app.whenReady().then(async () => {
   startupWindow?.destroy();
   startupWindow = null;
   electron.dialog.showErrorBox(
-    "数据采集上传工具启动失败",
-    message.includes("database is locked") ? "数据库正在被另一个程序进程使用。请结束旧的数据采集上传工具进程后重试。" : `${message}
+    "云桥上传器启动失败",
+    message.includes("database is locked") ? "数据库正在被另一个程序进程使用。请结束旧的云桥上传器进程后重试。" : `${message}
 
 请查看 ~/.config/electron-uploader/logs 下的日志。`
   );

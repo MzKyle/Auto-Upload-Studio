@@ -2,7 +2,7 @@
 // 共享常量
 // ============================================
 
-export const APP_NAME = '数据采集上传工具'
+export const APP_NAME = '云桥上传器'
 export const DEFAULT_WORK_DIR_NAME_PATTERN = '^\\d{2}-\\d{2}-\\d{2}$'
 export const DEFAULT_UPLOAD_PROFILE_ID = 'default'
 
