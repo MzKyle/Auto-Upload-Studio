@@ -663,7 +663,7 @@ export class TaskRunnerService {
       skippedFiles: runtime.skippedFiles,
       transferredBytes: runtime.transferredBytes
     }
-    for (const win of BrowserWindow.getAllWindows()) {
+    for (const win of BrowserWindow?.getAllWindows?.() ?? []) {
       win.webContents.send(IPC.TASK_PROGRESS, progress)
     }
   }
@@ -683,7 +683,7 @@ export class TaskRunnerService {
     status: TaskStatus,
     errorMessage?: string
   ): void {
-    for (const win of BrowserWindow.getAllWindows()) {
+    for (const win of BrowserWindow?.getAllWindows?.() ?? []) {
       win.webContents.send(IPC.TASK_DESTINATION_CHANGE, {
         taskId,
         provider,

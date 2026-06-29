@@ -19,6 +19,7 @@ import { v4 as uuid } from 'uuid'
 import type { AppSettings, CloudProvider, HistoryQuery, TaskStatus, SSHMachine, SSHMachineInput, RsyncProgress, TransferMode, DiskUsageInfo, DayFolderListQuery, UploadPathMode, UploadProfile } from '@shared/types'
 import { basename, dirname, normalize } from 'path'
 import { isDateFolderName } from '@shared/day-folder'
+import { shouldRestartScannerAfterSettingsSave } from '@shared/settings-effects'
 import {
   buildObjectKeyVariables,
   getProfileById,
@@ -214,7 +215,7 @@ export function registerAllIpc(): void {
     if (data.cleanup !== undefined) {
       getCleanupService().scheduleCleanup()
     }
-    if (data.scan !== undefined || data.stability !== undefined) {
+    if (shouldRestartScannerAfterSettingsSave(data)) {
       getScannerService().stop()
       getScannerService().start()
     }

@@ -753,7 +753,7 @@ export class ScannerService {
     oldStatus: Task['status'],
     newStatus: Task['status']
   ): void {
-    for (const win of BrowserWindow.getAllWindows()) {
+    for (const win of BrowserWindow?.getAllWindows?.() ?? []) {
       win.webContents.send(IPC.TASK_STATUS_CHANGE, {
         taskId,
         oldStatus,
@@ -971,7 +971,7 @@ export class ScannerService {
     try {
       const info = getDataCollectService().collectDataInfo(dirPath)
       if (info) {
-        for (const win of BrowserWindow.getAllWindows()) {
+        for (const win of BrowserWindow?.getAllWindows?.() ?? []) {
           win.webContents.send(IPC.DATA_COLLECT_RESULT, info)
         }
       }
@@ -982,7 +982,7 @@ export class ScannerService {
 
   private broadcastStatus(): void {
     const status = this.getStatus()
-    for (const win of BrowserWindow.getAllWindows()) {
+    for (const win of BrowserWindow?.getAllWindows?.() ?? []) {
       win.webContents.send(IPC.SCANNER_EVENT, status)
     }
   }

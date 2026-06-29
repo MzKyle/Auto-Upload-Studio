@@ -2417,7 +2417,7 @@ class SettingsRepo {
       const val = this.get(key);
       if (val !== null) {
         const defaultSection = settingsRecord[section];
-        if (typeof defaultSection === "object" && defaultSection !== null && typeof val === "object" && val !== null) {
+        if (typeof defaultSection === "object" && defaultSection !== null && typeof val === "object" && val !== null && !Array.isArray(defaultSection) && !Array.isArray(val)) {
           settingsRecord[section] = {
             ...defaultSection,
             ...val
@@ -3183,7 +3183,7 @@ class DayFolderService {
     return this.refresh(task.dayFolderId);
   }
   broadcast(summary) {
-    for (const win of electron.BrowserWindow.getAllWindows()) {
+    for (const win of electron.BrowserWindow?.getAllWindows?.() ?? []) {
       win.webContents.send(IPC.DAY_FOLDER_EVENT, summary);
     }
   }
@@ -4166,7 +4166,7 @@ class ScannerService {
     }
   }
   broadcastTaskStatus(taskId, oldStatus, newStatus) {
-    for (const win of electron.BrowserWindow.getAllWindows()) {
+    for (const win of electron.BrowserWindow?.getAllWindows?.() ?? []) {
       win.webContents.send(IPC.TASK_STATUS_CHANGE, {
         taskId,
         oldStatus,
@@ -4321,7 +4321,7 @@ class ScannerService {
     try {
       const info = getDataCollectService().collectDataInfo(dirPath);
       if (info) {
-        for (const win of electron.BrowserWindow.getAllWindows()) {
+        for (const win of electron.BrowserWindow?.getAllWindows?.() ?? []) {
           win.webContents.send(IPC.DATA_COLLECT_RESULT, info);
         }
       }
@@ -4331,7 +4331,7 @@ class ScannerService {
   }
   broadcastStatus() {
     const status = this.getStatus();
-    for (const win of electron.BrowserWindow.getAllWindows()) {
+    for (const win of electron.BrowserWindow?.getAllWindows?.() ?? []) {
       win.webContents.send(IPC.SCANNER_EVENT, status);
     }
   }
@@ -5067,6 +5067,9 @@ function getSSHRsyncService() {
   if (!instance$3) instance$3 = new SSHRsyncService();
   return instance$3;
 }
+function shouldRestartScannerAfterSettingsSave(data) {
+  return data.scan !== void 0 || data.stability !== void 0 || data.profiles !== void 0 || data.activeProfileId !== void 0;
+}
 function rowToSSHMachine(row) {
   return {
     id: row.id,
@@ -5222,7 +5225,7 @@ function registerAllIpc() {
     if (data.cleanup !== void 0) {
       getCleanupService().scheduleCleanup();
     }
-    if (data.scan !== void 0 || data.stability !== void 0) {
+    if (shouldRestartScannerAfterSettingsSave(data)) {
       getScannerService().stop();
       getScannerService().start();
     }
@@ -6168,7 +6171,7 @@ class TaskRunnerService {
       skippedFiles: runtime.skippedFiles,
       transferredBytes: runtime.transferredBytes
     };
-    for (const win of electron.BrowserWindow.getAllWindows()) {
+    for (const win of electron.BrowserWindow?.getAllWindows?.() ?? []) {
       win.webContents.send(IPC.TASK_PROGRESS, progress);
     }
   }
@@ -6181,7 +6184,7 @@ class TaskRunnerService {
     }
   }
   broadcastDestinationStatus(taskId, provider, status, errorMessage) {
-    for (const win of electron.BrowserWindow.getAllWindows()) {
+    for (const win of electron.BrowserWindow?.getAllWindows?.() ?? []) {
       win.webContents.send(IPC.TASK_DESTINATION_CHANGE, {
         taskId,
         provider,

@@ -155,7 +155,9 @@ export class SettingsRepo {
           typeof defaultSection === 'object' &&
           defaultSection !== null &&
           typeof val === 'object' &&
-          val !== null
+          val !== null &&
+          !Array.isArray(defaultSection) &&
+          !Array.isArray(val)
         ) {
           ; settingsRecord[section] = {
             ...(defaultSection as Record<string, unknown>),
