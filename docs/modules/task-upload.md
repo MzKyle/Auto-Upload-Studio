@@ -14,14 +14,17 @@
 
 ## 执行流程
 
-1. 读取任务创建时锁定的目标模式和 Prefix。
+1. 读取任务创建时锁定的 Profile 快照、目标模式、Prefix、路径模式和模板。
 2. 校验所有目标提供方配置并创建任务级 uploader。
 3. 从持久化文件队列读取稳定且到期的文件目标。
 4. 读取每个目标的 `pending / uploading / retrying / failed` 状态。
-5. 为对应提供方构建 `{prefix}/{uploadRelativePath}/{relativePath}`。
+5. 非模板模式构建 `{prefix}/{uploadRelativePath}/{relativePath}`；模板模式渲染模板后再追加 Prefix。
 6. 并发上传并分别更新云端进度、文件状态和错误。
 7. 聚合逻辑文件、逻辑任务和日期汇总状态。
 8. 状态切换时写入紧凑的 `process_task.json` 汇总；逐文件详情保存在 SQLite。
+
+上传前会按云端检查待上传文件的对象 Key。若两个不同文件渲染出同一个对象 Key，任务会
+失败并报告重复 Key，避免后上传文件静默覆盖先上传文件。
 
 ## 恢复与重试
 
@@ -41,6 +44,8 @@
 ```
 
 隐藏目录以及 `tmp_upload.json`、`process_task.json`、`day_upload.json` 不参与上传。
+
+新任务使用创建时保存的 Profile 过滤规则；旧任务没有 Profile 快照时回退全局过滤规则。
 
 ## 暂停和取消
 

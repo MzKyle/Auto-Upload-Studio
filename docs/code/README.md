@@ -27,9 +27,9 @@ src/main/index.ts
 | `src/main/db/day-folder.repo.ts` | 日期汇总 |
 | `src/renderer/pages/Dashboard.tsx` | 分云任务视图和日期汇总 |
 | `src/renderer/pages/History.tsx` | 分云历史 |
-| `src/renderer/pages/Settings.tsx` | 双云配置和连接测试 |
-| `src/shared/cloud-upload.ts` | 模式展开和状态聚合 |
-| `src/shared/day-folder.ts` | 日期与对象路径规则 |
+| `src/renderer/pages/Settings.tsx` | 云端凭据、项目 Profile、连接测试和自动保存 |
+| `src/shared/cloud-upload.ts` | 目标模式展开和状态聚合 |
+| `src/shared/day-folder.ts` | 日期、Profile 快照与对象路径规则 |
 
 ## 主链路
 

@@ -13,8 +13,8 @@ sequenceDiagram
   participant Tencent as Tencent
 
   UI->>Scanner: 触发扫描
-  Scanner->>Scanner: 只发现当天日期/工作次目录并登记忽略目录
-  Scanner->>DB: 创建 day_folder、逻辑任务和分云目标
+  Scanner->>Scanner: 按启用 Profile 发现当天日期/工作次目录并登记忽略目录
+  Scanner->>DB: 创建 day_folder、逻辑任务、Profile 快照和分云目标
   Scanner->>Scanner: 写 tmp_upload.json
   Queue->>DB: 获取 pending 任务
   Queue->>Runner: 启动任务
@@ -43,11 +43,11 @@ flowchart LR
   Task --> Cloud["CloudUploadService"]
 
   Remote --> SFTP["SFTP 读取 Buffer"]
-  SFTP --> Direct["按当前模式直传云端"]
+  SFTP --> Direct["按机器 Profile 直传云端"]
 ```
 
-`rsync` 进入普通任务链路，拥有 SQLite 状态、标记文件和历史。SFTP 返回逐云结果，
-但不创建普通任务历史。
+`rsync` 进入普通任务链路，拥有 SQLite 状态、标记文件和历史，并锁定机器绑定 Profile
+的快照。SFTP 返回逐云结果，但不创建普通任务历史。
 
 ## 进度事件
 

@@ -27,14 +27,17 @@
 
 ## 路径和完成规则
 
+对象 Key 由任务创建时保存的 Profile 快照、云端 Prefix、路径模式和模板决定。日期/
+工作次路径模式示例：
+
 ```text
-{providerPrefix}/{date}/{weldFolder}/{fileRelativePath}
+{providerPrefix}/{date}/{workDir}/{fileRelativePath}
 ```
 
-任务创建时锁定模式和 Prefix。双云文件只有两个 `TaskFileDestination` 都完成后，
-逻辑文件才完成；任务同理。
+模板模式会先渲染 `{profile}`、`{date}`、`{workDir}`、`{relativePath}` 等变量，再追加
+云端 Prefix。双云文件只有两个 `TaskFileDestination` 都完成后，逻辑文件才完成；任务同理。
 
 ## Buffer 上传
 
-SFTP 使用 Buffer 上传，并按当前模式创建一个或两个 uploader。操作返回
+SFTP 使用 Buffer 上传，并按机器绑定 Profile 创建一个或两个 uploader。操作返回
 `MultiCloudOperationResult`，但不写入普通任务历史。

@@ -12,22 +12,29 @@ npm run build:all
 
 ## Debian / Ubuntu
 
-应用版本为 `2.1.5`，典型安装命令：
+应用版本为 `2.2.0`，典型安装命令：
 
 ```bash
-sudo dpkg -i electron-uploader_2.1.5_amd64.deb
+sudo dpkg -i electron-uploader_2.2.0_amd64.deb
 sudo apt-get -f install -y
 ```
 
 实际文件名以 `dist/` 产物为准。
 
+没有系统管理员权限时，可以直接运行或放置 Linux AppImage：
+
+```bash
+chmod +x dist/数据采集上传工具-2.2.0.AppImage
+dist/数据采集上传工具-2.2.0.AppImage
+```
+
 ## 安装后验证
 
 1. 启动应用并打开设置页。
-2. 选择上传模式，配置并测试所有启用云端。
-3. 添加包含 `YYYY-MM-DD` 日期目录的数据根目录。
+2. 配置并测试所有启用云端的凭据。
+3. 在项目 Profile 中选择目标云、扫描目录、过滤规则和对象路径模式。
 4. 在当天日期目录下创建一个新的 `HH-MM-SS` 工作次目录并触发扫描。
-5. 确认对象路径包含日期和工作次目录。
+5. 确认对象路径与 Profile 的 Prefix、路径模式或模板预览一致。
 6. 双云模式下确认两个云端都完成后逻辑任务才完成。
 
 ## 原生模块问题

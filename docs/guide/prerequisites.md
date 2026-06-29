@@ -15,8 +15,9 @@ Node.js 12 无法解析当前 TypeScript 和 `tsx` 工具链。
 
 ## 云端准备
 
-阿里云需要 Region、Bucket、AK/SK，可选 Endpoint 和 Prefix。腾讯云需要 Endpoint、
-Region、Bucket、AK/SK，可选 Prefix；默认保持 TLS 校验。
+阿里云需要 Region、Bucket、AK/SK，可选 Endpoint。腾讯云需要 Endpoint、Region、
+Bucket、AK/SK；默认保持 TLS 校验。Prefix 和对象路径模式在项目 Profile 中按云端
+配置；旧全局 Prefix 仅用于兼容迁移。
 
 连接测试需要列举 Bucket 的权限，实际上传还需要对象写入和分片上传权限。两个云端
 应使用彼此独立的最小权限凭据。
@@ -38,5 +39,5 @@ Region、Bucket、AK/SK，可选 Prefix；默认保持 TLS 校验。
       file.csv
 ```
 
-设置中添加 `/data/upload-root`。日期目录必须是有效 `YYYY-MM-DD`，其直接子目录才
-会成为任务。
+在启用的项目 Profile 中添加 `/data/upload-root`。日期目录必须是有效 `YYYY-MM-DD`，
+其直接子目录才会成为任务。

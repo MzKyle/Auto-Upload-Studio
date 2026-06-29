@@ -45,7 +45,7 @@ pending / uploading / completed / failed
 
 | 文件 | 位置 | 作用 |
 | --- | --- | --- |
-| `tmp_upload.json` | 工作次目录 | 扫描登记、任务模式、Prefix 和来源 |
+| `tmp_upload.json` | 工作次目录 | 扫描登记、Profile 快照、任务模式、Prefix、路径规则和来源 |
 | `process_task.json` | 工作次目录 | 逻辑状态与逐云文件状态 |
 | `day_upload.json` | 日期目录 | 跨天完成汇总、子任务和逐云完成信息 |
 

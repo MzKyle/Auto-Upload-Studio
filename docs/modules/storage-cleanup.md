@@ -10,9 +10,10 @@
 
 ## 设置
 
-设置以 section JSON 保存到 `settings` 表，包括 `cloud`、`oss`、`tencentS3`、
-`scan`、`upload`、`filter`、`stability`、`cleanup` 等。读取时与
-`DEFAULT_SETTINGS` 深度合并，使旧数据库获得新增默认字段。
+设置以 section JSON 保存到 `settings` 表，包括 `profiles`、`activeProfileId`、
+`cloud`、`oss`、`tencentS3`、`scan`、`upload`、`filter`、`stability`、`cleanup`
+等。读取时与 `DEFAULT_SETTINGS` 合并并执行 Profile 归一化，使旧数据库获得新增
+默认字段和默认 Profile。
 
 ## 自动清理
 
@@ -31,5 +32,5 @@
 - 双云中仍有一个目标未完成的任务。
 - 尚未超过保留天数的数据。
 
-`retentionDays=0` 表示完成后尽快清理；非法值回退为 7 天。启用前必须确认所有选定
-云端的归档结果可靠。
+`retentionDays=0` 表示完成后尽快清理；非法值回退为 7 天。启用前必须确认相关
+Profile 选定云端的归档结果可靠。

@@ -7,22 +7,24 @@
 - [ ] `npm run typecheck` 通过
 - [ ] 应用启动且设置自动保存正常
 - [ ] 所有启用云端连接测试成功
+- [ ] 至少一个启用的项目 Profile 已配置扫描目录、目标云、过滤规则和路径模式
 
 ## 本地日期目录
 
 ```bash
-mkdir -p /tmp/upload_test/2026-06-18/04-39-04
-echo "hello" > /tmp/upload_test/2026-06-18/04-39-04/a.txt
-echo '{"ok":true}' > /tmp/upload_test/2026-06-18/04-39-04/meta.json
+mkdir -p /tmp/upload_test/2026-06-29/04-39-04
+echo "hello" > /tmp/upload_test/2026-06-29/04-39-04/a.txt
+echo '{"ok":true}' > /tmp/upload_test/2026-06-29/04-39-04/meta.json
 ```
 
-将 `/tmp/upload_test` 添加为数据根目录并触发扫描。
+将 `/tmp/upload_test` 添加到启用 Profile 的扫描目录并触发扫描。
 
 - [ ] 工作次目录稳定后出现 `tmp_upload.json`
 - [ ] 日期汇总显示一个子任务
 - [ ] 当前云端标签显示任务和逐云进度
-- [ ] 对象路径包含 `2026-06-18/04-39-04`
+- [ ] 对象路径与 Profile 的 Prefix、路径模式或模板预览一致
 - [ ] 任务目录出现含逐云状态的 `process_task.json`
+- [ ] 修改 Profile 后，已创建任务仍使用创建时保存的 Profile 快照
 
 自动扫描只处理测试当天的日期目录。测试跨天封账时，可使用系统日期切换、手动添加旧日期
 工作次，或准备已有数据库任务后再验证封账：
@@ -37,6 +39,7 @@ echo '{"ok":true}' > /tmp/upload_test/2026-06-18/04-39-04/meta.json
 
 - [ ] 仅阿里和仅腾讯模式分别可完成
 - [ ] 双云模式必须两端都完成才显示逻辑完成
+- [ ] 不同 Profile 的扫描目录、目标云和过滤规则不会串用
 - [ ] 人为使一个云端失败，另一个云端保持成功
 - [ ] “重试此云端”只补传失败端
 - [ ] 暂停、恢复、取消和时间窗口行为符合预期
@@ -44,8 +47,8 @@ echo '{"ok":true}' > /tmp/upload_test/2026-06-18/04-39-04/meta.json
 
 ## 远程
 
-- [ ] rsync 拉取后创建普通任务并保留日期层路径
-- [ ] SFTP 按当前模式返回每个云端结果
+- [ ] rsync 拉取后按机器绑定 Profile 创建普通任务并保留日期层路径
+- [ ] SFTP 按机器绑定 Profile 返回每个云端结果
 - [ ] SFTP 不创建普通任务历史
 
 ## 清理与迁移
@@ -59,9 +62,10 @@ echo '{"ok":true}' > /tmp/upload_test/2026-06-18/04-39-04/meta.json
 
 ```text
 测试时间：
-应用版本：2.1.5
+应用版本：2.2.0
 Node.js：
-上传模式：
+Profile：
+Profile 目标云：
 阿里 Bucket：
 腾讯 Bucket：
 日期目录：

@@ -2,8 +2,8 @@
 
 ```mermaid
 flowchart LR
-  Root["数据根目录"] --> Scanner["日期发现与稳定性"]
-  Scanner --> Register["日期汇总 + 逻辑任务 + 云端目标"]
+  Profile["项目 Profile"] --> Scanner["日期发现与稳定性"]
+  Scanner --> Register["日期汇总 + 逻辑任务 + Profile 快照 + 云端目标"]
   Register --> Queue["时间窗口与任务并发"]
   Queue --> Runner["文件过滤与分云恢复"]
   Runner --> Cloud["阿里 OSS / 腾讯 TurboS3"]
@@ -23,10 +23,10 @@ flowchart LR
 
 | 能力 | 行为 |
 | --- | --- |
-| 手动添加目录 | 创建 `sourceType=manual` 的普通任务 |
-| rsync | 拉取后创建 `sourceType=rsync` 的普通任务 |
-| SFTP | 按当前模式直传，返回逐云结果，不创建历史 |
+| 手动添加目录 | 选择 Profile 后创建 `sourceType=manual` 的普通任务 |
+| rsync | 拉取后按机器绑定 Profile 创建 `sourceType=rsync` 的普通任务 |
+| SFTP | 按机器绑定 Profile 直传，返回逐云结果，不创建历史 |
 | 数采分析 | 提取工作次目录元信息并广播 |
 | 自动清理 | 清理已封账日期目录及符合条件的独立任务 |
 
-对象 key 始终使用 `/`，任务创建时锁定上传模式和各云端 Prefix。
+对象 key 始终使用 `/`，任务创建时锁定 Profile 快照、上传模式、各云端 Prefix 和路径规则。
