@@ -10,6 +10,7 @@ import {
   fetchDayFolders,
   deleteDayFolderHistory,
   retryTask,
+  fetchSettings,
 } from "@/lib/ipc-client";
 import type {
   CloudProvider,
@@ -25,15 +26,18 @@ export default function History() {
   const [deletingId, setDeletingId] = useState<string | null>(null);
   const [dayFolders, setDayFolders] = useState<DayFolderSummary[]>([]);
   const [provider, setProvider] = useState<CloudProvider>("aliyun");
+  const [providerReady, setProviderReady] = useState(false);
   const pageSize = 20;
 
   const load = useCallback(async () => {
+    if (!providerReady) return;
     const result = await fetchHistory({ page, pageSize, provider });
     setItems(result.items);
     setTotal(result.total);
     const folders = await fetchDayFolders({
       includeCompleted: true,
       limit: 100,
+      provider,
     });
     setDayFolders(
       folders.filter(
@@ -42,16 +46,25 @@ export default function History() {
           folder.status === "completed_with_skips",
       ),
     );
-  }, [page, provider]);
+  }, [page, provider, providerReady]);
+
+  useEffect(() => {
+    fetchSettings()
+      .then((settings) => {
+        setProvider(settings.cloud.targetMode === "tencent" ? "tencent" : "aliyun");
+      })
+      .catch(() => {})
+      .finally(() => setProviderReady(true));
+  }, []);
 
   useEffect(() => {
     load();
   }, [load]);
 
   const handleClear = useCallback(async () => {
-    await clearHistory();
+    await clearHistory(undefined, provider);
     load();
-  }, [load]);
+  }, [load, provider]);
 
   const handleDeleteDayFolder = useCallback(
     async (item: DayFolderSummary) => {
@@ -59,13 +72,13 @@ export default function History() {
       if (!ok) return;
       setDeletingId(item.id);
       try {
-        await deleteDayFolderHistory(item.id);
+        await deleteDayFolderHistory(item.id, provider);
         await load();
       } finally {
         setDeletingId(null);
       }
     },
-    [load]
+    [load, provider]
   );
 
   const handleDeleteItem = useCallback(
@@ -75,7 +88,7 @@ export default function History() {
 
       setDeletingId(item.id);
       try {
-        await deleteHistoryItem(item.id);
+        await deleteHistoryItem(item.id, item.provider);
         if (items.length === 1 && page > 1) {
           setPage((p) => p - 1);
           return;

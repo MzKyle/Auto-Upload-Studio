@@ -1,12 +1,4 @@
-import {
-  Database,
-  Folder,
-  Clock,
-  Eye,
-  EyeOff,
-  ChevronDown,
-  ChevronUp,
-} from "lucide-react";
+import { Database } from "lucide-react";
 import { Card, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { formatBytes } from "@/lib/utils";

@@ -66,7 +66,7 @@ export class DayFolderService {
   }
 
   private broadcast(summary: DayFolderSummary): void {
-    for (const win of BrowserWindow.getAllWindows()) {
+    for (const win of BrowserWindow?.getAllWindows?.() ?? []) {
       win.webContents.send(IPC.DAY_FOLDER_EVENT, summary)
     }
   }

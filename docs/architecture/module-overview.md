@@ -24,14 +24,14 @@
 | `Dashboard` | 分云标签、日期汇总、任务控制和扫描入口 |
 | `TaskCard` | 当前提供方进度、错误和指定云端重试 |
 | `History` | 分提供方历史与日期汇总 |
-| `Settings` | 上传模式、双云连接测试和自动保存 |
+| `Settings` | 云端凭据、项目 Profile、连接测试和自动保存 |
 | `SSHMachines` | 远程机器配置与传输 |
 
 ## 共享模块
 
-- `cloud-upload.ts`：上传模式展开、逐云状态聚合和进度 key。
-- `day-folder.ts`：日期名校验、汇总状态、上传相对路径和对象 key。
-- `types.ts`：逻辑任务、分云目标、日期汇总和多云操作结果。
+- `cloud-upload.ts`：目标模式展开、逐云状态聚合和进度 key。
+- `day-folder.ts`：日期名校验、汇总状态、Profile 快照、上传相对路径和对象 key。
+- `types.ts`：Profile、逻辑任务、分云目标、日期汇总和多云操作结果。
 - `ipc-channels.ts`：主进程和渲染进程共享的通道常量。
 
 扩展新的对象存储时，应实现 `CloudTaskUploader`，接入 `CloudUploadService`，并为任务

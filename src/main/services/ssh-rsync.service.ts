@@ -1,7 +1,7 @@
 import { spawn, type ChildProcess } from 'child_process'
 import { Client as SSHClient, type SFTPWrapper } from 'ssh2'
 import { readFileSync } from 'fs'
-import { join, posix } from 'path'
+import { posix } from 'path'
 import log from 'electron-log'
 import type {
   CloudOperationResult,
@@ -9,13 +9,15 @@ import type {
   SSHMachine,
   RsyncProgress,
   SftpProgress,
-  AppSettings
+  AppSettings,
+  CloudProvider
 } from '@shared/types'
 import { providersForMode } from '@shared/cloud-upload'
 import {
-  buildOssKey,
-  resolveDirectoryUploadRelativePath
-} from '@shared/day-folder'
+  getProfileById,
+  renderObjectKey,
+  resolveProfileUploadSnapshot
+} from '@shared/upload-profile'
 import { getCloudUploadService } from './cloud-upload.service'
 import type { CloudTaskUploader } from './cloud-upload.types'
 
@@ -148,8 +150,9 @@ export class SSHRsyncService {
       throw new Error('该机器已有传输进程在运行')
     }
 
-    const providers = providersForMode(settings.cloud.targetMode)
-    const uploaders = new Map<string, CloudTaskUploader>()
+    const profile = getProfileById(settings, machine.profileId)
+    const providers = providersForMode(profile.targetMode)
+    const uploaders = new Map<CloudProvider, CloudTaskUploader>()
     try {
       for (const provider of providers) {
         const validationError = getCloudUploadService().validateProvider(provider, settings)
@@ -233,14 +236,19 @@ export class SSHRsyncService {
     sftp: SFTPWrapper,
     machine: SSHMachine,
     settings: AppSettings,
-    uploaders: Map<string, CloudTaskUploader>,
+    uploaders: Map<CloudProvider, CloudTaskUploader>,
     onProgress?: (progress: SftpProgress) => void
   ): Promise<MultiCloudOperationResult> {
     // 递归列出所有远程文件
     const files = await this.sftpListFiles(sftp, machine.remoteDir, machine.remoteDir)
     log.info(`SFTP 发现 ${files.length} 个文件`)
 
-    const uploadRelativePath = resolveDirectoryUploadRelativePath(machine.remoteDir)
+    const providers = Array.from(uploaders.keys())
+    const snapshot = resolveProfileUploadSnapshot(
+      getProfileById(settings, machine.profileId),
+      { sourcePath: machine.remoteDir },
+      providers
+    )
     let uploadedCount = 0
     const providerResults = new Map<string, CloudOperationResult>()
     for (const provider of uploaders.keys()) {
@@ -274,14 +282,21 @@ export class SSHRsyncService {
             })
             await Promise.all(
               active.map(async ([provider, uploader]) => {
-                const prefix =
-                  provider === 'aliyun'
-                    ? settings.oss.prefix
-                    : settings.tencentS3.prefix
-                const objectKey = buildOssKey(
-                  prefix,
-                  uploadRelativePath,
-                  relativePath
+                const objectKey = renderObjectKey(
+                  {
+                    provider,
+                    prefix: snapshot.prefixes[provider],
+                    uploadRelativePath: snapshot.uploadRelativePaths[provider] ?? '',
+                    pathMode: snapshot.pathModes[provider],
+                    objectKeyTemplate: snapshot.objectKeyTemplates[provider] ?? null
+                  },
+                  {
+                    sourcePath: machine.remoteDir,
+                    folderName: posix.basename(machine.remoteDir),
+                    relativePath,
+                    profileId: snapshot.profileId,
+                    profileName: snapshot.profileName
+                  }
                 )
                 try {
                   await uploader.uploadBuffer(buffer, objectKey)

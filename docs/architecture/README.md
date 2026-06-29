@@ -8,7 +8,7 @@ SDK。
 graph TB
   subgraph Renderer["Renderer"]
     Dashboard["Dashboard<br/>分云任务 / 日期汇总"]
-    Settings["Settings<br/>双云配置"]
+    Settings["Settings<br/>云端凭据 / 项目 Profile"]
     History["History<br/>分云历史"]
     Remote["SSHMachines"]
   end
@@ -62,13 +62,13 @@ graph TB
 ## 持久化原则
 
 SQLite 是应用查询和恢复的主要状态源；数据目录内的三个 JSON 标记用于扫描去重、
-现场排查和跨应用恢复。任务创建时锁定上传模式和 Prefix，保证设置变更不会改变
-已存在任务的目标。
+现场排查和跨应用恢复。任务创建时锁定所选 Profile 的快照、上传模式、过滤规则、
+Prefix、路径模式和对象 Key 模板，保证设置变更不会改变已存在任务的目标。
 
 旧数据库启动时会自动：
 
 - 为旧逻辑任务创建阿里云 `task_destinations`。
 - 为未完成任务文件创建阿里云 `task_file_destinations`。
-- 补齐 `upload_target_mode`、`day_folder_id`、`upload_relative_path`。
+- 补齐 `upload_target_mode`、`day_folder_id`、`upload_relative_path`、Profile 和路径模式字段。
 - 从本地或远程路径推导未完成任务的日期层上传路径。
 - 将源目录已删除的未完成任务标记为已跳过，避免启动恢复阻塞。

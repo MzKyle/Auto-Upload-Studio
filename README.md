@@ -1,10 +1,10 @@
-# Data Collection Uploader
+# CloudBridge Uploader
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
-![Data Collection Uploader](docs/assets/cover.svg)
+![CloudBridge Uploader](docs/assets/cover.svg)
 
-Data Collection Uploader is an Electron desktop application for reliably archiving
+CloudBridge Uploader is an Electron desktop application for reliably archiving
 industrial collection data to Aliyun OSS, Tencent TurboS3, or both clouds. It discovers
 stable welding-session directories, schedules resumable upload tasks, tracks each cloud
 independently, and closes completed date directories for retention and cleanup.
@@ -17,7 +17,8 @@ independently, and closes completed date directories for retention and cleanup.
 - Automatically scan only the current date directory on startup; old dates are added manually.
 - Treat only directories matching the work-session name pattern as automatic tasks, with `HH-MM-SS` as the default.
 - Wait for repeated size and modification-time checks before uploading a file.
-- Upload to Aliyun only, Tencent only, or both providers.
+- Use project Profiles to bind scan roots, file filters, target providers, and object-key rules.
+- Upload each Profile to Aliyun only, Tencent only, or both providers.
 - Track progress, errors, completion, and retries independently for each provider.
 - Pause, resume, cancel, and retry an individual failed cloud destination.
 - Restrict new task starts to a daily or overnight upload window.
@@ -27,7 +28,7 @@ independently, and closes completed date directories for retention and cleanup.
 
 ## Upload Model
 
-Configure the parent directory of the date folders:
+Configure the parent directory of the date folders in an upload Profile:
 
 ```text
 /data/upload-root/
@@ -48,17 +49,19 @@ Files placed directly in the date folder are not uploaded. New or modified files
 work-session directory are uploaded after they become stable and overwrite the same object
 key in the cloud.
 
-Each provider has its own prefix. With `upload/` as the prefix, object keys are:
+Each Profile can define separate prefixes and path modes for Aliyun and Tencent. With
+`upload/` as the prefix and the date/work-session path mode, object keys are:
 
 ```text
 upload/2026-06-18/04-39-04/camera1/0001.jpg
 upload/2026-06-18/04-39-04/metadata.json
 ```
 
-The upload mode and both prefixes are captured when a task is created. Changing settings
-later affects new tasks only. In dual-cloud mode, a logical file and task complete only
-after both destinations complete. Retrying one failed destination does not resend files
-that already succeeded on the other provider.
+The selected Profile is snapshotted when a task is created, including target providers,
+file filters, prefixes, path modes, and object-key templates. Later Profile changes affect
+new tasks only. In dual-cloud mode, a logical file and task complete only after both
+destinations complete. Retrying one failed destination does not resend files that already
+succeeded on the other provider.
 
 After the date has passed and every discovered work session is complete or explicitly
 skipped, `day_upload.json` is written in the date directory. To backfill an old date, add
@@ -83,8 +86,8 @@ does not replace the need for object-write and multipart-upload permissions.
 
 | Feature | Behavior |
 | --- | --- |
-| `rsync` | Pulls to a local directory, then creates a normal resumable upload task |
-| SFTP | Reads each remote file into memory and uploads it to the currently selected providers |
+| `rsync` | Pulls to a local directory, then creates a normal resumable task using the machine Profile |
+| SFTP | Reads each remote file into memory and uploads it using the machine Profile |
 
 SFTP operations return a result for each provider, but they do not create normal
 task-history records. For large files or unreliable networks, prefer `rsync` so the
@@ -107,12 +110,12 @@ npm run dev
 
 In **Settings**:
 
-1. Choose Aliyun, Tencent, or dual-cloud upload.
-2. Configure and test every enabled provider.
-3. Add the data root that contains the `YYYY-MM-DD` directories.
+1. Configure and test the Aliyun or Tencent credentials.
+2. In **Project Profile**, choose target providers, scan roots, suffix filters, and path rules.
+3. Set the default Profile when needed; manual folder add and new SSH machines use it by default.
 4. Adjust task, per-task file, and global file concurrency.
 5. Configure or disable the upload time window.
-6. Return to the dashboard and trigger a scan. Use manual folder add for old dates.
+6. Return to the dashboard and trigger a scan. Use manual folder add plus a Profile for old dates.
 
 ## Common Commands
 
@@ -128,7 +131,7 @@ npm run build:win
 npm run build:all
 ```
 
-Build output is written to `dist/`. The current application version is `2.1.5`.
+Build output is written to `dist/`. The current application version is `2.2.0`.
 
 ## Architecture
 

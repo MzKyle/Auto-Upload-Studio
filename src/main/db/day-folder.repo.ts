@@ -1,7 +1,7 @@
 import { join, normalize } from 'path'
 import { v4 as uuid } from 'uuid'
 import { determineDayFolderStatus } from '@shared/day-folder'
-import type { DayFolderListQuery, DayFolderSummary, Task } from '@shared/types'
+import type { CloudProvider, DayFolderListQuery, DayFolderSummary, Task } from '@shared/types'
 import { getDb } from './database'
 import { getTaskRepo } from './task.repo'
 
@@ -82,6 +82,18 @@ export class DayFolderRepo {
       params.push(query.status)
     } else if (query.includeCompleted === false) {
       conditions.push("status NOT IN ('completed', 'completed_with_skips')")
+    }
+    if (query.provider) {
+      conditions.push(
+        `EXISTS (
+          SELECT 1
+          FROM tasks t
+          INNER JOIN task_destinations td ON td.task_id = t.id
+          WHERE t.day_folder_id = day_folders.id
+            AND td.provider = ?
+        )`
+      )
+      params.push(query.provider)
     }
 
     const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : ''
@@ -193,8 +205,49 @@ export class DayFolderRepo {
     return rows.map((row) => this.toSummary(rowToRecord(row)))
   }
 
-  clearCompleted(before?: string): void {
+  clearCompleted(before?: string, provider?: CloudProvider): void {
     const db = getDb()
+    if (provider) {
+      const transaction = db.transaction(() => {
+        const params: unknown[] = [provider]
+        let beforeCondition = ''
+        if (before) {
+          beforeCondition = ' AND df.completed_at < ?'
+          params.push(before)
+        }
+        db.prepare(
+          `DELETE FROM task_destinations
+           WHERE provider = ?
+             AND task_id IN (
+               SELECT t.id
+               FROM tasks t
+               INNER JOIN day_folders df ON df.id = t.day_folder_id
+               WHERE df.status IN ('completed', 'completed_with_skips')
+                 AND df.completed_at IS NOT NULL${beforeCondition}
+             )`
+        ).run(...params)
+        db.prepare(
+          `DELETE FROM tasks
+           WHERE day_folder_id IS NOT NULL
+             AND NOT EXISTS (
+               SELECT 1 FROM task_destinations td WHERE td.task_id = tasks.id
+             )`
+        ).run()
+        db.prepare(
+          `DELETE FROM day_folders
+           WHERE status IN ('completed', 'completed_with_skips')
+             AND NOT EXISTS (
+               SELECT 1
+               FROM tasks t
+               INNER JOIN task_destinations td ON td.task_id = t.id
+               WHERE t.day_folder_id = day_folders.id
+             )`
+        ).run()
+      })
+      transaction()
+      return
+    }
+
     if (before) {
       db.prepare(
         "DELETE FROM day_folders WHERE status IN ('completed', 'completed_with_skips') AND completed_at < ?"
@@ -206,8 +259,39 @@ export class DayFolderRepo {
     }
   }
 
-  deleteCompleted(id: string): void {
-    getDb().prepare(
+  deleteCompleted(id: string, provider?: CloudProvider): void {
+    const db = getDb()
+    if (provider) {
+      const transaction = db.transaction(() => {
+        db.prepare(
+          `DELETE FROM task_destinations
+           WHERE provider = ?
+             AND task_id IN (SELECT id FROM tasks WHERE day_folder_id = ?)`
+        ).run(provider, id)
+        db.prepare(
+          `DELETE FROM tasks
+           WHERE day_folder_id = ?
+             AND NOT EXISTS (
+               SELECT 1 FROM task_destinations td WHERE td.task_id = tasks.id
+             )`
+        ).run(id)
+        db.prepare(
+          `DELETE FROM day_folders
+           WHERE id = ?
+             AND status IN ('completed', 'completed_with_skips')
+             AND NOT EXISTS (
+               SELECT 1
+               FROM tasks t
+               INNER JOIN task_destinations td ON td.task_id = t.id
+               WHERE t.day_folder_id = day_folders.id
+             )`
+        ).run(id)
+      })
+      transaction()
+      return
+    }
+
+    db.prepare(
       "DELETE FROM day_folders WHERE id = ? AND status IN ('completed', 'completed_with_skips')"
     ).run(id)
   }

@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useMemo } from "react";
 import {
   Radar,
   ChevronDown,
@@ -11,14 +11,28 @@ import {
 import { Card, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Progress } from "@/components/ui/progress";
+import { PathTree } from "@/components/PathTree";
 import { getScannerStatus } from "@/lib/ipc-client";
-import type { ScannerStatus } from "@shared/types";
+import { buildPathTreeFromPaths } from "@/lib/path-tree";
+import { CLOUD_PROVIDER_LABELS } from "@shared/constants";
+import type { CloudProvider, ScannerStatus } from "@shared/types";
 import { IPC } from "@shared/ipc-channels";
 
 export function ScanSchedulePanel() {
   const [status, setStatus] = useState<ScannerStatus | null>(null);
   const [collapsed, setCollapsed] = useState(false);
   const [countdown, setCountdown] = useState("");
+  const watchedDirectoryTreesByProvider = useMemo(
+    () => ({
+      aliyun: buildPathTreeFromPaths(
+        status?.watchedDirectoriesByProvider?.aliyun ?? [],
+      ),
+      tencent: buildPathTreeFromPaths(
+        status?.watchedDirectoriesByProvider?.tencent ?? [],
+      ),
+    }),
+    [status?.watchedDirectoriesByProvider],
+  );
 
   const loadStatus = useCallback(async () => {
     const s = await getScannerStatus();
@@ -142,14 +156,26 @@ export function ScanSchedulePanel() {
             {status.watchedDirectories.length > 0 && (
               <div>
                 <div className="text-xs font-medium text-muted-foreground mb-1">
-                  监控目录
+                  监控目录 ({status.watchedDirectories.length})
                 </div>
-                <div className="flex flex-wrap gap-1">
-                  {status.watchedDirectories.map((dir) => (
-                    <Badge key={dir} variant="outline" className="text-xs">
-                      {dir}
-                    </Badge>
-                  ))}
+                <div className="space-y-2">
+                  {(["aliyun", "tencent"] as CloudProvider[]).map((provider) => {
+                    const dirs =
+                      status.watchedDirectoriesByProvider?.[provider] ?? [];
+                    if (dirs.length === 0) return null;
+                    return (
+                      <div key={provider}>
+                        <div className="text-xs text-muted-foreground mb-1">
+                          {CLOUD_PROVIDER_LABELS[provider]} ({dirs.length})
+                        </div>
+                        <PathTree
+                          nodes={watchedDirectoryTreesByProvider[provider]}
+                          className="rounded-md border bg-muted/20 p-1"
+                          rowClassName="text-xs"
+                        />
+                      </div>
+                    );
+                  })}
                 </div>
               </div>
             )}

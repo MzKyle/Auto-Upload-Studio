@@ -2,12 +2,17 @@
 // 共享常量
 // ============================================
 
-export const APP_NAME = '数据采集上传工具'
+export const APP_NAME = '云桥上传器'
 export const DEFAULT_WORK_DIR_NAME_PATTERN = '^\\d{2}-\\d{2}-\\d{2}$'
+export const DEFAULT_UPLOAD_PROFILE_ID = 'default'
 
 export const DEFAULT_SETTINGS = {
   scan: {
     directories: [],
+    providerDirectories: {
+      aliyun: [],
+      tencent: []
+    },
     intervalSeconds: 30,
     workDirNamePattern: DEFAULT_WORK_DIR_NAME_PATTERN
   },
@@ -27,6 +32,8 @@ export const DEFAULT_SETTINGS = {
     bucket: '',
     region: '',
     prefix: '',
+    pathMode: 'target-root' as const,
+    pathSegmentCount: 2,
     accessKeyId: '',
     accessKeySecret: ''
   },
@@ -35,10 +42,48 @@ export const DEFAULT_SETTINGS = {
     bucket: '',
     region: '',
     prefix: '',
+    pathMode: 'target-root' as const,
+    pathSegmentCount: 2,
     accessKeyId: '',
     accessKeySecret: '',
     allowInsecureTls: false
   },
+  profiles: [
+    {
+      id: DEFAULT_UPLOAD_PROFILE_ID,
+      name: '默认项目',
+      enabled: true,
+      targetMode: 'aliyun' as const,
+      filter: {
+        whitelist: [],
+        blacklist: [],
+        regex: [],
+        suffixes: ['.jpg', '.jpeg', '.png', '.bmp', '.csv', '.json', '.log', '.txt']
+      },
+      scan: {
+        providerDirectories: {
+          aliyun: [],
+          tencent: []
+        },
+        workDirNamePattern: DEFAULT_WORK_DIR_NAME_PATTERN
+      },
+      providers: {
+        aliyun: {
+          prefix: '',
+          pathMode: 'target-root' as const,
+          pathSegmentCount: 2,
+          objectKeyTemplate: '{relativePath}'
+        },
+        tencent: {
+          prefix: '',
+          pathMode: 'target-root' as const,
+          pathSegmentCount: 2,
+          objectKeyTemplate: '{relativePath}'
+        }
+      }
+    }
+  ],
+  activeProfileId: DEFAULT_UPLOAD_PROFILE_ID,
   filter: {
     whitelist: [],
     blacklist: [],

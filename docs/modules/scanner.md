@@ -2,7 +2,7 @@
 
 ## 职责
 
-`ScannerService` 把配置的数据根目录转换为日期汇总和工作次上传任务：
+`ScannerService` 把启用 Profile 的监控目录转换为日期汇总和工作次上传任务：
 
 - 启动后只自动扫描当天有效的 `YYYY-MM-DD` 日期目录。
 - 旧日期目录只保留已有数据库状态，不自动发现新任务。
@@ -18,7 +18,8 @@
 
 ## 启动与扫描范围
 
-扫描器启动后延迟进入后台工作，避免阻塞 Electron 窗口显示。自动扫描只读取：
+扫描器启动后延迟进入后台工作，避免阻塞 Electron 窗口显示。自动扫描读取每个启用
+Profile 的云端监控目录，并按 Profile 的目标云过滤提供方。每个目录只读取：
 
 ```text
 {dataRoot}/{today}
@@ -26,7 +27,8 @@
 
 其中 `today` 使用本机当前日期，例如 `2026-06-24`。旧日期中的新目录不会自动注册。
 如果旧日期已有未完成任务，启动恢复会按队列限流逐个续传；源目录已删除的未完成任务
-会自动标记为“已跳过（源目录已删除）”。
+会自动标记为“已跳过（源目录已删除）”。保存 Profile 或默认 Profile 后会重启 watcher，
+使扫描范围变化立即生效。
 
 目录枚举、文件枚举和任务校准都采用异步分批执行，避免同步递归扫描大目录导致主进程
 卡死。
@@ -76,7 +78,7 @@ relativePath -> size + mtimeMs
 
 ```json
 {
-  "version": 1,
+  "version": 2,
   "createdAt": "2026-06-18T10:00:00.000Z",
   "folderPath": "/data/upload-root/2026-06-18/04-39-04",
   "metadata": {
@@ -85,9 +87,18 @@ relativePath -> size + mtimeMs
     "date": "2026-06-18",
     "uploadRelativePath": "2026-06-18/04-39-04",
     "uploadTargetMode": "both",
+    "profileId": "default",
+    "profileName": "默认项目",
     "destinationPrefixes": {
       "aliyun": "ali-upload/",
       "tencent": "tencent-upload/"
+    },
+    "destinationPathModes": {
+      "aliyun": "date-workdir",
+      "tencent": "template"
+    },
+    "destinationObjectKeyTemplates": {
+      "tencent": "{profile}/{date}/{workDir}/{relativePath}"
     }
   }
 }
@@ -96,8 +107,8 @@ relativePath -> size + mtimeMs
 任务会保存：
 
 - 日期汇总 ID 和 `日期/工作次目录` 上传相对路径。
-- 创建时的上传模式。
-- 阿里和腾讯各自的 Prefix。
+- 创建时的 Profile ID、Profile 名称和 Profile 快照。
+- 创建时的上传模式、阿里和腾讯各自的 Prefix、路径模式和对象 Key 模板。
 - `local`、`rsync` 或 `manual` 来源信息。
 
 ## 日期汇总状态

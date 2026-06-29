@@ -2,13 +2,14 @@
 
 ## 上传目标
 
-设置页支持三种模式：
+项目 Profile 支持三种目标模式：
 
 - `aliyun`：仅阿里云 OSS
 - `tencent`：仅腾讯云 TurboS3
 - `both`：两个云端同时上传
 
-任务创建时会保存上传模式和两个云端的 Prefix。后续修改设置只影响新任务。
+任务创建时会保存所选 Profile 的目标模式、两个云端 Prefix、路径模式和对象 Key 模板。
+后续修改 Profile 只影响新任务。云端凭据仍在阿里云/腾讯云配置页维护。
 
 ## 阿里云 OSS
 
@@ -17,7 +18,7 @@
 | Endpoint | 否 | 自定义 OSS 服务地址，可留空由 SDK 按 Region 推导 |
 | Region | 是 | 例如 `oss-cn-hangzhou` |
 | Bucket | 是 | 目标 Bucket |
-| Prefix | 否 | 对象统一前缀 |
+| Prefix | 否 | 兼容旧配置；新任务优先使用 Profile 中该云端的 Prefix |
 | AccessKey ID | 是 | 专用 RAM 用户的访问密钥 ID |
 | AccessKey Secret | 是 | 访问密钥 Secret |
 
@@ -30,7 +31,7 @@
 | Endpoint | 是 | S3 兼容服务地址，包含协议 |
 | Region | 是 | 签名使用的 Region |
 | Bucket | 是 | 目标 Bucket |
-| Prefix | 否 | 对象统一前缀 |
+| Prefix | 否 | 兼容旧配置；新任务优先使用 Profile 中该云端的 Prefix |
 | AccessKey ID | 是 | 腾讯云访问密钥 ID |
 | AccessKey Secret | 是 | 腾讯云访问密钥 Secret |
 | 不安全 TLS | 否 | 默认关闭，仅用于无法验证的自签名证书 |
@@ -40,10 +41,10 @@
 
 ## 对象路径
 
-两个云端分别使用自己的 Prefix，但追加相同的任务路径：
+两个云端分别使用 Profile 中自己的 Prefix，并按该云端路径模式生成对象 Key：
 
 ```text
-{providerPrefix}/{date}/{weldFolder}/{relativePath}
+{providerPrefix}/{profileResolvedPath}/{relativePath}
 ```
 
 例如：
@@ -53,6 +54,9 @@ upload/2026-06-18/04-39-04/camera1/0001.jpg
 ```
 
 Windows 反斜杠会统一为 `/`，空路径段和重复分隔符会被清理。
+
+当路径模式为 `template` 时，模板结果会作为 Prefix 后的完整相对对象 Key，再进行安全
+校验。模板或渲染结果为空、绝对路径或包含 `..` 路径段都会被拒绝。
 
 ## 权限建议
 

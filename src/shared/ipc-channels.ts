@@ -42,6 +42,7 @@ export const IPC = {
   SETTINGS_SAVE: 'settings:save',
   SETTINGS_TEST_OSS: 'settings:test-oss',
   SETTINGS_TEST_TENCENT_S3: 'settings:test-tencent-s3',
+  UPLOAD_PATH_PREVIEW: 'upload:path-preview',
 
   // SSH / rsync
   SSH_LIST_MACHINES: 'ssh:list-machines',

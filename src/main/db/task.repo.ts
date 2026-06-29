@@ -8,15 +8,22 @@ import type {
   TaskFileDetail,
   TaskStatus,
   SourceType,
+  UploadPathMode,
+  UploadProfile,
   UploadTargetMode
 } from '@shared/types'
 import { getTaskDestinationRepo } from './task-destination.repo'
+import { providersForMode } from '@shared/cloud-upload'
 
 function normalizeFolderPath(p: string): string {
   return normalize(p).replace(/[\\/]+$/, '')
 }
 
 function rowToTask(row: Record<string, unknown>): Task {
+  const profileSnapshot =
+    typeof row.profile_snapshot_json === 'string' && row.profile_snapshot_json
+      ? safeParseProfile(row.profile_snapshot_json)
+      : null
   return {
     id: row.id as string,
     folderPath: row.folder_path as string,
@@ -30,13 +37,24 @@ function rowToTask(row: Record<string, unknown>): Task {
     uploadTargetMode: (row.upload_target_mode as UploadTargetMode) || 'aliyun',
     destinations: getTaskDestinationRepo().listByTask(row.id as string),
     dayFolderId: (row.day_folder_id as string) || null,
-    uploadRelativePath: (row.upload_relative_path as string) || (row.folder_name as string),
+    uploadRelativePath: (row.upload_relative_path as string | null | undefined) ?? (row.folder_name as string),
     errorMessage: (row.error_message as string) || null,
     sourceType: row.source_type as SourceType,
     sourceMachineId: (row.source_machine_id as string) || null,
+    profileId: (row.profile_id as string) || null,
+    profileName: (row.profile_name as string) || null,
+    profileSnapshot,
     createdAt: row.created_at as string,
     updatedAt: row.updated_at as string,
     completedAt: (row.completed_at as string) || null
+  }
+}
+
+function safeParseProfile(value: string): UploadProfile | null {
+  try {
+    return JSON.parse(value) as UploadProfile
+  } catch {
+    return null
   }
 }
 
@@ -72,13 +90,15 @@ export class TaskRepo {
 
   listContinuouslyMonitored(dateName: string): Task[] {
     const rows = getDb().prepare(
-      `SELECT * FROM tasks
-       WHERE source_type = 'local'
-         AND day_folder_id IS NOT NULL
-         AND replace(upload_relative_path, '\\', '/') LIKE ?
-         AND status NOT IN ('skipped', 'paused', 'completed')
-       ORDER BY created_at ASC`
-    ).all(`${dateName}/%`) as Record<string, unknown>[]
+      `SELECT t.*
+       FROM tasks t
+       INNER JOIN day_folders df ON df.id = t.day_folder_id
+       WHERE t.source_type = 'local'
+         AND t.day_folder_id IS NOT NULL
+         AND df.date_value = ?
+         AND t.status NOT IN ('skipped', 'paused', 'completed')
+       ORDER BY t.created_at ASC`
+    ).all(dateName) as Record<string, unknown>[]
     return rows.map(rowToTask)
   }
 
@@ -131,40 +151,71 @@ export class TaskRepo {
     ossPrefix?: string
     uploadTargetMode?: UploadTargetMode
     destinationPrefixes?: Partial<Record<CloudProvider, string>>
+    destinationUploadRelativePaths?: Partial<Record<CloudProvider, string>>
+    destinationPathModes?: Partial<Record<CloudProvider, UploadPathMode>>
+    destinationObjectKeyTemplates?: Partial<Record<CloudProvider, string | null>>
     dayFolderId?: string
     uploadRelativePath?: string
     sourceType?: SourceType
     sourceMachineId?: string
+    profileId?: string | null
+    profileName?: string | null
+    profileSnapshot?: UploadProfile | null
   }): Task {
     const db = getDb()
     const id = uuid()
     const now = new Date().toISOString()
     const normalizedPath = normalizeFolderPath(params.folderPath)
+    const uploadTargetMode = params.uploadTargetMode || 'aliyun'
+    const uploadRelativePath = params.uploadRelativePath ?? params.folderName
+    const destinationUploadRelativePaths =
+      params.destinationUploadRelativePaths ||
+      Object.fromEntries(
+        providersForMode(uploadTargetMode).map((provider) => [
+          provider,
+          uploadRelativePath
+        ])
+      )
     db.prepare(
       `INSERT INTO tasks (
         id, folder_path, folder_name, status, oss_prefix, upload_target_mode,
         day_folder_id, upload_relative_path, source_type, source_machine_id,
-        created_at, updated_at
-      ) VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?)`
+        profile_id, profile_name, profile_snapshot_json, created_at, updated_at
+      ) VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     ).run(
       id,
       normalizedPath,
       params.folderName,
       params.ossPrefix || '',
-      params.uploadTargetMode || 'aliyun',
+      uploadTargetMode,
       params.dayFolderId || null,
-      params.uploadRelativePath || params.folderName,
+      uploadRelativePath,
       params.sourceType || 'local',
       params.sourceMachineId || null,
+      params.profileId || null,
+      params.profileName || null,
+      params.profileSnapshot ? JSON.stringify(params.profileSnapshot) : null,
       now,
       now
     )
     getTaskDestinationRepo().ensureForTask(
       id,
-      params.uploadTargetMode || 'aliyun',
-      params.destinationPrefixes || { aliyun: params.ossPrefix || '' }
+      uploadTargetMode,
+      params.destinationPrefixes || { aliyun: params.ossPrefix || '' },
+      'pending',
+      destinationUploadRelativePaths,
+      params.destinationPathModes,
+      params.destinationObjectKeyTemplates
     )
     return this.getById(id)!
+  }
+
+  updateDayFolderId(id: string, dayFolderId: string): void {
+    getDb().prepare(
+      `UPDATE tasks
+       SET day_folder_id = ?, updated_at = ?
+       WHERE id = ?`
+    ).run(dayFolderId, new Date().toISOString(), id)
   }
 
   updateDayFolderMetadata(id: string, dayFolderId: string, uploadRelativePath: string): void {

@@ -30,10 +30,10 @@
     </g>
 
     <text x="58" y="205" fill="#F8FAFC" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="62" font-weight="800" letter-spacing="0">
-      Data Collection Uploader
+      CloudBridge Uploader
     </text>
     <text x="60" y="255" fill="#A7F3D0" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="26" font-weight="600" letter-spacing="0">
-      数据采集上传工具
+      云桥上传器
     </text>
     <text x="60" y="306" fill="#CBD5E1" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="22" letter-spacing="0">
       Folder scanning, resumable task queue, OSS upload, remote sync and data insight.

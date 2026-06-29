@@ -16,10 +16,19 @@ import { getDb } from '../db/database'
 import { getDataCollectService } from '../services/data-collect.service'
 import { getTaskDestinationRepo } from '../db/task-destination.repo'
 import { v4 as uuid } from 'uuid'
-import type { AppSettings, CloudProvider, HistoryQuery, TaskStatus, SSHMachine, SSHMachineInput, RsyncProgress, TransferMode, DiskUsageInfo, ScanConfig, DayFolderListQuery } from '@shared/types'
-import { getUploadTargetSnapshot } from '@shared/cloud-upload'
-import { resolveDirectoryUploadRelativePath } from '@shared/day-folder'
-import { basename, normalize, join } from 'path'
+import type { AppSettings, CloudProvider, HistoryQuery, TaskStatus, SSHMachine, SSHMachineInput, RsyncProgress, TransferMode, DiskUsageInfo, DayFolderListQuery, UploadPathMode, UploadProfile } from '@shared/types'
+import { basename, dirname, normalize } from 'path'
+import { isDateFolderName } from '@shared/day-folder'
+import { shouldRestartScannerAfterSettingsSave } from '@shared/settings-effects'
+import {
+  buildObjectKeyVariables,
+  getProfileById,
+  renderObjectKey,
+  resolveProfileUploadSnapshot,
+  validateObjectKeyTemplate,
+  validateObjectKeyValue,
+  type UploadPathPreview
+} from '@shared/upload-profile'
 import { existsSync } from 'fs'
 import { statfs } from 'fs/promises'
 import log from 'electron-log'
@@ -39,6 +48,7 @@ function rowToSSHMachine(row: Record<string, unknown>): SSHMachine {
     bwLimit: row.bw_limit as number,
     cpuNice: row.cpu_nice as number,
     transferMode: (row.transfer_mode as TransferMode) || 'rsync',
+    profileId: (row.profile_id as string) || null,
     enabled: Boolean(row.enabled),
     lastSyncAt: (row.last_sync_at as string) || null,
     createdAt: row.created_at as string
@@ -71,20 +81,29 @@ export function registerAllIpc(): void {
     }
   })
 
-  ipcMain.handle(IPC.TASK_ADD_FOLDER, (_event, args: { folderPath: string }) => {
+  ipcMain.handle(IPC.TASK_ADD_FOLDER, (_event, args: { folderPath: string; profileId?: string }) => {
     const taskRepo = getTaskRepo()
     const settingsRepo = getSettingsRepo()
-    const snapshot = getUploadTargetSnapshot(settingsRepo.getAll())
+    const settings = settingsRepo.getAll()
+    const profile = getProfileById(settings, args.profileId)
+    const snapshot = resolveProfileUploadSnapshot(profile, {
+      sourcePath: args.folderPath
+    })
     const folderName = basename(args.folderPath)
-    const uploadRelativePath = resolveDirectoryUploadRelativePath(args.folderPath)
     const task = taskRepo.create({
       folderPath: args.folderPath,
       folderName,
       ossPrefix: snapshot.prefixes.aliyun,
       uploadTargetMode: snapshot.mode,
       destinationPrefixes: snapshot.prefixes,
-      uploadRelativePath,
-      sourceType: 'manual'
+      destinationUploadRelativePaths: snapshot.uploadRelativePaths,
+      destinationPathModes: snapshot.pathModes,
+      destinationObjectKeyTemplates: snapshot.objectKeyTemplates,
+      uploadRelativePath: snapshot.uploadRelativePath,
+      sourceType: 'manual',
+      profileId: snapshot.profileId,
+      profileName: snapshot.profileName,
+      profileSnapshot: snapshot.profileSnapshot
     })
     getScannerService().queueReconcileTask(task)
     return getTaskRepo().getById(task.id)
@@ -157,8 +176,8 @@ export function registerAllIpc(): void {
     return getDayFolderRepo().list(query)
   })
 
-  ipcMain.handle(IPC.DAY_FOLDER_DELETE, (_event, args: { id: string }) => {
-    getDayFolderRepo().deleteCompleted(args.id)
+  ipcMain.handle(IPC.DAY_FOLDER_DELETE, (_event, args: { id: string; provider?: CloudProvider }) => {
+    getDayFolderRepo().deleteCompleted(args.id, args.provider)
   })
 
   ipcMain.handle(IPC.DAY_FOLDER_IGNORE, (_event, args: { id: string }) => {
@@ -196,7 +215,7 @@ export function registerAllIpc(): void {
     if (data.cleanup !== undefined) {
       getCleanupService().scheduleCleanup()
     }
-    if (data.scan !== undefined || data.stability !== undefined) {
+    if (shouldRestartScannerAfterSettingsSave(data)) {
       getScannerService().stop()
       getScannerService().start()
     }
@@ -214,6 +233,100 @@ export function registerAllIpc(): void {
     }
   )
 
+  ipcMain.handle(
+    IPC.UPLOAD_PATH_PREVIEW,
+    (_event, args: {
+      profileId?: string
+      sourcePath: string
+      provider?: CloudProvider
+      sampleFiles?: string[]
+    }): UploadPathPreview => {
+      const settings = getSettingsRepo().getAll()
+      const profile = getProfileById(settings, args.profileId)
+      const folderName = basename(args.sourcePath)
+      const dateName = basename(dirname(args.sourcePath))
+      const context = {
+        sourcePath: args.sourcePath,
+        basePath: dirname(args.sourcePath),
+        dateName: isDateFolderName(dateName) ? dateName : undefined,
+        workDirName: folderName
+      }
+      const requestedProviders = args.provider ? [args.provider] : undefined
+      const snapshot = resolveProfileUploadSnapshot(
+        profile,
+        context,
+        requestedProviders
+      )
+      const sampleFiles = (args.sampleFiles?.length
+        ? args.sampleFiles
+        : ['camera/0001.jpg', 'data/sample.csv']
+      ).slice(0, 20)
+
+      return {
+        profileId: profile.id,
+        profileName: profile.name,
+        sourcePath: args.sourcePath,
+        providers: Object.keys(snapshot.pathModes || {}).map((providerKey) => {
+          const provider = providerKey as CloudProvider
+          const pathMode = snapshot.pathModes?.[provider] || 'target-root'
+          const objectKeyTemplate = snapshot.objectKeyTemplates?.[provider] ?? null
+          const errors = objectKeyTemplate
+            ? [...validateObjectKeyTemplate(objectKeyTemplate)]
+            : []
+          const keys: string[] = []
+          for (const relativePath of sampleFiles) {
+            try {
+              const key = renderObjectKey(
+                {
+                  provider,
+                  prefix: snapshot.prefixes[provider],
+                  uploadRelativePath: snapshot.uploadRelativePaths[provider] ?? '',
+                  pathMode,
+                  objectKeyTemplate
+                },
+                {
+                  ...context,
+                  profileId: profile.id,
+                  profileName: profile.name,
+                  folderName,
+                  relativePath
+                }
+              )
+              const valueErrors = validateObjectKeyValue(key)
+              if (valueErrors.length > 0) errors.push(...valueErrors)
+              keys.push(key)
+            } catch (error) {
+              errors.push(error instanceof Error ? error.message : String(error))
+            }
+          }
+          const duplicateKeys = keys.filter(
+            (key, index) => keys.indexOf(key) !== index
+          )
+          const warnings = duplicateKeys.length > 0
+            ? [`存在重复对象 Key: ${Array.from(new Set(duplicateKeys)).join(', ')}`]
+            : []
+          return {
+            provider,
+            prefix: snapshot.prefixes[provider],
+            uploadRelativePath: snapshot.uploadRelativePaths[provider] ?? '',
+            pathMode,
+            objectKeyTemplate,
+            variables: buildObjectKeyVariables(provider, {
+              ...context,
+              profileId: profile.id,
+              profileName: profile.name,
+              folderName,
+              relativePath: sampleFiles[0] || ''
+            }),
+            keys,
+            errors: Array.from(new Set(errors)),
+            warnings
+          }
+        })
+      }
+    }
+  )
+
   // ---- SSH 机器 CRUD ----
   ipcMain.handle(IPC.SSH_LIST_MACHINES, () => {
     const db = getDb()
@@ -225,10 +338,11 @@ export function registerAllIpc(): void {
     const db = getDb()
     const id = uuid()
     const now = new Date().toISOString()
+    const profileId = input.profileId || getSettingsRepo().getAll().activeProfileId
     db.prepare(
-      `INSERT INTO ssh_machines (id, name, host, port, username, auth_type, private_key_path, encrypted_password, remote_dir, local_dir, bw_limit, cpu_nice, transfer_mode, enabled, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-    ).run(id, input.name, input.host, input.port, input.username, input.authType, input.privateKeyPath || null, input.password || null, input.remoteDir, input.localDir, input.bwLimit, input.cpuNice, input.transferMode || 'rsync', input.enabled ? 1 : 0, now)
+      `INSERT INTO ssh_machines (id, name, host, port, username, auth_type, private_key_path, encrypted_password, remote_dir, local_dir, bw_limit, cpu_nice, transfer_mode, profile_id, enabled, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(id, input.name, input.host, input.port, input.username, input.authType, input.privateKeyPath || null, input.password || null, input.remoteDir, input.localDir, input.bwLimit, input.cpuNice, input.transferMode || 'rsync', profileId, input.enabled ? 1 : 0, now)
     const row = db.prepare('SELECT * FROM ssh_machines WHERE id = ?').get(id) as Record<string, unknown>
     return rowToSSHMachine(row)
   })
@@ -236,8 +350,8 @@ export function registerAllIpc(): void {
   ipcMain.handle(IPC.SSH_UPDATE_MACHINE, (_event, machine: SSHMachine) => {
     const db = getDb()
     db.prepare(
-      `UPDATE ssh_machines SET name=?, host=?, port=?, username=?, auth_type=?, private_key_path=?, remote_dir=?, local_dir=?, bw_limit=?, cpu_nice=?, enabled=? WHERE id=?`
-    ).run(machine.name, machine.host, machine.port, machine.username, machine.authType, machine.privateKeyPath, machine.remoteDir, machine.localDir, machine.bwLimit, machine.cpuNice, machine.enabled ? 1 : 0, machine.id)
+      `UPDATE ssh_machines SET name=?, host=?, port=?, username=?, auth_type=?, private_key_path=?, remote_dir=?, local_dir=?, bw_limit=?, cpu_nice=?, transfer_mode=?, profile_id=?, enabled=? WHERE id=?`
+    ).run(machine.name, machine.host, machine.port, machine.username, machine.authType, machine.privateKeyPath, machine.remoteDir, machine.localDir, machine.bwLimit, machine.cpuNice, machine.transferMode || 'rsync', machine.profileId || null, machine.enabled ? 1 : 0, machine.id)
   })
 
   ipcMain.handle(IPC.SSH_DELETE_MACHINE, (_event, args: { id: string }) => {
@@ -273,13 +387,23 @@ export function registerAllIpc(): void {
       // rsync 完成后自动注册本地目录为上传任务
       const taskRepo = getTaskRepo()
       const settingsRepo = getSettingsRepo()
-      const snapshot = getUploadTargetSnapshot(settingsRepo.getAll())
+      const settings = settingsRepo.getAll()
+      const profile = getProfileById(settings, machine.profileId)
       const localDir = normalize(machine.localDir).replace(/[\\/]+$/, '')
-      const uploadRelativePath = resolveDirectoryUploadRelativePath(
-        machine.remoteDir,
-        localDir
-      )
+      const snapshot = resolveProfileUploadSnapshot(profile, {
+        sourcePath: machine.remoteDir,
+        fallbackDirectoryPath: localDir
+      })
       const existing = taskRepo.getByFolderPath(localDir)
+      let markerMode = snapshot.mode
+      let markerPrefixes = snapshot.prefixes
+      let markerUploadRelativePath = snapshot.uploadRelativePath
+      let markerUploadRelativePaths = snapshot.uploadRelativePaths
+      let markerPathModes = snapshot.pathModes
+      let markerObjectKeyTemplates = snapshot.objectKeyTemplates
+      let markerProfileId: string | undefined = snapshot.profileId
+      let markerProfileName: string | undefined = snapshot.profileName
+      let markerProfileSnapshot: UploadProfile | undefined = snapshot.profileSnapshot
       if (!existing || existing.status === 'completed' || existing.status === 'failed') {
         const task = taskRepo.create({
           folderPath: localDir,
@@ -287,14 +411,51 @@ export function registerAllIpc(): void {
           ossPrefix: snapshot.prefixes.aliyun,
           uploadTargetMode: snapshot.mode,
           destinationPrefixes: snapshot.prefixes,
-          uploadRelativePath,
+          destinationUploadRelativePaths: snapshot.uploadRelativePaths,
+          destinationPathModes: snapshot.pathModes,
+          destinationObjectKeyTemplates: snapshot.objectKeyTemplates,
+          uploadRelativePath: snapshot.uploadRelativePath,
           sourceType: 'rsync',
-          sourceMachineId: machine.id
+          sourceMachineId: machine.id,
+          profileId: snapshot.profileId,
+          profileName: snapshot.profileName,
+          profileSnapshot: snapshot.profileSnapshot
         })
         getScannerService().queueReconcileTask(task)
         log.info('rsync 完成, 自动创建上传任务:', localDir)
-      } else if (existing.uploadRelativePath !== uploadRelativePath) {
-        taskRepo.updateUploadRelativePath(existing.id, uploadRelativePath)
+      } else {
+        const current = taskRepo.getById(existing.id) || existing
+        markerMode = current.uploadTargetMode
+        markerPrefixes = {
+          aliyun:
+            current.destinations.find((item) => item.provider === 'aliyun')?.prefix ||
+            '',
+          tencent:
+            current.destinations.find((item) => item.provider === 'tencent')?.prefix ||
+            ''
+        }
+        markerUploadRelativePaths = Object.fromEntries(
+          current.destinations.map((destination) => [
+            destination.provider,
+            destination.uploadRelativePath
+          ])
+        ) as Partial<Record<CloudProvider, string>>
+        markerPathModes = Object.fromEntries(
+          current.destinations.map((destination) => [
+            destination.provider,
+            destination.pathMode
+          ])
+        ) as Partial<Record<CloudProvider, UploadPathMode>>
+        markerObjectKeyTemplates = Object.fromEntries(
+          current.destinations.map((destination) => [
+            destination.provider,
+            destination.objectKeyTemplate
+          ])
+        ) as Partial<Record<CloudProvider, string | null>>
+        markerUploadRelativePath = current.uploadRelativePath
+        markerProfileId = current.profileId || undefined
+        markerProfileName = current.profileName || undefined
+        markerProfileSnapshot = current.profileSnapshot || undefined
       }
 
       // 写入标记文件，防止 scanner 重复做稳定性检查
@@ -305,9 +466,15 @@ export function registerAllIpc(): void {
         metadata: {
           source: 'rsync',
           machineId: machine.id,
-          uploadRelativePath,
-          uploadTargetMode: snapshot.mode,
-          destinationPrefixes: snapshot.prefixes
+          uploadRelativePath: markerUploadRelativePath,
+          uploadTargetMode: markerMode,
+          profileId: markerProfileId,
+          profileName: markerProfileName,
+          profileSnapshot: markerProfileSnapshot,
+          destinationPrefixes: markerPrefixes,
+          destinationUploadRelativePaths: markerUploadRelativePaths,
+          destinationPathModes: markerPathModes,
+          destinationObjectKeyTemplates: markerObjectKeyTemplates
         }
       })
     } catch (err) {
@@ -325,13 +492,13 @@ export function registerAllIpc(): void {
     return getHistoryRepo().list(query)
   })
 
-  ipcMain.handle(IPC.HISTORY_CLEAR, (_event, args?: { before?: string }) => {
-    getHistoryRepo().clear(args?.before)
-    getDayFolderRepo().clearCompleted(args?.before)
+  ipcMain.handle(IPC.HISTORY_CLEAR, (_event, args?: { before?: string; provider?: CloudProvider }) => {
+    getHistoryRepo().clear(args?.before, args?.provider)
+    getDayFolderRepo().clearCompleted(args?.before, args?.provider)
   })
 
-  ipcMain.handle(IPC.HISTORY_DELETE, (_event, args: { id: string }) => {
-    getHistoryRepo().deleteById(args.id)
+  ipcMain.handle(IPC.HISTORY_DELETE, (_event, args: { id: string; provider?: CloudProvider }) => {
+    getHistoryRepo().deleteById(args.id, args.provider)
   })
 
   // ---- 对话框 ----
@@ -405,7 +572,7 @@ export function registerAllIpc(): void {
   // ---- 磁盘用量 ----
   ipcMain.handle(IPC.DISK_USAGE, async () => {
     const settingsRepo = getSettingsRepo()
-    const scanConfig = settingsRepo.get<ScanConfig>('scan')
+    const scanConfig = settingsRepo.getAll().scan
     const db = getDb()
 
     // 收集所有需要检查的路径

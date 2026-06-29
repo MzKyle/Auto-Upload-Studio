@@ -1,5 +1,5 @@
 import { useEffect, useState, useCallback } from "react";
-import { Plus, Trash2, Wifi, Play, Edit2, X, Save } from "lucide-react";
+import { Plus, Trash2, Wifi, Play, X, Save } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -13,6 +13,7 @@ import {
   testSSHConnection,
   startRsync,
   startSftp,
+  fetchSettings,
 } from "@/lib/ipc-client";
 import type { SSHMachine, SSHMachineInput, TransferMode } from "@shared/types";
 
@@ -29,6 +30,7 @@ const EMPTY_FORM: SSHMachineInput = {
   bwLimit: 5000,
   cpuNice: 19,
   transferMode: "rsync",
+  profileId: null,
   enabled: true,
 };
 
@@ -39,6 +41,7 @@ export default function SSHMachines() {
   >({});
   const [showForm, setShowForm] = useState(false);
   const [formData, setFormData] = useState<SSHMachineInput>({ ...EMPTY_FORM });
+  const [profiles, setProfiles] = useState<Array<{ id: string; name: string }>>([]);
   const [submitting, setSubmitting] = useState(false);
 
   const load = useCallback(async () => {
@@ -48,6 +51,18 @@ export default function SSHMachines() {
 
   useEffect(() => {
     load();
+    fetchSettings()
+      .then((settings) => {
+        setProfiles(settings.profiles.map((profile) => ({
+          id: profile.id,
+          name: profile.name,
+        })));
+        setFormData((prev) => ({
+          ...prev,
+          profileId: prev.profileId || settings.activeProfileId,
+        }));
+      })
+      .catch(() => {});
   }, [load]);
 
   const handleTest = useCallback(async (id: string) => {
@@ -249,8 +264,8 @@ export default function SSHMachines() {
                   />
                 </div>
               )}
-              <div>
-                <Label>远程目录</Label>
+            <div>
+              <Label>远程目录</Label>
                 <Input
                   value={formData.remoteDir}
                   onChange={(e) =>
@@ -259,6 +274,22 @@ export default function SSHMachines() {
                   className="mt-1"
                   placeholder="/data/collection"
                 />
+              </div>
+              <div>
+                <Label>项目 Profile</Label>
+                <select
+                  value={formData.profileId || ""}
+                  onChange={(e) =>
+                    setFormData((p) => ({ ...p, profileId: e.target.value || null }))
+                  }
+                  className="mt-1 w-full h-9 rounded-md border border-input bg-background px-3 text-sm"
+                >
+                  {profiles.map((profile) => (
+                    <option key={profile.id} value={profile.id}>
+                      {profile.name}
+                    </option>
+                  ))}
+                </select>
               </div>
               <div>
                 <Label>本地目录</Label>
@@ -370,6 +401,9 @@ export default function SSHMachines() {
                     </Badge>
                     <Badge variant="secondary">
                       {machine.transferMode === "sftp" ? "SFTP 直传" : "rsync"}
+                    </Badge>
+                    <Badge variant="outline">
+                      {profiles.find((profile) => profile.id === machine.profileId)?.name || "默认项目"}
                     </Badge>
                   </div>
                   <div className="flex items-center gap-2">

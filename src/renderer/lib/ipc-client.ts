@@ -5,6 +5,7 @@ import type {
   DayFolderSummary, DayFolderListQuery, CloudProvider, MultiCloudOperationResult,
   TaskDetail
 } from '@shared/types'
+import type { UploadPathPreview } from '@shared/upload-profile'
 
 const api = window.api
 
@@ -21,8 +22,8 @@ export async function fetchTaskDetail(taskId: string): Promise<TaskDetail> {
   return (await api.invoke(IPC.TASK_DETAIL, { taskId })) as TaskDetail
 }
 
-export async function addFolder(folderPath: string): Promise<Task> {
-  return (await api.invoke(IPC.TASK_ADD_FOLDER, { folderPath })) as Task
+export async function addFolder(folderPath: string, profileId?: string): Promise<Task> {
+  return (await api.invoke(IPC.TASK_ADD_FOLDER, { folderPath, profileId })) as Task
 }
 
 export async function pauseTask(taskId: string): Promise<void> {
@@ -54,8 +55,8 @@ export async function fetchDayFolders(query?: DayFolderListQuery): Promise<DayFo
   return (await api.invoke(IPC.DAY_FOLDER_LIST, query)) as DayFolderSummary[]
 }
 
-export async function deleteDayFolderHistory(id: string): Promise<void> {
-  await api.invoke(IPC.DAY_FOLDER_DELETE, { id })
+export async function deleteDayFolderHistory(id: string, provider?: CloudProvider): Promise<void> {
+  await api.invoke(IPC.DAY_FOLDER_DELETE, { id, provider })
 }
 
 export async function ignoreDayFolder(id: string): Promise<DayFolderSummary> {
@@ -98,6 +99,15 @@ export async function testOSS(config: AppSettings['oss']): Promise<{ ok: boolean
 
 export async function testTencentS3(config: AppSettings['tencentS3']): Promise<{ ok: boolean; error?: string }> {
   return (await api.invoke(IPC.SETTINGS_TEST_TENCENT_S3, config)) as { ok: boolean; error?: string }
+}
+
+export async function previewUploadPath(input: {
+  profileId?: string
+  sourcePath: string
+  provider?: CloudProvider
+  sampleFiles?: string[]
+}): Promise<UploadPathPreview> {
+  return (await api.invoke(IPC.UPLOAD_PATH_PREVIEW, input)) as UploadPathPreview
 }
 
 // ---- SSH ----
@@ -151,12 +161,12 @@ export async function fetchHistory(query: HistoryQuery): Promise<HistoryResult> 
   return (await api.invoke(IPC.HISTORY_LIST, query)) as HistoryResult
 }
 
-export async function clearHistory(before?: string): Promise<void> {
-  await api.invoke(IPC.HISTORY_CLEAR, before ? { before } : undefined)
+export async function clearHistory(before?: string, provider?: CloudProvider): Promise<void> {
+  await api.invoke(IPC.HISTORY_CLEAR, before || provider ? { before, provider } : undefined)
 }
 
-export async function deleteHistoryItem(id: string): Promise<void> {
-  await api.invoke(IPC.HISTORY_DELETE, { id })
+export async function deleteHistoryItem(id: string, provider?: CloudProvider): Promise<void> {
+  await api.invoke(IPC.HISTORY_DELETE, { id, provider })
 }
 
 // ---- 对话框 ----

@@ -66,6 +66,25 @@ function createLegacyDatabase(): Database.Database {
   return db
 }
 
+test('migration adds profile and object key template columns', () => {
+  const db = createLegacyDatabase()
+  runMigrations(db)
+
+  const taskColumns = (db.pragma('table_info(tasks)') as Array<{ name: string }>)
+    .map((column) => column.name)
+  const destinationColumns = (db.pragma('table_info(task_destinations)') as Array<{ name: string }>)
+    .map((column) => column.name)
+  const sshColumns = (db.pragma('table_info(ssh_machines)') as Array<{ name: string }>)
+    .map((column) => column.name)
+
+  assert.ok(taskColumns.includes('profile_id'))
+  assert.ok(taskColumns.includes('profile_name'))
+  assert.ok(taskColumns.includes('profile_snapshot_json'))
+  assert.ok(destinationColumns.includes('path_mode'))
+  assert.ok(destinationColumns.includes('object_key_template'))
+  assert.ok(sshColumns.includes('profile_id'))
+})
+
 test('legacy migration skips completed file details and preserves unfinished progress', () => {
   const db = createLegacyDatabase()
   const now = new Date().toISOString()
@@ -118,11 +137,21 @@ test('legacy migration skips completed file details and preserves unfinished pro
   runMigrations(db)
 
   const destinations = db.prepare(
-    'SELECT task_id, provider, status FROM task_destinations ORDER BY task_id'
+    'SELECT task_id, provider, status, upload_relative_path FROM task_destinations ORDER BY task_id'
   ).all()
   assert.deepEqual(destinations, [
-    { task_id: 'completed-task', provider: 'aliyun', status: 'completed' },
-    { task_id: 'failed-task', provider: 'aliyun', status: 'failed' }
+    {
+      task_id: 'completed-task',
+      provider: 'aliyun',
+      status: 'completed',
+      upload_relative_path: ''
+    },
+    {
+      task_id: 'failed-task',
+      provider: 'aliyun',
+      status: 'failed',
+      upload_relative_path: '2026-03-14/failed'
+    }
   ])
 
   const fileDestinations = db.prepare(`
@@ -185,10 +214,14 @@ test('legacy rsync tasks recover the date and child package from the remote path
   runMigrations(db)
 
   const task = db.prepare(
-    'SELECT upload_relative_path FROM tasks WHERE id = ?'
+    `SELECT t.upload_relative_path, td.upload_relative_path AS destination_upload_relative_path
+     FROM tasks t
+     INNER JOIN task_destinations td ON td.task_id = t.id
+     WHERE t.id = ?`
   ).get('rsync-task')
   assert.deepEqual(task, {
-    upload_relative_path: '2026-03-14/17-38-09_teleop'
+    upload_relative_path: '2026-03-14/17-38-09_teleop',
+    destination_upload_relative_path: '2026-03-14/17-38-09_teleop'
   })
 
   db.close()

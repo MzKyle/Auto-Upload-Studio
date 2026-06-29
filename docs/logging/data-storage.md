@@ -7,11 +7,11 @@
 | 表 | 内容 |
 | --- | --- |
 | `day_folders` | 日期路径、状态、子目录清单、文件/字节汇总和完成时间 |
-| `tasks` | 逻辑任务、上传模式、日期汇总 ID、上传相对路径和来源 |
+| `tasks` | 逻辑任务、上传模式、Profile 快照、日期汇总 ID、上传相对路径和来源 |
 | `task_files` | 逻辑文件、大小和聚合状态 |
-| `task_destinations` | 每个任务的阿里/腾讯状态、Prefix、进度和错误 |
+| `task_destinations` | 每个任务的阿里/腾讯状态、Prefix、路径模式、模板、进度和错误 |
 | `task_file_destinations` | 每个逻辑文件的逐云状态、对象 key、upload ID 和错误 |
-| `ssh_machines` | SSH、目录、传输模式和最近同步时间 |
+| `ssh_machines` | SSH、目录、传输模式、绑定 Profile 和最近同步时间 |
 | `settings` | 各设置 section 的 JSON |
 
 `tasks.oss_prefix`、`task_files.oss_key` 等旧字段为兼容保留。新逻辑以
@@ -24,6 +24,7 @@
 - 为没有目标记录的旧任务创建阿里云目标。
 - 为未完成旧任务的文件创建阿里云文件目标。
 - 添加上传模式、日期汇总和上传相对路径字段。
+- 添加 Profile、目的地路径模式、对象 Key 模板和 SSH 机器 Profile 字段。
 - 从本地任务路径或 rsync 远程路径推导未完成任务的日期层路径。
 - 为旧远程机器补充 `transfer_mode`。
 
@@ -33,7 +34,8 @@
 
 ### `tmp_upload.json`
 
-记录目录登记、来源、日期汇总、上传相对路径、上传模式和两个 Prefix。
+记录目录登记、来源、日期汇总、上传相对路径、上传模式、Profile 快照、两个 Prefix、
+路径模式和对象 Key 模板。
 
 ### `process_task.json`
 

@@ -5,8 +5,21 @@ import { watch, type FSWatcher } from 'chokidar'
 import { BrowserWindow } from 'electron'
 import log from 'electron-log'
 import { IPC } from '@shared/ipc-channels'
-import { buildUploadRelativePath } from '@shared/day-folder'
-import { getUploadTargetSnapshot } from '@shared/cloud-upload'
+import {
+  getUploadTargetSnapshot,
+  providersForMode,
+  type UploadTargetSnapshot
+} from '@shared/cloud-upload'
+import type { UploadPathResolveContext } from '@shared/upload-path'
+import {
+  getActiveProfileScanRoots,
+  getProfileWatchedDirectoriesByProvider,
+  type ActiveProfileScanRoot
+} from '@shared/scan-config'
+import {
+  getProfileById,
+  resolveProfileUploadSnapshot
+} from '@shared/upload-profile'
 import { getTaskRepo } from '../db/task.repo'
 import { getTaskDestinationRepo } from '../db/task-destination.repo'
 import { getDayFolderRepo } from '../db/day-folder.repo'
@@ -24,13 +37,14 @@ import {
 } from '../utils/marker-file'
 import type {
   TmpUploadMarker,
-  ScanConfig,
   StabilityConfig,
   ScannerStatus,
   DataCollectConfig,
   Task,
   UploadTargetMode,
-  CloudProvider
+  CloudProvider,
+  AppSettings,
+  UploadPathMode
 } from '@shared/types'
 
 interface PendingDir {
@@ -43,7 +57,13 @@ interface PendingDir {
   discoveredAt: string
   lastSnapshot: Map<string, { size: number; mtimeMs: number }>
   uploadTargetMode?: UploadTargetMode
+  profileId?: string
+  profileName?: string
+  profileSnapshot?: AppSettings['profiles'][number]
   destinationPrefixes?: Partial<Record<CloudProvider, string>>
+  destinationUploadRelativePaths?: Partial<Record<CloudProvider, string>>
+  destinationPathModes?: TmpUploadMarker['metadata']['destinationPathModes']
+  destinationObjectKeyTemplates?: TmpUploadMarker['metadata']['destinationObjectKeyTemplates']
 }
 
 const NON_WORK_DIR_REASON = '非工作次目录'
@@ -82,9 +102,10 @@ export class ScannerService {
     this.running = true
 
     const settings = getSettingsRepo()
-    const scanConfig = settings.get<ScanConfig>('scan')
-    const directories = scanConfig?.directories || []
-    const intervalMs = (scanConfig?.intervalSeconds || 30) * 1000
+    const allSettings = settings.getAll()
+    const activeRoots = getActiveProfileScanRoots(allSettings.profiles)
+    const directories = activeRoots.map((root) => root.directory)
+    const intervalMs = (allSettings.scan.intervalSeconds || 30) * 1000
 
     this.startWatcher(directories)
     this.timer = setInterval(() => this.scheduleFullScan(), intervalMs)
@@ -129,9 +150,13 @@ export class ScannerService {
 
   getStatus(): ScannerStatus {
     const settings = getSettingsRepo()
-    const scanConfig = settings.get<ScanConfig>('scan')
+    const allSettings = settings.getAll()
     const stabilityConfig = settings.get<StabilityConfig>('stability')
     const requiredChecks = stabilityConfig?.checkCount || 3
+    const activeRoots = getActiveProfileScanRoots(allSettings.profiles)
+    const watchedDirectoriesByProvider = getProfileWatchedDirectoriesByProvider(
+      allSettings.profiles
+    )
 
     const pendingStabilityChecks: ScannerStatus['pendingStabilityChecks'] = []
     for (const pending of this.pendingDirs.values()) {
@@ -147,7 +172,8 @@ export class ScannerService {
       running: this.running,
       lastScanAt: this.lastScanAt,
       nextScanAt: this.nextScanAt,
-      watchedDirectories: scanConfig?.directories || [],
+      watchedDirectories: activeRoots.map((root) => root.directory),
+      watchedDirectoriesByProvider,
       pendingStabilityChecks,
       lastScanResults: this.lastScanResults
     }
@@ -166,8 +192,10 @@ export class ScannerService {
 
     this.scanInProgress = true
     const settings = getSettingsRepo()
-    const scanConfig = settings.get<ScanConfig>('scan')
-    const directories = scanConfig?.directories || []
+    const allSettings = settings.getAll()
+    const scanConfig = allSettings.scan
+    const activeRoots = getActiveProfileScanRoots(allSettings.profiles)
+    const directories = activeRoots.map((root) => root.directory)
     const intervalMs = (scanConfig?.intervalSeconds || 30) * 1000
     const today = this.formatLocalDate(new Date())
     const seenChildPaths = new Set<string>()
@@ -179,15 +207,16 @@ export class ScannerService {
     let skippedChildren = 0
 
     try {
-      for (const rootDir of directories) {
-        if (!(await this.pathExists(rootDir))) {
-          log.warn('扫描根目录不存在:', rootDir)
+      for (const root of activeRoots) {
+        if (!(await this.pathExists(root.directory))) {
+          log.warn('扫描根目录不存在:', root.directory)
           continue
         }
+        const profile = getProfileById(allSettings, root.profileId)
         const result = await this.scanRootDirectory(
-          rootDir,
+          root,
           today,
-          scanConfig?.workDirNamePattern,
+          profile.scan.workDirNamePattern || scanConfig?.workDirNamePattern,
           seenChildPaths
         )
         scannedDirs += result.scanned
@@ -227,7 +256,7 @@ export class ScannerService {
   }
 
   private async scanRootDirectory(
-    rootDir: string,
+    root: ActiveProfileScanRoot,
     today: string,
     workDirNamePattern: string | undefined,
     seenChildPaths: Set<string>
@@ -240,17 +269,21 @@ export class ScannerService {
 
     try {
       const dayDirectory = await discoverCurrentDayDirectory(
-        rootDir,
+        root.directory,
         today,
         workDirNamePattern
       )
       if (dayDirectory) {
+        const profile = getProfileById(getSettingsRepo().getAll(), root.profileId)
         const result = await this.scanDayDirectory(
+          root.directory,
           dayDirectory.folderPath,
           dayDirectory.dateName,
           dayDirectory.childFolderNames,
           dayDirectory.ignoredChildFolderNames,
-          seenChildPaths
+          seenChildPaths,
+          root.providers,
+          profile
         )
         scanned += result.scanned
         newFound += result.newFound
@@ -259,18 +292,21 @@ export class ScannerService {
         skipped += result.skipped
       }
     } catch (err) {
-      log.error('扫描数据根目录失败:', rootDir, err)
+      log.error('扫描数据根目录失败:', root.directory, err)
     }
 
     return { scanned, newFound, existing, ignored, skipped }
   }
 
   private async scanDayDirectory(
+    sourceRootDir: string,
     dayFolderPath: string,
     dateName: string,
     discoveredChildNames: string[],
     ignoredChildNames: string[],
-    seenChildPaths: Set<string>
+    seenChildPaths: Set<string>,
+    providers: CloudProvider[],
+    profile: AppSettings['profiles'][number]
   ): Promise<{ scanned: number; newFound: number; existing: number; ignored: number; skipped: number }> {
     const dayFolder = getDayFolderRepo().ensure(dayFolderPath, dateName)
     const childNames = Array.from(
@@ -287,13 +323,20 @@ export class ScannerService {
       for (let index = 0; index < childNames.length; index++) {
         const childName = childNames[index]
         const childPath = join(dayFolderPath, childName)
-        const uploadRelativePath = buildUploadRelativePath(dateName, childName)
+        const pathContext: UploadPathResolveContext = {
+          sourcePath: childPath,
+          basePath: sourceRootDir,
+          dateName,
+          workDirName: childName
+        }
+        const targetSnapshot = this.pendingTargetSnapshot(providers, pathContext, profile)
+        const uploadRelativePath = targetSnapshot.uploadRelativePath
         seenChildPaths.add(childPath)
         scanned++
 
         const existingTask = getTaskRepo().getByFolderPath(childPath)
         if (existingTask) {
-          this.attachTaskToDayFolder(existingTask, dayFolder.id, uploadRelativePath)
+          this.attachTaskToDayFolder(existingTask, dayFolder.id)
           this.pendingDirs.delete(childPath)
           if (
             dayFolder.ignored &&
@@ -316,7 +359,9 @@ export class ScannerService {
             childPath,
             childName,
             dayFolder.id,
-            uploadRelativePath
+            uploadRelativePath,
+            providers,
+            targetSnapshot
           )
           this.broadcastTaskStatus(task.id, task.status, 'skipped')
           ignored++
@@ -340,17 +385,31 @@ export class ScannerService {
 
         const tmpMarker = readTmpUpload(childPath)
         if (tmpMarker) {
+          const markerUploadRelativePath =
+            tmpMarker.metadata.uploadRelativePath ?? uploadRelativePath
           const task = this.registerNewDir({
             path: childPath,
             dayFolderId: dayFolder.id,
             dateName,
             folderName: childName,
-            uploadRelativePath,
+            uploadRelativePath: markerUploadRelativePath,
             checks: 0,
             discoveredAt: tmpMarker.createdAt || new Date().toISOString(),
             lastSnapshot: new Map(),
             uploadTargetMode: tmpMarker.metadata.uploadTargetMode,
-            destinationPrefixes: tmpMarker.metadata.destinationPrefixes
+            profileId: tmpMarker.metadata.profileId,
+            profileName: tmpMarker.metadata.profileName,
+            profileSnapshot: tmpMarker.metadata.profileSnapshot,
+            destinationPrefixes: tmpMarker.metadata.destinationPrefixes,
+            destinationUploadRelativePaths:
+              tmpMarker.metadata.destinationUploadRelativePaths ||
+              this.legacyDestinationUploadRelativePaths(
+                tmpMarker.metadata.uploadTargetMode,
+                markerUploadRelativePath
+              ),
+            destinationPathModes: tmpMarker.metadata.destinationPathModes,
+            destinationObjectKeyTemplates:
+              tmpMarker.metadata.destinationObjectKeyTemplates
           })
           if (dayFolder.ignored) {
             getTaskRepo().skip(task.id, '用户忽略整个日期')
@@ -372,7 +431,15 @@ export class ScannerService {
             uploadRelativePath,
             checks: 0,
             discoveredAt: new Date().toISOString(),
-            lastSnapshot: new Map()
+            lastSnapshot: new Map(),
+            uploadTargetMode: targetSnapshot.mode,
+            profileId: targetSnapshot.profileId,
+            profileName: targetSnapshot.profileName,
+            profileSnapshot: targetSnapshot.profileSnapshot,
+            destinationPrefixes: targetSnapshot.prefixes,
+            destinationUploadRelativePaths: targetSnapshot.uploadRelativePaths,
+            destinationPathModes: targetSnapshot.pathModes,
+            destinationObjectKeyTemplates: targetSnapshot.objectKeyTemplates
           }
           const task = this.registerNewDir(pending)
           if (dayFolder.ignored) {
@@ -426,9 +493,21 @@ export class ScannerService {
             prefixes: {
               aliyun: pending.destinationPrefixes.aliyun || '',
               tencent: pending.destinationPrefixes.tencent || ''
-            }
+            },
+          uploadRelativePaths:
+              pending.destinationUploadRelativePaths ||
+              this.legacyDestinationUploadRelativePaths(
+                pending.uploadTargetMode,
+                pending.uploadRelativePath
+              ),
+            uploadRelativePath: pending.uploadRelativePath,
+            profileId: pending.profileId,
+            profileName: pending.profileName,
+            profileSnapshot: pending.profileSnapshot,
+            pathModes: pending.destinationPathModes,
+            objectKeyTemplates: pending.destinationObjectKeyTemplates
           }
-        : getUploadTargetSnapshot(settings)
+        : this.legacySnapshotForPendingDir(pending, settings)
     const marker: TmpUploadMarker = {
       version: 2,
       createdAt: new Date().toISOString(),
@@ -439,7 +518,13 @@ export class ScannerService {
         date: pending.dateName,
         uploadRelativePath: pending.uploadRelativePath,
         uploadTargetMode: snapshot.mode,
-        destinationPrefixes: snapshot.prefixes
+        profileId: snapshot.profileId,
+        profileName: snapshot.profileName,
+        profileSnapshot: snapshot.profileSnapshot,
+        destinationPrefixes: snapshot.prefixes,
+        destinationUploadRelativePaths: snapshot.uploadRelativePaths,
+        destinationPathModes: snapshot.pathModes,
+        destinationObjectKeyTemplates: snapshot.objectKeyTemplates
       }
     }
 
@@ -461,13 +546,16 @@ export class ScannerService {
     dirPath: string,
     folderName: string,
     dayFolderId: string,
-    uploadRelativePath: string
+    uploadRelativePath: string,
+    providers?: CloudProvider[],
+    targetSnapshot?: UploadTargetSnapshot
   ): Task {
     const task = this.ensureTaskRegistered(
       dirPath,
       folderName,
       dayFolderId,
-      uploadRelativePath
+      uploadRelativePath,
+      targetSnapshot || (providers ? getUploadTargetSnapshot(getSettingsRepo().getAll()) : undefined)
     )
     if (task.status !== 'skipped' || task.errorMessage !== NON_WORK_DIR_REASON) {
       getTaskRepo().skip(task.id, NON_WORK_DIR_REASON)
@@ -589,7 +677,7 @@ export class ScannerService {
 
     try {
       const settings = getSettingsRepo().getAll()
-      const files = await new FileFilterService(settings.filter).scanFolderAsync(task.folderPath)
+      const files = await new FileFilterService(task.profileSnapshot?.filter || settings.filter).scanFolderAsync(task.folderPath)
       const stableChecks =
         task.sourceType === 'local' && task.dayFolderId
           ? Math.max(2, settings.stability.checkCount || 2)
@@ -665,7 +753,7 @@ export class ScannerService {
     oldStatus: Task['status'],
     newStatus: Task['status']
   ): void {
-    for (const win of BrowserWindow.getAllWindows()) {
+    for (const win of BrowserWindow?.getAllWindows?.() ?? []) {
       win.webContents.send(IPC.TASK_STATUS_CHANGE, {
         taskId,
         oldStatus,
@@ -702,6 +790,9 @@ export class ScannerService {
         currentSettings.tencentS3.prefix ||
         ''
     }
+    const uploadRelativePaths =
+      tmpMarker?.metadata.destinationUploadRelativePaths ||
+      this.legacyDestinationUploadRelativePaths(mode, legacyUploadRelativePath)
     const task = this.ensureTaskRegistered(
       dirPath,
       folderName,
@@ -709,7 +800,9 @@ export class ScannerService {
       legacyUploadRelativePath,
       {
         mode,
-        prefixes
+        prefixes,
+        uploadRelativePaths,
+        uploadRelativePath: legacyUploadRelativePath
       }
     )
     const taskRepo = getTaskRepo()
@@ -747,7 +840,8 @@ export class ScannerService {
         date: dateName,
         uploadRelativePath: legacyUploadRelativePath,
         uploadTargetMode: mode,
-        destinationPrefixes: prefixes
+        destinationPrefixes: prefixes,
+        destinationUploadRelativePaths: uploadRelativePaths
       }
     })
     writeProcessTask(dirPath, {
@@ -765,15 +859,12 @@ export class ScannerService {
     folderName: string,
     dayFolderId: string,
     uploadRelativePath: string,
-    targetSnapshot?: {
-      mode: UploadTargetMode
-      prefixes: Record<CloudProvider, string>
-    }
+    targetSnapshot?: UploadTargetSnapshot
   ): Task {
     const taskRepo = getTaskRepo()
     const existing = taskRepo.getByFolderPath(dirPath)
     if (existing) {
-      this.attachTaskToDayFolder(existing, dayFolderId, uploadRelativePath)
+      this.attachTaskToDayFolder(existing, dayFolderId)
       return taskRepo.getById(existing.id)!
     }
 
@@ -785,28 +876,91 @@ export class ScannerService {
       ossPrefix: snapshot.prefixes.aliyun,
       uploadTargetMode: snapshot.mode,
       destinationPrefixes: snapshot.prefixes,
+      destinationUploadRelativePaths: snapshot.uploadRelativePaths,
+      destinationPathModes: snapshot.pathModes,
+      destinationObjectKeyTemplates: snapshot.objectKeyTemplates,
       dayFolderId,
       uploadRelativePath,
-      sourceType: 'local'
+      sourceType: 'local',
+      profileId: snapshot.profileId,
+      profileName: snapshot.profileName,
+      profileSnapshot: snapshot.profileSnapshot
     })
+  }
+
+  private pendingTargetSnapshot(
+    providers: CloudProvider[],
+    context: UploadPathResolveContext,
+    profile: AppSettings['profiles'][number]
+  ): {
+    uploadTargetMode: UploadTargetMode
+    destinationPrefixes: Record<CloudProvider, string>
+    destinationUploadRelativePaths: Partial<Record<CloudProvider, string>>
+    uploadRelativePath: string
+    mode: UploadTargetMode
+    prefixes: Record<CloudProvider, string>
+    uploadRelativePaths: Partial<Record<CloudProvider, string>>
+    profileId: string
+    profileName: string
+    profileSnapshot: AppSettings['profiles'][number]
+    pathModes: Partial<Record<CloudProvider, UploadPathMode>>
+    objectKeyTemplates: Partial<Record<CloudProvider, string | null>>
+  } {
+    const snapshot = resolveProfileUploadSnapshot(
+      profile,
+      context,
+      providers,
+    )
+    return {
+      uploadTargetMode: snapshot.mode,
+      destinationPrefixes: snapshot.prefixes,
+      destinationUploadRelativePaths: snapshot.uploadRelativePaths,
+      uploadRelativePath: snapshot.uploadRelativePath,
+      mode: snapshot.mode,
+      prefixes: snapshot.prefixes,
+      uploadRelativePaths: snapshot.uploadRelativePaths,
+      profileId: snapshot.profileId,
+      profileName: snapshot.profileName,
+      profileSnapshot: snapshot.profileSnapshot,
+      pathModes: snapshot.pathModes,
+      objectKeyTemplates: snapshot.objectKeyTemplates
+    }
+  }
+
+  private legacySnapshotForPendingDir(
+    pending: PendingDir,
+    settings: AppSettings
+  ): UploadTargetSnapshot {
+    const snapshot = getUploadTargetSnapshot(settings)
+    return {
+      ...snapshot,
+      uploadRelativePath: pending.uploadRelativePath,
+      uploadRelativePaths: this.legacyDestinationUploadRelativePaths(
+        snapshot.mode,
+        pending.uploadRelativePath
+      )
+    }
   }
 
   private attachTaskToDayFolder(
     task: Task,
-    dayFolderId: string,
-    uploadRelativePath: string
+    dayFolderId: string
   ): void {
-    const targetUploadRelativePath =
-      task.status === 'completed' && task.uploadRelativePath === task.folderName
-        ? task.uploadRelativePath
-        : uploadRelativePath
-
-    if (
-      task.dayFolderId !== dayFolderId ||
-      task.uploadRelativePath !== targetUploadRelativePath
-    ) {
-      getTaskRepo().updateDayFolderMetadata(task.id, dayFolderId, targetUploadRelativePath)
+    if (task.dayFolderId !== dayFolderId) {
+      getTaskRepo().updateDayFolderId(task.id, dayFolderId)
     }
+  }
+
+  private legacyDestinationUploadRelativePaths(
+    mode: UploadTargetMode | undefined,
+    uploadRelativePath: string | undefined
+  ): Partial<Record<CloudProvider, string>> {
+    if (uploadRelativePath === undefined) return {}
+    const paths: Partial<Record<CloudProvider, string>> = {}
+    for (const provider of providersForMode(mode || 'aliyun')) {
+      paths[provider] = uploadRelativePath
+    }
+    return paths
   }
 
   private collectDataInfo(dirPath: string): void {
@@ -817,7 +971,7 @@ export class ScannerService {
     try {
       const info = getDataCollectService().collectDataInfo(dirPath)
       if (info) {
-        for (const win of BrowserWindow.getAllWindows()) {
+        for (const win of BrowserWindow?.getAllWindows?.() ?? []) {
           win.webContents.send(IPC.DATA_COLLECT_RESULT, info)
         }
       }
@@ -828,7 +982,7 @@ export class ScannerService {
 
   private broadcastStatus(): void {
     const status = this.getStatus()
-    for (const win of BrowserWindow.getAllWindows()) {
+    for (const win of BrowserWindow?.getAllWindows?.() ?? []) {
       win.webContents.send(IPC.SCANNER_EVENT, status)
     }
   }

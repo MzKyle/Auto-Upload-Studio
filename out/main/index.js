@@ -170,6 +170,7 @@ const IPC = {
   SETTINGS_SAVE: "settings:save",
   SETTINGS_TEST_OSS: "settings:test-oss",
   SETTINGS_TEST_TENCENT_S3: "settings:test-tencent-s3",
+  UPLOAD_PATH_PREVIEW: "upload:path-preview",
   // SSH / rsync
   SSH_LIST_MACHINES: "ssh:list-machines",
   SSH_ADD_MACHINE: "ssh:add-machine",
@@ -244,11 +245,11 @@ function joinOssPath(...parts) {
 function buildUploadRelativePath(dateFolder, childFolder) {
   return joinOssPath(dateFolder, childFolder);
 }
-function pathSegments(directoryPath) {
+function pathSegments$2(directoryPath) {
   return directoryPath.replace(/\\/g, "/").split("/").map((part) => part.trim()).filter((part) => part.length > 0 && part !== ".");
 }
 function deriveDateScopedUploadRelativePath(directoryPath) {
-  const segments = pathSegments(directoryPath);
+  const segments = pathSegments$2(directoryPath);
   const folderName = segments.at(-1);
   if (!folderName) return null;
   if (isDateFolderName(folderName)) {
@@ -259,13 +260,6 @@ function deriveDateScopedUploadRelativePath(directoryPath) {
     return buildUploadRelativePath(parentName, folderName);
   }
   return null;
-}
-function resolveDirectoryUploadRelativePath(directoryPath, fallbackDirectoryPath) {
-  const dateScopedPath = deriveDateScopedUploadRelativePath(directoryPath) || (fallbackDirectoryPath ? deriveDateScopedUploadRelativePath(fallbackDirectoryPath) : null);
-  if (dateScopedPath) return dateScopedPath;
-  const primaryFolderName = pathSegments(directoryPath).at(-1);
-  const fallbackFolderName = fallbackDirectoryPath ? pathSegments(fallbackDirectoryPath).at(-1) : null;
-  return primaryFolderName || fallbackFolderName || "";
 }
 function buildOssKey(prefix, uploadRelativePath, fileRelativePath) {
   return joinOssPath(prefix, uploadRelativePath, fileRelativePath);
@@ -326,6 +320,9 @@ function runMigrations(db2) {
       error_message TEXT,
       source_type TEXT NOT NULL DEFAULT 'local',
       source_machine_id TEXT,
+      profile_id TEXT,
+      profile_name TEXT,
+      profile_snapshot_json TEXT,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL,
       completed_at TEXT,
@@ -358,6 +355,9 @@ function runMigrations(db2) {
       provider TEXT NOT NULL,
       status TEXT NOT NULL DEFAULT 'pending',
       prefix TEXT NOT NULL DEFAULT '',
+      upload_relative_path TEXT NOT NULL DEFAULT '',
+      path_mode TEXT NOT NULL DEFAULT 'target-root',
+      object_key_template TEXT,
       total_files INTEGER NOT NULL DEFAULT 0,
       uploaded_files INTEGER NOT NULL DEFAULT 0,
       total_bytes INTEGER NOT NULL DEFAULT 0,
@@ -408,6 +408,7 @@ function runMigrations(db2) {
       bw_limit INTEGER NOT NULL DEFAULT 5000,
       cpu_nice INTEGER NOT NULL DEFAULT 19,
       transfer_mode TEXT NOT NULL DEFAULT 'rsync',
+      profile_id TEXT,
       enabled INTEGER NOT NULL DEFAULT 1,
       last_sync_at TEXT,
       created_at TEXT NOT NULL
@@ -432,7 +433,35 @@ function runMigrations(db2) {
     db2.exec(`ALTER TABLE tasks ADD COLUMN upload_target_mode TEXT NOT NULL DEFAULT 'aliyun'`);
     log.info("迁移: tasks 表添加 upload_target_mode 列");
   }
+  if (!taskColumns.some((c) => c.name === "profile_id")) {
+    db2.exec(`ALTER TABLE tasks ADD COLUMN profile_id TEXT`);
+    log.info("迁移: tasks 表添加 profile_id 列");
+  }
+  if (!taskColumns.some((c) => c.name === "profile_name")) {
+    db2.exec(`ALTER TABLE tasks ADD COLUMN profile_name TEXT`);
+    log.info("迁移: tasks 表添加 profile_name 列");
+  }
+  if (!taskColumns.some((c) => c.name === "profile_snapshot_json")) {
+    db2.exec(`ALTER TABLE tasks ADD COLUMN profile_snapshot_json TEXT`);
+    log.info("迁移: tasks 表添加 profile_snapshot_json 列");
+  }
   db2.exec(`CREATE INDEX IF NOT EXISTS idx_tasks_day_folder_id ON tasks(day_folder_id)`);
+  const taskDestinationColumns = db2.pragma("table_info(task_destinations)");
+  const addedDestinationUploadPath = !taskDestinationColumns.some(
+    (c) => c.name === "upload_relative_path"
+  );
+  if (addedDestinationUploadPath) {
+    db2.exec(`ALTER TABLE task_destinations ADD COLUMN upload_relative_path TEXT NOT NULL DEFAULT ''`);
+    log.info("迁移: task_destinations 表添加 upload_relative_path 列");
+  }
+  if (!taskDestinationColumns.some((c) => c.name === "path_mode")) {
+    db2.exec(`ALTER TABLE task_destinations ADD COLUMN path_mode TEXT NOT NULL DEFAULT 'target-root'`);
+    log.info("迁移: task_destinations 表添加 path_mode 列");
+  }
+  if (!taskDestinationColumns.some((c) => c.name === "object_key_template")) {
+    db2.exec(`ALTER TABLE task_destinations ADD COLUMN object_key_template TEXT`);
+    log.info("迁移: task_destinations 表添加 object_key_template 列");
+  }
   const dayFolderColumns = db2.pragma("table_info(day_folders)");
   if (!dayFolderColumns.some((c) => c.name === "ignored")) {
     db2.exec(`ALTER TABLE day_folders ADD COLUMN ignored INTEGER NOT NULL DEFAULT 0`);
@@ -491,14 +520,27 @@ function runMigrations(db2) {
   if (migratedDatePaths > 0) {
     log.info(`日期层路径迁移完成: ${migratedDatePaths} 个未完成任务`);
   }
+  if (addedDestinationUploadPath) {
+    db2.exec(`
+      UPDATE task_destinations
+      SET upload_relative_path = COALESCE((
+        SELECT upload_relative_path
+        FROM tasks
+        WHERE tasks.id = task_destinations.task_id
+      ), '')
+    `);
+    log.info("迁移: 已回填任务目标上传相对路径");
+  }
   const migratedDestinations = db2.prepare(
     `INSERT OR IGNORE INTO task_destinations (
       id, task_id, provider, status, prefix, total_files, uploaded_files,
-      total_bytes, uploaded_bytes, error_message, created_at, updated_at, completed_at
+      total_bytes, uploaded_bytes, error_message, created_at, updated_at,
+      completed_at, upload_relative_path, path_mode, object_key_template
     )
     SELECT lower(hex(randomblob(16))), id, 'aliyun', status, COALESCE(oss_prefix, ''),
       total_files, uploaded_files, total_bytes, uploaded_bytes, error_message,
-      created_at, updated_at, completed_at
+      created_at, updated_at, completed_at, COALESCE(upload_relative_path, ''),
+      'target-root', NULL
     FROM tasks t
     WHERE NOT EXISTS (
       SELECT 1 FROM task_destinations existing WHERE existing.task_id = t.id
@@ -532,6 +574,11 @@ function runMigrations(db2) {
   if (!hasTransferMode) {
     db2.exec(`ALTER TABLE ssh_machines ADD COLUMN transfer_mode TEXT NOT NULL DEFAULT 'rsync'`);
     log.info("迁移: ssh_machines 表添加 transfer_mode 列");
+  }
+  const sshColumnsAfterTransfer = db2.pragma("table_info(ssh_machines)");
+  if (!sshColumnsAfterTransfer.some((c) => c.name === "profile_id")) {
+    db2.exec(`ALTER TABLE ssh_machines ADD COLUMN profile_id TEXT`);
+    log.info("迁移: ssh_machines 表添加 profile_id 列");
   }
 }
 function ensureUniqueTaskFilePathIndex(db2) {
@@ -661,17 +708,132 @@ function reconcileStartupState(db2) {
   });
   transaction();
 }
+const DEFAULT_UPLOAD_PATH_MODE = "target-root";
+const DEFAULT_UPLOAD_PATH_SEGMENT_COUNT = 2;
+const UPLOAD_PATH_MODES = /* @__PURE__ */ new Set([
+  "target-root",
+  "date-workdir",
+  "keep-source",
+  "last-segments",
+  "template"
+]);
+function normalizeUploadPathMode(value) {
+  return typeof value === "string" && UPLOAD_PATH_MODES.has(value) ? value : DEFAULT_UPLOAD_PATH_MODE;
+}
+function normalizeUploadPathSegmentCount(value) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return DEFAULT_UPLOAD_PATH_SEGMENT_COUNT;
+  return Math.max(0, Math.min(20, Math.floor(parsed)));
+}
+function normalizeUploadPathConfig(config) {
+  return {
+    ...config,
+    pathMode: normalizeUploadPathMode(config.pathMode),
+    pathSegmentCount: normalizeUploadPathSegmentCount(config.pathSegmentCount)
+  };
+}
+function getProviderUploadPathConfig(settings, provider) {
+  const config = provider === "aliyun" ? settings.oss : settings.tencentS3;
+  return normalizeUploadPathConfig(config);
+}
+function resolveProviderUploadRelativePaths(settings, providers, context) {
+  const paths = {};
+  for (const provider of providers) {
+    paths[provider] = resolveUploadRelativePath(
+      getProviderUploadPathConfig(settings, provider),
+      context
+    );
+  }
+  return paths;
+}
+function firstProviderUploadRelativePath(providers, paths, fallback = "") {
+  for (const provider of providers) {
+    const path2 = paths[provider];
+    if (path2 !== void 0) return path2;
+  }
+  return fallback;
+}
+function resolveUploadRelativePath(config, context) {
+  const normalized = normalizeUploadPathConfig(
+    config
+  );
+  const sourcePath = context.sourcePath;
+  if (normalized.pathMode === "target-root" || normalized.pathMode === "template") return "";
+  if (normalized.pathMode === "date-workdir") {
+    if (context.dateName && context.workDirName) {
+      return joinOssPath(context.dateName, context.workDirName);
+    }
+    return deriveDateScopedUploadRelativePath(sourcePath) || (context.fallbackDirectoryPath ? deriveDateScopedUploadRelativePath(context.fallbackDirectoryPath) : null) || lastPathSegment(sourcePath);
+  }
+  if (normalized.pathMode === "keep-source") {
+    const basePath = context.basePath || parentDirectoryPath(sourcePath);
+    return relativePathFromBase$1(sourcePath, basePath);
+  }
+  if (normalized.pathSegmentCount <= 0) return "";
+  return joinOssPath(...pathSegments$1(sourcePath).slice(-normalized.pathSegmentCount));
+}
+function relativePathFromBase$1(sourcePath, basePath) {
+  const source = pathSegments$1(sourcePath);
+  const base = pathSegments$1(basePath);
+  if (source.length === 0) return "";
+  let index = 0;
+  while (index < source.length && index < base.length && segmentEquals(source[index], base[index])) {
+    index++;
+  }
+  if (index === base.length && index < source.length) {
+    return joinOssPath(...source.slice(index));
+  }
+  return lastPathSegment(sourcePath);
+}
+function pathSegments$1(path2) {
+  return path2.replace(/\\/g, "/").split("/").map((part) => part.trim()).filter((part) => part.length > 0 && part !== ".");
+}
+function parentDirectoryPath(path2) {
+  const segments = pathSegments$1(path2);
+  return joinOssPath(...segments.slice(0, -1));
+}
+function lastPathSegment(path2) {
+  return pathSegments$1(path2).at(-1) || "";
+}
+function segmentEquals(a, b) {
+  if (a.endsWith(":") || b.endsWith(":")) return a.toLowerCase() === b.toLowerCase();
+  return a === b;
+}
 function providersForMode(mode) {
   if (mode === "both") return ["aliyun", "tencent"];
   return [mode];
 }
-function getUploadTargetSnapshot(settings) {
+function modeForProviders(providers) {
+  const set = new Set(providers);
+  if (set.has("aliyun") && set.has("tencent")) return "both";
+  return set.has("tencent") ? "tencent" : "aliyun";
+}
+function getUploadTargetSnapshot(settings, context) {
+  return getUploadTargetSnapshotForProviders(
+    providersForMode(settings.cloud.targetMode),
+    settings,
+    context
+  );
+}
+function getUploadTargetSnapshotForProviders(providers, settings, context) {
+  const uploadRelativePaths = context ? resolveProviderUploadRelativePaths(settings, providers, context) : {};
   return {
-    mode: settings.cloud.targetMode,
+    mode: modeForProviders(providers),
     prefixes: {
       aliyun: settings.oss.prefix || "",
       tencent: settings.tencentS3.prefix || ""
-    }
+    },
+    uploadRelativePaths,
+    uploadRelativePath: firstProviderUploadRelativePath(
+      providers,
+      uploadRelativePaths,
+      ""
+    ),
+    pathModes: {
+      aliyun: settings.oss.pathMode,
+      tencent: settings.tencentS3.pathMode
+    },
+    objectKeyTemplates: {}
   };
 }
 function deriveLogicalFileStatus(statuses) {
@@ -692,6 +854,9 @@ function rowToDestination(row) {
     provider: row.provider,
     status: row.status,
     prefix: row.prefix || "",
+    uploadRelativePath: row.upload_relative_path ?? "",
+    pathMode: row.path_mode || "target-root",
+    objectKeyTemplate: row.object_key_template || null,
     totalFiles: row.total_files,
     uploadedFiles: row.uploaded_files,
     totalBytes: row.total_bytes,
@@ -717,13 +882,15 @@ function rowToFileDestination(row) {
   };
 }
 class TaskDestinationRepo {
-  ensureForTask(taskId, mode, prefixes, initialStatus = "pending") {
+  ensureForTask(taskId, mode, prefixes, initialStatus = "pending", uploadRelativePaths = {}, pathModes = {}, objectKeyTemplates = {}) {
     const db2 = getDb();
     const now = (/* @__PURE__ */ new Date()).toISOString();
     const stmt = db2.prepare(
       `INSERT OR IGNORE INTO task_destinations (
-        id, task_id, provider, status, prefix, created_at, updated_at, completed_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+        id, task_id, provider, status, prefix, upload_relative_path,
+        path_mode, object_key_template,
+        created_at, updated_at, completed_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     );
     const completedAt = initialStatus === "completed" || initialStatus === "failed" || initialStatus === "skipped" ? now : null;
     const transaction = db2.transaction(() => {
@@ -734,6 +901,9 @@ class TaskDestinationRepo {
           provider,
           initialStatus,
           prefixes[provider] || "",
+          uploadRelativePaths[provider] ?? "",
+          pathModes[provider] || "target-root",
+          objectKeyTemplates[provider] ?? null,
           now,
           now,
           completedAt
@@ -758,6 +928,13 @@ class TaskDestinationRepo {
          SET status = ?, error_message = ?, updated_at = ?, completed_at = ?
          WHERE task_id = ? AND provider = ?`
     ).run(status, errorMessage || null, now, completedAt, taskId, provider);
+  }
+  updateUploadRelativePath(taskId, provider, uploadRelativePath) {
+    getDb().prepare(
+      `UPDATE task_destinations
+         SET upload_relative_path = ?, updated_at = ?
+         WHERE task_id = ? AND provider = ?`
+    ).run(uploadRelativePath, (/* @__PURE__ */ new Date()).toISOString(), taskId, provider);
   }
   updateIncompleteStatuses(taskId, status, errorMessage) {
     const now = (/* @__PURE__ */ new Date()).toISOString();
@@ -952,6 +1129,7 @@ function normalizeFolderPath$1(p) {
   return path.normalize(p).replace(/[\\/]+$/, "");
 }
 function rowToTask(row) {
+  const profileSnapshot = typeof row.profile_snapshot_json === "string" && row.profile_snapshot_json ? safeParseProfile(row.profile_snapshot_json) : null;
   return {
     id: row.id,
     folderPath: row.folder_path,
@@ -965,14 +1143,24 @@ function rowToTask(row) {
     uploadTargetMode: row.upload_target_mode || "aliyun",
     destinations: getTaskDestinationRepo().listByTask(row.id),
     dayFolderId: row.day_folder_id || null,
-    uploadRelativePath: row.upload_relative_path || row.folder_name,
+    uploadRelativePath: row.upload_relative_path ?? row.folder_name,
     errorMessage: row.error_message || null,
     sourceType: row.source_type,
     sourceMachineId: row.source_machine_id || null,
+    profileId: row.profile_id || null,
+    profileName: row.profile_name || null,
+    profileSnapshot,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
     completedAt: row.completed_at || null
   };
+}
+function safeParseProfile(value) {
+  try {
+    return JSON.parse(value);
+  } catch {
+    return null;
+  }
 }
 function rowToTaskFile(row) {
   return {
@@ -1004,13 +1192,15 @@ class TaskRepo {
   }
   listContinuouslyMonitored(dateName) {
     const rows = getDb().prepare(
-      `SELECT * FROM tasks
-       WHERE source_type = 'local'
-         AND day_folder_id IS NOT NULL
-         AND replace(upload_relative_path, '\\', '/') LIKE ?
-         AND status NOT IN ('skipped', 'paused', 'completed')
-       ORDER BY created_at ASC`
-    ).all(`${dateName}/%`);
+      `SELECT t.*
+       FROM tasks t
+       INNER JOIN day_folders df ON df.id = t.day_folder_id
+       WHERE t.source_type = 'local'
+         AND t.day_folder_id IS NOT NULL
+         AND df.date_value = ?
+         AND t.status NOT IN ('skipped', 'paused', 'completed')
+       ORDER BY t.created_at ASC`
+    ).all(dateName);
     return rows.map(rowToTask);
   }
   listRunnable(now = (/* @__PURE__ */ new Date()).toISOString()) {
@@ -1057,31 +1247,53 @@ class TaskRepo {
     const id = uuid.v4();
     const now = (/* @__PURE__ */ new Date()).toISOString();
     const normalizedPath = normalizeFolderPath$1(params.folderPath);
+    const uploadTargetMode = params.uploadTargetMode || "aliyun";
+    const uploadRelativePath = params.uploadRelativePath ?? params.folderName;
+    const destinationUploadRelativePaths = params.destinationUploadRelativePaths || Object.fromEntries(
+      providersForMode(uploadTargetMode).map((provider) => [
+        provider,
+        uploadRelativePath
+      ])
+    );
     db2.prepare(
       `INSERT INTO tasks (
         id, folder_path, folder_name, status, oss_prefix, upload_target_mode,
         day_folder_id, upload_relative_path, source_type, source_machine_id,
-        created_at, updated_at
-      ) VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?)`
+        profile_id, profile_name, profile_snapshot_json, created_at, updated_at
+      ) VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     ).run(
       id,
       normalizedPath,
       params.folderName,
       params.ossPrefix || "",
-      params.uploadTargetMode || "aliyun",
+      uploadTargetMode,
       params.dayFolderId || null,
-      params.uploadRelativePath || params.folderName,
+      uploadRelativePath,
       params.sourceType || "local",
       params.sourceMachineId || null,
+      params.profileId || null,
+      params.profileName || null,
+      params.profileSnapshot ? JSON.stringify(params.profileSnapshot) : null,
       now,
       now
     );
     getTaskDestinationRepo().ensureForTask(
       id,
-      params.uploadTargetMode || "aliyun",
-      params.destinationPrefixes || { aliyun: params.ossPrefix || "" }
+      uploadTargetMode,
+      params.destinationPrefixes || { aliyun: params.ossPrefix || "" },
+      "pending",
+      destinationUploadRelativePaths,
+      params.destinationPathModes,
+      params.destinationObjectKeyTemplates
     );
     return this.getById(id);
+  }
+  updateDayFolderId(id, dayFolderId) {
+    getDb().prepare(
+      `UPDATE tasks
+       SET day_folder_id = ?, updated_at = ?
+       WHERE id = ?`
+    ).run(dayFolderId, (/* @__PURE__ */ new Date()).toISOString(), id);
   }
   updateDayFolderMetadata(id, dayFolderId, uploadRelativePath) {
     getDb().prepare(
@@ -1575,9 +1787,14 @@ function getTaskRepo() {
   return instance$f;
 }
 const DEFAULT_WORK_DIR_NAME_PATTERN = "^\\d{2}-\\d{2}-\\d{2}$";
+const DEFAULT_UPLOAD_PROFILE_ID = "default";
 const DEFAULT_SETTINGS = {
   scan: {
     directories: [],
+    providerDirectories: {
+      aliyun: [],
+      tencent: []
+    },
     intervalSeconds: 30,
     workDirNamePattern: DEFAULT_WORK_DIR_NAME_PATTERN
   },
@@ -1598,6 +1815,8 @@ const DEFAULT_SETTINGS = {
     bucket: "",
     region: "",
     prefix: "",
+    pathMode: "target-root",
+    pathSegmentCount: 2,
     accessKeyId: "",
     accessKeySecret: ""
   },
@@ -1606,10 +1825,48 @@ const DEFAULT_SETTINGS = {
     bucket: "",
     region: "",
     prefix: "",
+    pathMode: "target-root",
+    pathSegmentCount: 2,
     accessKeyId: "",
     accessKeySecret: "",
     allowInsecureTls: false
   },
+  profiles: [
+    {
+      id: DEFAULT_UPLOAD_PROFILE_ID,
+      name: "默认项目",
+      enabled: true,
+      targetMode: "aliyun",
+      filter: {
+        whitelist: [],
+        blacklist: [],
+        regex: [],
+        suffixes: [".jpg", ".jpeg", ".png", ".bmp", ".csv", ".json", ".log", ".txt"]
+      },
+      scan: {
+        providerDirectories: {
+          aliyun: [],
+          tencent: []
+        },
+        workDirNamePattern: DEFAULT_WORK_DIR_NAME_PATTERN
+      },
+      providers: {
+        aliyun: {
+          prefix: "",
+          pathMode: "target-root",
+          pathSegmentCount: 2,
+          objectKeyTemplate: "{relativePath}"
+        },
+        tencent: {
+          prefix: "",
+          pathMode: "target-root",
+          pathSegmentCount: 2,
+          objectKeyTemplate: "{relativePath}"
+        }
+      }
+    }
+  ],
+  activeProfileId: DEFAULT_UPLOAD_PROFILE_ID,
   filter: {
     whitelist: [],
     blacklist: [],
@@ -1644,20 +1901,434 @@ const MARKER_FILES = {
   PROCESS_TASK: "process_task.json",
   DAY_UPLOAD: "day_upload.json"
 };
+const CLOUD_PROVIDERS = ["aliyun", "tencent"];
+function emptyProviderDirectories() {
+  return {
+    aliyun: [],
+    tencent: []
+  };
+}
+function normalizeScanDirectory(directory) {
+  const trimmed = directory.trim().replace(/[\\/]+$/, "");
+  if (!trimmed) return "";
+  const parts = trimmed.split(/[\\/]+/);
+  const last = parts[parts.length - 1];
+  if (last && isDateFolderName(last) && parts.length > 1) {
+    return trimmed.slice(0, trimmed.length - last.length).replace(/[\\/]+$/, "");
+  }
+  return trimmed;
+}
+function normalizeScanDirectories(directories) {
+  return Array.from(
+    new Set(
+      directories.map(normalizeScanDirectory).filter(Boolean)
+    )
+  );
+}
+function normalizeProviderDirectories(providerDirectories) {
+  return {
+    aliyun: normalizeScanDirectories(providerDirectories?.aliyun ?? []),
+    tencent: normalizeScanDirectories(providerDirectories?.tencent ?? [])
+  };
+}
+function migrateLegacyScanDirectories(legacyDirectories, targetMode) {
+  const normalized = normalizeScanDirectories(legacyDirectories);
+  const providerDirectories = emptyProviderDirectories();
+  for (const provider of providersForMode(targetMode)) {
+    providerDirectories[provider] = normalized;
+  }
+  return providerDirectories;
+}
+function normalizeScanConfig(scan, targetMode) {
+  const hasProviderDirectories = Boolean(
+    scan.providerDirectories && CLOUD_PROVIDERS.some(
+      (provider) => scan.providerDirectories[provider]?.length > 0
+    )
+  );
+  const providerDirectories = hasProviderDirectories ? normalizeProviderDirectories(scan.providerDirectories) : migrateLegacyScanDirectories(scan.directories ?? [], targetMode);
+  const directories = normalizeScanDirectories([
+    ...providerDirectories.aliyun,
+    ...providerDirectories.tencent
+  ]);
+  return {
+    ...scan,
+    directories,
+    providerDirectories
+  };
+}
+function getActiveProfileScanRoots(profiles) {
+  const roots = /* @__PURE__ */ new Map();
+  for (const profile of profiles) {
+    if (!profile.enabled) continue;
+    const activeProviders = new Set(providersForMode(profile.targetMode));
+    const providerDirectories = normalizeProviderDirectories(
+      profile.scan.providerDirectories
+    );
+    for (const provider of CLOUD_PROVIDERS) {
+      if (!activeProviders.has(provider)) continue;
+      for (const directory of providerDirectories[provider]) {
+        const key = scanDirectoryKey(directory);
+        const current = roots.get(key);
+        if (current) {
+          if (current.profileId === profile.id && !current.providers.includes(provider)) {
+            current.providers.push(provider);
+            current.providers = providersForMode(modeForProviders(current.providers));
+          }
+          continue;
+        }
+        roots.set(key, {
+          directory,
+          providers: [provider],
+          profileId: profile.id,
+          profileName: profile.name
+        });
+      }
+    }
+  }
+  return Array.from(roots.values());
+}
+function getProfileWatchedDirectoriesByProvider(profiles) {
+  const result = emptyProviderDirectories();
+  for (const root of getActiveProfileScanRoots(profiles)) {
+    for (const provider of root.providers) {
+      if (!result[provider].includes(root.directory)) {
+        result[provider].push(root.directory);
+      }
+    }
+  }
+  return result;
+}
+function scanDirectoryKey(directory) {
+  return normalizeScanDirectory(directory).replace(/\\/g, "/");
+}
+const DEFAULT_OBJECT_KEY_TEMPLATE = "{relativePath}";
+const TEMPLATE_VARIABLES = /* @__PURE__ */ new Set([
+  "profile",
+  "provider",
+  "date",
+  "yy",
+  "yyyy",
+  "MM",
+  "dd",
+  "workDir",
+  "HH",
+  "mm",
+  "ss",
+  "folderName",
+  "sourceRelativePath",
+  "sourceLast1",
+  "sourceLast2",
+  "sourceLast3",
+  "relativePath",
+  "filename",
+  "stem",
+  "ext"
+]);
+function normalizeProfiles(settings) {
+  const fallbackProfile = createDefaultProfileFromSettings(settings);
+  const rawProfiles = Array.isArray(settings.profiles) ? settings.profiles : [];
+  const profiles = [];
+  const seen = /* @__PURE__ */ new Set();
+  for (const rawProfile of rawProfiles) {
+    const profile = normalizeProfile(rawProfile, fallbackProfile);
+    if (seen.has(profile.id)) continue;
+    seen.add(profile.id);
+    profiles.push(profile);
+  }
+  if (profiles.length === 0) {
+    profiles.push(fallbackProfile);
+    seen.add(fallbackProfile.id);
+  }
+  let activeProfileId = typeof settings.activeProfileId === "string" && seen.has(settings.activeProfileId) ? settings.activeProfileId : profiles[0].id;
+  if (!profiles.some((profile) => profile.enabled && profile.id === activeProfileId)) {
+    activeProfileId = profiles.find((profile) => profile.enabled)?.id || profiles[0].id;
+  }
+  return { profiles, activeProfileId };
+}
+function getProfileById(settings, profileId) {
+  const normalized = normalizeProfiles(settings);
+  return normalized.profiles.find((profile) => profile.id === profileId) || normalized.profiles.find((profile) => profile.id === normalized.activeProfileId) || normalized.profiles[0];
+}
+function resolveProfileUploadSnapshot(profile, context, requestedProviders) {
+  const providers = requestedProviders?.length ? requestedProviders : providersForMode(profile.targetMode);
+  const uploadRelativePaths = {};
+  const pathModes = {};
+  const objectKeyTemplates = {};
+  const prefixes = {
+    aliyun: profile.providers.aliyun.prefix,
+    tencent: profile.providers.tencent.prefix
+  };
+  for (const provider of providers) {
+    const providerConfig = profile.providers[provider];
+    const normalized = normalizeUploadPathConfig(
+      providerConfig
+    );
+    uploadRelativePaths[provider] = resolveUploadRelativePath(
+      providerConfig,
+      context
+    );
+    pathModes[provider] = normalized.pathMode;
+    objectKeyTemplates[provider] = normalized.pathMode === "template" ? providerConfig.objectKeyTemplate || "" : null;
+  }
+  return {
+    mode: modeForProviders(providers),
+    prefixes,
+    uploadRelativePaths,
+    uploadRelativePath: firstResolvedPath(providers, uploadRelativePaths),
+    profileId: profile.id,
+    profileName: profile.name,
+    profileSnapshot: profile,
+    pathModes,
+    objectKeyTemplates
+  };
+}
+function renderObjectKey(destination, context) {
+  const pathMode = destination.pathMode || "target-root";
+  if (pathMode !== "template") {
+    return buildOssKey(
+      destination.prefix,
+      destination.uploadRelativePath,
+      context.relativePath
+    );
+  }
+  const template = destination.objectKeyTemplate || "";
+  const templateErrors = validateObjectKeyTemplate(template);
+  if (templateErrors.length > 0) {
+    throw new Error(templateErrors.join("；"));
+  }
+  const variables = buildObjectKeyVariables(destination.provider, context);
+  const rendered = template.replace(/\{([A-Za-z0-9_]+)\}/g, (_match, name) => {
+    return variables[name] ?? "";
+  });
+  const normalized = joinOssPath(rendered);
+  const keyErrors = validateObjectKeyValue(normalized);
+  if (keyErrors.length > 0) {
+    throw new Error(keyErrors.join("；"));
+  }
+  return joinOssPath(destination.prefix, normalized);
+}
+function buildObjectKeyVariables(provider, context) {
+  const relativePath = normalizeObjectPath(context.relativePath);
+  const fileName = pathSegments(relativePath).at(-1) || "";
+  const dotIndex = fileName.lastIndexOf(".");
+  const ext = dotIndex > 0 ? fileName.slice(dotIndex) : "";
+  const stem = dotIndex > 0 ? fileName.slice(0, dotIndex) : fileName;
+  const sourceSegments = pathSegments(context.sourcePath);
+  const folderName = context.folderName || sourceSegments.at(-1) || "";
+  const dateParts = parseDateParts(context.dateName || "");
+  const timeParts = parseTimeParts(context.workDirName || "");
+  const sourceRelativePath = context.basePath ? relativePathFromBase(context.sourcePath, context.basePath) : folderName;
+  return {
+    profile: context.profileName || "",
+    provider,
+    date: context.dateName || "",
+    yy: dateParts.yy,
+    yyyy: dateParts.yyyy,
+    MM: dateParts.MM,
+    dd: dateParts.dd,
+    workDir: context.workDirName || folderName,
+    HH: timeParts.HH,
+    mm: timeParts.mm,
+    ss: timeParts.ss,
+    folderName,
+    sourceRelativePath,
+    sourceLast1: sourceSegments.at(-1) || "",
+    sourceLast2: sourceSegments.slice(-2).join("/"),
+    sourceLast3: sourceSegments.slice(-3).join("/"),
+    relativePath,
+    filename: fileName,
+    stem,
+    ext
+  };
+}
+function validateObjectKeyTemplate(template) {
+  const errors = [];
+  const trimmed = template.trim();
+  if (!trimmed) errors.push("对象 Key 模板不能为空");
+  if (isAbsolutePath(trimmed)) errors.push("对象 Key 模板不能使用绝对路径");
+  const unknownVariables = Array.from(
+    new Set(
+      [...trimmed.matchAll(/\{([A-Za-z0-9_]+)\}/g)].map((match) => match[1]).filter((name) => !TEMPLATE_VARIABLES.has(name))
+    )
+  );
+  if (unknownVariables.length > 0) {
+    errors.push(`未知模板变量: ${unknownVariables.join(", ")}`);
+  }
+  if (pathSegments(trimmed).includes("..")) {
+    errors.push("对象 Key 模板不能包含 .. 路径段");
+  }
+  return errors;
+}
+function validateObjectKeyValue(key) {
+  const errors = [];
+  const trimmed = key.trim();
+  if (!trimmed) errors.push("对象 Key 渲染结果不能为空");
+  if (isAbsolutePath(trimmed)) errors.push("对象 Key 渲染结果不能是绝对路径");
+  if (pathSegments(trimmed).includes("..")) {
+    errors.push("对象 Key 渲染结果不能包含 .. 路径段");
+  }
+  return errors;
+}
+function createDefaultProfileFromSettings(settings) {
+  const defaultSettings = DEFAULT_SETTINGS;
+  const scan = settings.scan || defaultSettings.scan;
+  const filter = normalizeFilter(settings.filter || defaultSettings.filter);
+  const targetMode = normalizeTargetMode(settings.cloud?.targetMode, defaultSettings.cloud.targetMode);
+  const providerDirectories = normalizeScanConfig(
+    {
+      ...defaultSettings.scan,
+      ...scan
+    },
+    targetMode
+  ).providerDirectories;
+  return {
+    id: DEFAULT_UPLOAD_PROFILE_ID,
+    name: "默认项目",
+    enabled: true,
+    targetMode,
+    filter,
+    scan: {
+      providerDirectories,
+      workDirNamePattern: scan.workDirNamePattern || DEFAULT_WORK_DIR_NAME_PATTERN
+    },
+    providers: {
+      aliyun: normalizeProfileProviderConfig({
+        prefix: settings.oss?.prefix || "",
+        pathMode: settings.oss?.pathMode,
+        pathSegmentCount: settings.oss?.pathSegmentCount,
+        objectKeyTemplate: DEFAULT_OBJECT_KEY_TEMPLATE
+      }),
+      tencent: normalizeProfileProviderConfig({
+        prefix: settings.tencentS3?.prefix || "",
+        pathMode: settings.tencentS3?.pathMode,
+        pathSegmentCount: settings.tencentS3?.pathSegmentCount,
+        objectKeyTemplate: DEFAULT_OBJECT_KEY_TEMPLATE
+      })
+    }
+  };
+}
+function normalizeProfile(rawProfile, fallback) {
+  const raw = isRecord(rawProfile) ? rawProfile : {};
+  const rawScan = isRecord(raw.scan) ? raw.scan : {};
+  const rawProviders = isRecord(raw.providers) ? raw.providers : {};
+  const id = typeof raw.id === "string" && raw.id.trim() ? raw.id.trim() : fallback.id;
+  const name = typeof raw.name === "string" && raw.name.trim() ? raw.name.trim() : fallback.name;
+  return {
+    id,
+    name,
+    enabled: typeof raw.enabled === "boolean" ? raw.enabled : true,
+    targetMode: normalizeTargetMode(raw.targetMode, fallback.targetMode),
+    filter: normalizeFilter(isRecord(raw.filter) ? raw.filter : fallback.filter),
+    scan: {
+      providerDirectories: normalizeProviderDirectories(
+        isRecord(rawScan.providerDirectories) ? rawScan.providerDirectories : fallback.scan.providerDirectories
+      ),
+      workDirNamePattern: typeof rawScan.workDirNamePattern === "string" && rawScan.workDirNamePattern.trim() ? rawScan.workDirNamePattern.trim() : fallback.scan.workDirNamePattern
+    },
+    providers: {
+      aliyun: normalizeProfileProviderConfig(
+        isRecord(rawProviders.aliyun) ? rawProviders.aliyun : {},
+        fallback.providers.aliyun
+      ),
+      tencent: normalizeProfileProviderConfig(
+        isRecord(rawProviders.tencent) ? rawProviders.tencent : {},
+        fallback.providers.tencent
+      )
+    }
+  };
+}
+function normalizeProfileProviderConfig(rawConfig, fallback) {
+  const raw = isRecord(rawConfig) ? rawConfig : {};
+  const normalized = normalizeUploadPathConfig({
+    pathMode: raw.pathMode ?? fallback?.pathMode,
+    pathSegmentCount: raw.pathSegmentCount ?? fallback?.pathSegmentCount
+  });
+  return {
+    prefix: typeof raw.prefix === "string" ? raw.prefix : fallback?.prefix || "",
+    pathMode: normalized.pathMode,
+    pathSegmentCount: normalized.pathSegmentCount ?? DEFAULT_UPLOAD_PATH_SEGMENT_COUNT,
+    objectKeyTemplate: typeof raw.objectKeyTemplate === "string" ? raw.objectKeyTemplate : fallback?.objectKeyTemplate || DEFAULT_OBJECT_KEY_TEMPLATE
+  };
+}
+function normalizeFilter(raw) {
+  const defaultFilter = DEFAULT_SETTINGS.filter;
+  return {
+    whitelist: normalizeStringArray(raw.whitelist ?? defaultFilter.whitelist),
+    blacklist: normalizeStringArray(raw.blacklist ?? defaultFilter.blacklist),
+    regex: normalizeStringArray(raw.regex ?? defaultFilter.regex),
+    suffixes: normalizeSuffixes$1(raw.suffixes ?? defaultFilter.suffixes)
+  };
+}
+function normalizeStringArray(value) {
+  return Array.isArray(value) ? Array.from(new Set(value.map((item) => String(item).trim()).filter(Boolean))) : [];
+}
+function normalizeSuffixes$1(value) {
+  const suffixes = normalizeStringArray(value).map(
+    (suffix) => suffix.startsWith(".") ? suffix.toLowerCase() : `.${suffix.toLowerCase()}`
+  );
+  const unique = Array.from(new Set(suffixes));
+  if (!unique.includes(".csv")) unique.push(".csv");
+  return unique;
+}
+function normalizeTargetMode(value, fallback) {
+  return value === "aliyun" || value === "tencent" || value === "both" ? value : fallback;
+}
+function firstResolvedPath(providers, paths) {
+  for (const provider of providers) {
+    const value = paths[provider];
+    if (value !== void 0) return value;
+  }
+  return "";
+}
+function parseDateParts(dateName) {
+  const match = dateName.match(/^(\d{2}|\d{4})-(\d{2})-(\d{2})$/);
+  if (!match) return { yy: "", yyyy: "", MM: "", dd: "" };
+  const yyyy = match[1].length === 2 ? `20${match[1]}` : match[1];
+  return {
+    yy: yyyy.slice(-2),
+    yyyy,
+    MM: match[2],
+    dd: match[3]
+  };
+}
+function parseTimeParts(workDirName) {
+  const match = workDirName.match(/(\d{2})[-_:](\d{2})[-_:](\d{2})/);
+  if (!match) return { HH: "", mm: "", ss: "" };
+  return {
+    HH: match[1],
+    mm: match[2],
+    ss: match[3]
+  };
+}
+function normalizeObjectPath(path2) {
+  return joinOssPath(path2);
+}
+function pathSegments(path2) {
+  return path2.replace(/\\/g, "/").split("/").map((part) => part.trim()).filter((part) => part.length > 0 && part !== ".");
+}
+function relativePathFromBase(sourcePath, basePath) {
+  const source = pathSegments(sourcePath);
+  const base = pathSegments(basePath);
+  let index = 0;
+  while (index < source.length && index < base.length && source[index].toLowerCase() === base[index].toLowerCase()) {
+    index++;
+  }
+  if (index === base.length && index < source.length) {
+    return source.slice(index).join("/");
+  }
+  return source.at(-1) || "";
+}
+function isAbsolutePath(path2) {
+  return path2.startsWith("/") || path2.startsWith("\\") || /^[A-Za-z]:[\\/]/.test(path2);
+}
+function isRecord(value) {
+  return typeof value === "object" && value !== null;
+}
 function normalizeSuffixes(suffixes) {
   const normalized = suffixes.map((suffix) => suffix.trim().toLowerCase()).filter(Boolean).map((suffix) => suffix.startsWith(".") ? suffix : `.${suffix}`);
   const unique = Array.from(new Set(normalized));
   if (!unique.includes(".csv")) unique.push(".csv");
   return unique;
-}
-function normalizeScanDirectories(directories) {
-  return Array.from(
-    new Set(
-      directories.map((directory) => path.normalize(directory).replace(/[\\/]+$/, "")).filter(Boolean).map(
-        (directory) => isDateFolderName(path.basename(directory)) ? path.dirname(directory) : directory
-      )
-    )
-  );
 }
 class SettingsRepo {
   get(key) {
@@ -1673,6 +2344,16 @@ class SettingsRepo {
       if (key === "scan" && typeof parsed === "object" && parsed !== null && "directories" in parsed && Array.isArray(parsed.directories)) {
         const scan = parsed;
         scan.directories = normalizeScanDirectories(scan.directories);
+        if ("providerDirectories" in scan && typeof scan.providerDirectories === "object" && scan.providerDirectories !== null) {
+          scan.providerDirectories = normalizeProviderDirectories(
+            scan.providerDirectories
+          );
+        }
+      }
+      if ((key === "oss" || key === "tencentS3") && typeof parsed === "object" && parsed !== null) {
+        return normalizeUploadPathConfig(
+          parsed
+        );
       }
       return parsed;
     } catch {
@@ -1692,10 +2373,22 @@ class SettingsRepo {
     }
     if (key === "scan" && typeof value === "object" && value !== null && "directories" in value && Array.isArray(value.directories)) {
       const scan = value;
+      const cloud = this.get("cloud");
       persistedValue = {
         ...scan,
-        directories: normalizeScanDirectories(scan.directories)
+        ...normalizeScanConfig(
+          {
+            ...DEFAULT_SETTINGS.scan,
+            ...scan
+          },
+          cloud?.targetMode || DEFAULT_SETTINGS.cloud.targetMode
+        )
       };
+    }
+    if ((key === "oss" || key === "tencentS3") && typeof value === "object" && value !== null) {
+      persistedValue = normalizeUploadPathConfig(
+        value
+      );
     }
     const serialized = typeof persistedValue === "string" ? persistedValue : JSON.stringify(persistedValue);
     db2.prepare(
@@ -1703,13 +2396,16 @@ class SettingsRepo {
     ).run(key, serialized, now, serialized, now);
   }
   getAll() {
-    const settings = { ...DEFAULT_SETTINGS };
+    const settings = { ...DEFAULT_SETTINGS, profiles: [] };
+    const settingsRecord = settings;
     const keys = [
       { section: "scan", key: "scan" },
       { section: "upload", key: "upload" },
       { section: "cloud", key: "cloud" },
       { section: "oss", key: "oss" },
       { section: "tencentS3", key: "tencentS3" },
+      { section: "profiles", key: "profiles" },
+      { section: "activeProfileId", key: "activeProfileId" },
       { section: "filter", key: "filter" },
       { section: "webhook", key: "webhook" },
       { section: "stability", key: "stability" },
@@ -1720,14 +2416,14 @@ class SettingsRepo {
     for (const { section, key } of keys) {
       const val = this.get(key);
       if (val !== null) {
-        const defaultSection = settings[section];
-        if (typeof defaultSection === "object" && defaultSection !== null && typeof val === "object" && val !== null) {
-          settings[section] = {
+        const defaultSection = settingsRecord[section];
+        if (typeof defaultSection === "object" && defaultSection !== null && typeof val === "object" && val !== null && !Array.isArray(defaultSection) && !Array.isArray(val)) {
+          settingsRecord[section] = {
             ...defaultSection,
             ...val
           };
         } else {
-          settings[section] = val;
+          settingsRecord[section] = val;
         }
       }
     }
@@ -1736,6 +2432,19 @@ class SettingsRepo {
     if (settings.filter && Array.isArray(settings.filter.suffixes)) {
       settings.filter.suffixes = normalizeSuffixes(settings.filter.suffixes);
     }
+    settings.oss = normalizeUploadPathConfig(
+      settings.oss
+    );
+    settings.tencentS3 = normalizeUploadPathConfig(
+      settings.tencentS3
+    );
+    settings.scan = normalizeScanConfig(
+      settings.scan,
+      settings.cloud.targetMode
+    );
+    const normalizedProfiles = normalizeProfiles(settings);
+    settings.profiles = normalizedProfiles.profiles;
+    settings.activeProfileId = normalizedProfiles.activeProfileId;
     return settings;
   }
   saveAll(partial) {
@@ -1800,17 +2509,56 @@ class HistoryRepo {
     ).all(...params, pageSize, offset);
     return { items: rows.map(rowToHistory), total };
   }
-  clear(before) {
+  clear(before, provider) {
     const db2 = getDb();
-    if (before) {
-      db2.prepare("DELETE FROM tasks WHERE status IN ('completed', 'failed') AND completed_at < ?").run(before);
-    } else {
-      db2.prepare("DELETE FROM tasks WHERE status IN ('completed', 'failed')").run();
-    }
+    const transaction = db2.transaction(() => {
+      if (provider) {
+        const params = [provider];
+        let beforeCondition = "";
+        if (before) {
+          beforeCondition = " AND completed_at < ?";
+          params.push(before);
+        }
+        db2.prepare(
+          `DELETE FROM task_destinations
+           WHERE provider = ?
+             AND status IN ('completed', 'failed')
+             AND completed_at IS NOT NULL${beforeCondition}`
+        ).run(...params);
+        db2.prepare(
+          `DELETE FROM tasks
+           WHERE NOT EXISTS (
+             SELECT 1 FROM task_destinations td WHERE td.task_id = tasks.id
+           )`
+        ).run();
+      } else if (before) {
+        db2.prepare("DELETE FROM tasks WHERE status IN ('completed', 'failed') AND completed_at < ?").run(before);
+      } else {
+        db2.prepare("DELETE FROM tasks WHERE status IN ('completed', 'failed')").run();
+      }
+    });
+    transaction();
   }
-  deleteById(id) {
+  deleteById(id, provider) {
     const db2 = getDb();
-    db2.prepare("DELETE FROM tasks WHERE id = ? AND status IN ('completed', 'failed')").run(id);
+    const transaction = db2.transaction(() => {
+      if (provider) {
+        db2.prepare(
+          `DELETE FROM task_destinations
+           WHERE task_id = ? AND provider = ? AND status IN ('completed', 'failed')`
+        ).run(id, provider);
+        db2.prepare(
+          `DELETE FROM tasks
+           WHERE id = ?
+             AND NOT EXISTS (
+               SELECT 1 FROM task_destinations td WHERE td.task_id = tasks.id
+             )`
+        ).run(id);
+      } else {
+        db2.prepare("DELETE FROM tasks WHERE id = ? AND status IN ('completed', 'failed')").run(id);
+      }
+    });
+    transaction();
   }
 }
 let instance$d = null;
@@ -1883,6 +2631,18 @@ class DayFolderRepo {
       params.push(query.status);
     } else if (query.includeCompleted === false) {
       conditions.push("status NOT IN ('completed', 'completed_with_skips')");
+    }
+    if (query.provider) {
+      conditions.push(
+        `EXISTS (
+          SELECT 1
+          FROM tasks t
+          INNER JOIN task_destinations td ON td.task_id = t.id
+          WHERE t.day_folder_id = day_folders.id
+            AND td.provider = ?
+        )`
+      );
+      params.push(query.provider);
     }
     const where = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
     const limit = Math.max(1, Math.min(query.limit || 100, 1e3));
@@ -1972,8 +2732,48 @@ class DayFolderRepo {
     ).all(cutoff);
     return rows.map((row) => this.toSummary(rowToRecord(row)));
   }
-  clearCompleted(before) {
+  clearCompleted(before, provider) {
     const db2 = getDb();
+    if (provider) {
+      const transaction = db2.transaction(() => {
+        const params = [provider];
+        let beforeCondition = "";
+        if (before) {
+          beforeCondition = " AND df.completed_at < ?";
+          params.push(before);
+        }
+        db2.prepare(
+          `DELETE FROM task_destinations
+           WHERE provider = ?
+             AND task_id IN (
+               SELECT t.id
+               FROM tasks t
+               INNER JOIN day_folders df ON df.id = t.day_folder_id
+               WHERE df.status IN ('completed', 'completed_with_skips')
+                 AND df.completed_at IS NOT NULL${beforeCondition}
+             )`
+        ).run(...params);
+        db2.prepare(
+          `DELETE FROM tasks
+           WHERE day_folder_id IS NOT NULL
+             AND NOT EXISTS (
+               SELECT 1 FROM task_destinations td WHERE td.task_id = tasks.id
+             )`
+        ).run();
+        db2.prepare(
+          `DELETE FROM day_folders
+           WHERE status IN ('completed', 'completed_with_skips')
+             AND NOT EXISTS (
+               SELECT 1
+               FROM tasks t
+               INNER JOIN task_destinations td ON td.task_id = t.id
+               WHERE t.day_folder_id = day_folders.id
+             )`
+        ).run();
+      });
+      transaction();
+      return;
+    }
     if (before) {
       db2.prepare(
         "DELETE FROM day_folders WHERE status IN ('completed', 'completed_with_skips') AND completed_at < ?"
@@ -1984,8 +2784,38 @@ class DayFolderRepo {
       ).run();
     }
   }
-  deleteCompleted(id) {
-    getDb().prepare(
+  deleteCompleted(id, provider) {
+    const db2 = getDb();
+    if (provider) {
+      const transaction = db2.transaction(() => {
+        db2.prepare(
+          `DELETE FROM task_destinations
+           WHERE provider = ?
+             AND task_id IN (SELECT id FROM tasks WHERE day_folder_id = ?)`
+        ).run(provider, id);
+        db2.prepare(
+          `DELETE FROM tasks
+           WHERE day_folder_id = ?
+             AND NOT EXISTS (
+               SELECT 1 FROM task_destinations td WHERE td.task_id = tasks.id
+             )`
+        ).run(id);
+        db2.prepare(
+          `DELETE FROM day_folders
+           WHERE id = ?
+             AND status IN ('completed', 'completed_with_skips')
+             AND NOT EXISTS (
+               SELECT 1
+               FROM tasks t
+               INNER JOIN task_destinations td ON td.task_id = t.id
+               WHERE t.day_folder_id = day_folders.id
+             )`
+        ).run(id);
+      });
+      transaction();
+      return;
+    }
+    db2.prepare(
       "DELETE FROM day_folders WHERE id = ? AND status IN ('completed', 'completed_with_skips')"
     ).run(id);
   }
@@ -2353,7 +3183,7 @@ class DayFolderService {
     return this.refresh(task.dayFolderId);
   }
   broadcast(summary) {
-    for (const win of electron.BrowserWindow.getAllWindows()) {
+    for (const win of electron.BrowserWindow?.getAllWindows?.() ?? []) {
       win.webContents.send(IPC.DAY_FOLDER_EVENT, summary);
     }
   }
@@ -2801,9 +3631,10 @@ class ScannerService {
     if (this.running) return;
     this.running = true;
     const settings = getSettingsRepo();
-    const scanConfig = settings.get("scan");
-    const directories = scanConfig?.directories || [];
-    const intervalMs = (scanConfig?.intervalSeconds || 30) * 1e3;
+    const allSettings = settings.getAll();
+    const activeRoots = getActiveProfileScanRoots(allSettings.profiles);
+    const directories = activeRoots.map((root) => root.directory);
+    const intervalMs = (allSettings.scan.intervalSeconds || 30) * 1e3;
     this.startWatcher(directories);
     this.timer = setInterval(() => this.scheduleFullScan(), intervalMs);
     this.scheduleFullScan(INITIAL_SCAN_DELAY_MS);
@@ -2842,9 +3673,13 @@ class ScannerService {
   }
   getStatus() {
     const settings = getSettingsRepo();
-    const scanConfig = settings.get("scan");
+    const allSettings = settings.getAll();
     const stabilityConfig = settings.get("stability");
     const requiredChecks = stabilityConfig?.checkCount || 3;
+    const activeRoots = getActiveProfileScanRoots(allSettings.profiles);
+    const watchedDirectoriesByProvider = getProfileWatchedDirectoriesByProvider(
+      allSettings.profiles
+    );
     const pendingStabilityChecks = [];
     for (const pending of this.pendingDirs.values()) {
       pendingStabilityChecks.push({
@@ -2858,7 +3693,8 @@ class ScannerService {
       running: this.running,
       lastScanAt: this.lastScanAt,
       nextScanAt: this.nextScanAt,
-      watchedDirectories: scanConfig?.directories || [],
+      watchedDirectories: activeRoots.map((root) => root.directory),
+      watchedDirectoriesByProvider,
       pendingStabilityChecks,
       lastScanResults: this.lastScanResults
     };
@@ -2874,8 +3710,10 @@ class ScannerService {
     }
     this.scanInProgress = true;
     const settings = getSettingsRepo();
-    const scanConfig = settings.get("scan");
-    const directories = scanConfig?.directories || [];
+    const allSettings = settings.getAll();
+    const scanConfig = allSettings.scan;
+    const activeRoots = getActiveProfileScanRoots(allSettings.profiles);
+    const directories = activeRoots.map((root) => root.directory);
     const intervalMs = (scanConfig?.intervalSeconds || 30) * 1e3;
     const today = this.formatLocalDate(/* @__PURE__ */ new Date());
     const seenChildPaths = /* @__PURE__ */ new Set();
@@ -2885,15 +3723,16 @@ class ScannerService {
     let ignoredDirectories = 0;
     let skippedChildren = 0;
     try {
-      for (const rootDir of directories) {
-        if (!await this.pathExists(rootDir)) {
-          log.warn("扫描根目录不存在:", rootDir);
+      for (const root of activeRoots) {
+        if (!await this.pathExists(root.directory)) {
+          log.warn("扫描根目录不存在:", root.directory);
           continue;
         }
+        const profile = getProfileById(allSettings, root.profileId);
         const result = await this.scanRootDirectory(
-          rootDir,
+          root,
           today,
-          scanConfig?.workDirNamePattern,
+          profile.scan.workDirNamePattern || scanConfig?.workDirNamePattern,
           seenChildPaths
         );
         scannedDirs += result.scanned;
@@ -2928,7 +3767,7 @@ class ScannerService {
       }
     }
   }
-  async scanRootDirectory(rootDir, today, workDirNamePattern, seenChildPaths) {
+  async scanRootDirectory(root, today, workDirNamePattern, seenChildPaths) {
     let scanned = 0;
     let newFound = 0;
     let existing = 0;
@@ -2936,17 +3775,21 @@ class ScannerService {
     let skipped = 0;
     try {
       const dayDirectory = await discoverCurrentDayDirectory(
-        rootDir,
+        root.directory,
         today,
         workDirNamePattern
       );
       if (dayDirectory) {
+        const profile = getProfileById(getSettingsRepo().getAll(), root.profileId);
         const result = await this.scanDayDirectory(
+          root.directory,
           dayDirectory.folderPath,
           dayDirectory.dateName,
           dayDirectory.childFolderNames,
           dayDirectory.ignoredChildFolderNames,
-          seenChildPaths
+          seenChildPaths,
+          root.providers,
+          profile
         );
         scanned += result.scanned;
         newFound += result.newFound;
@@ -2955,11 +3798,11 @@ class ScannerService {
         skipped += result.skipped;
       }
     } catch (err) {
-      log.error("扫描数据根目录失败:", rootDir, err);
+      log.error("扫描数据根目录失败:", root.directory, err);
     }
     return { scanned, newFound, existing, ignored, skipped };
   }
-  async scanDayDirectory(dayFolderPath, dateName, discoveredChildNames, ignoredChildNames, seenChildPaths) {
+  async scanDayDirectory(sourceRootDir, dayFolderPath, dateName, discoveredChildNames, ignoredChildNames, seenChildPaths, providers, profile) {
     const dayFolder = getDayFolderRepo().ensure(dayFolderPath, dateName);
     const childNames = Array.from(
       /* @__PURE__ */ new Set([...discoveredChildNames, ...ignoredChildNames])
@@ -2974,12 +3817,19 @@ class ScannerService {
       for (let index = 0; index < childNames.length; index++) {
         const childName = childNames[index];
         const childPath = path.join(dayFolderPath, childName);
-        const uploadRelativePath = buildUploadRelativePath(dateName, childName);
+        const pathContext = {
+          sourcePath: childPath,
+          basePath: sourceRootDir,
+          dateName,
+          workDirName: childName
+        };
+        const targetSnapshot = this.pendingTargetSnapshot(providers, pathContext, profile);
+        const uploadRelativePath = targetSnapshot.uploadRelativePath;
         seenChildPaths.add(childPath);
         scanned++;
         const existingTask = getTaskRepo().getByFolderPath(childPath);
         if (existingTask) {
-          this.attachTaskToDayFolder(existingTask, dayFolder.id, uploadRelativePath);
+          this.attachTaskToDayFolder(existingTask, dayFolder.id);
           this.pendingDirs.delete(childPath);
           if (dayFolder.ignored && existingTask.status !== "completed" && existingTask.status !== "synced") {
             getTaskRepo().skip(existingTask.id, "用户忽略整个日期");
@@ -2997,7 +3847,9 @@ class ScannerService {
             childPath,
             childName,
             dayFolder.id,
-            uploadRelativePath
+            uploadRelativePath,
+            providers,
+            targetSnapshot
           );
           this.broadcastTaskStatus(task.id, task.status, "skipped");
           ignored++;
@@ -3019,17 +3871,27 @@ class ScannerService {
         }
         const tmpMarker = readTmpUpload(childPath);
         if (tmpMarker) {
+          const markerUploadRelativePath = tmpMarker.metadata.uploadRelativePath ?? uploadRelativePath;
           const task = this.registerNewDir({
             path: childPath,
             dayFolderId: dayFolder.id,
             dateName,
             folderName: childName,
-            uploadRelativePath,
+            uploadRelativePath: markerUploadRelativePath,
             checks: 0,
             discoveredAt: tmpMarker.createdAt || (/* @__PURE__ */ new Date()).toISOString(),
             lastSnapshot: /* @__PURE__ */ new Map(),
             uploadTargetMode: tmpMarker.metadata.uploadTargetMode,
-            destinationPrefixes: tmpMarker.metadata.destinationPrefixes
+            profileId: tmpMarker.metadata.profileId,
+            profileName: tmpMarker.metadata.profileName,
+            profileSnapshot: tmpMarker.metadata.profileSnapshot,
+            destinationPrefixes: tmpMarker.metadata.destinationPrefixes,
+            destinationUploadRelativePaths: tmpMarker.metadata.destinationUploadRelativePaths || this.legacyDestinationUploadRelativePaths(
+              tmpMarker.metadata.uploadTargetMode,
+              markerUploadRelativePath
+            ),
+            destinationPathModes: tmpMarker.metadata.destinationPathModes,
+            destinationObjectKeyTemplates: tmpMarker.metadata.destinationObjectKeyTemplates
           });
           if (dayFolder.ignored) {
             getTaskRepo().skip(task.id, "用户忽略整个日期");
@@ -3050,7 +3912,15 @@ class ScannerService {
             uploadRelativePath,
             checks: 0,
             discoveredAt: (/* @__PURE__ */ new Date()).toISOString(),
-            lastSnapshot: /* @__PURE__ */ new Map()
+            lastSnapshot: /* @__PURE__ */ new Map(),
+            uploadTargetMode: targetSnapshot.mode,
+            profileId: targetSnapshot.profileId,
+            profileName: targetSnapshot.profileName,
+            profileSnapshot: targetSnapshot.profileSnapshot,
+            destinationPrefixes: targetSnapshot.prefixes,
+            destinationUploadRelativePaths: targetSnapshot.uploadRelativePaths,
+            destinationPathModes: targetSnapshot.pathModes,
+            destinationObjectKeyTemplates: targetSnapshot.objectKeyTemplates
           };
           const task = this.registerNewDir(pending);
           if (dayFolder.ignored) {
@@ -3097,8 +3967,18 @@ class ScannerService {
       prefixes: {
         aliyun: pending.destinationPrefixes.aliyun || "",
         tencent: pending.destinationPrefixes.tencent || ""
-      }
-    } : getUploadTargetSnapshot(settings);
+      },
+      uploadRelativePaths: pending.destinationUploadRelativePaths || this.legacyDestinationUploadRelativePaths(
+        pending.uploadTargetMode,
+        pending.uploadRelativePath
+      ),
+      uploadRelativePath: pending.uploadRelativePath,
+      profileId: pending.profileId,
+      profileName: pending.profileName,
+      profileSnapshot: pending.profileSnapshot,
+      pathModes: pending.destinationPathModes,
+      objectKeyTemplates: pending.destinationObjectKeyTemplates
+    } : this.legacySnapshotForPendingDir(pending, settings);
     const marker = {
       version: 2,
       createdAt: (/* @__PURE__ */ new Date()).toISOString(),
@@ -3109,7 +3989,13 @@ class ScannerService {
         date: pending.dateName,
         uploadRelativePath: pending.uploadRelativePath,
         uploadTargetMode: snapshot.mode,
-        destinationPrefixes: snapshot.prefixes
+        profileId: snapshot.profileId,
+        profileName: snapshot.profileName,
+        profileSnapshot: snapshot.profileSnapshot,
+        destinationPrefixes: snapshot.prefixes,
+        destinationUploadRelativePaths: snapshot.uploadRelativePaths,
+        destinationPathModes: snapshot.pathModes,
+        destinationObjectKeyTemplates: snapshot.objectKeyTemplates
       }
     };
     writeTmpUpload(pending.path, marker);
@@ -3125,12 +4011,13 @@ class ScannerService {
     getDayFolderService().refresh(pending.dayFolderId);
     return task;
   }
-  registerIgnoredDir(dirPath, folderName, dayFolderId, uploadRelativePath) {
+  registerIgnoredDir(dirPath, folderName, dayFolderId, uploadRelativePath, providers, targetSnapshot) {
     const task = this.ensureTaskRegistered(
       dirPath,
       folderName,
       dayFolderId,
-      uploadRelativePath
+      uploadRelativePath,
+      targetSnapshot || (providers ? getUploadTargetSnapshot(getSettingsRepo().getAll()) : void 0)
     );
     if (task.status !== "skipped" || task.errorMessage !== NON_WORK_DIR_REASON) {
       getTaskRepo().skip(task.id, NON_WORK_DIR_REASON);
@@ -3225,7 +4112,7 @@ class ScannerService {
     }
     try {
       const settings = getSettingsRepo().getAll();
-      const files = await new FileFilterService(settings.filter).scanFolderAsync(task.folderPath);
+      const files = await new FileFilterService(task.profileSnapshot?.filter || settings.filter).scanFolderAsync(task.folderPath);
       const stableChecks = task.sourceType === "local" && task.dayFolderId ? Math.max(2, settings.stability.checkCount || 2) : 1;
       getTaskRepo().reconcileFiles(
         task.id,
@@ -3279,7 +4166,7 @@ class ScannerService {
     }
   }
   broadcastTaskStatus(taskId, oldStatus, newStatus) {
-    for (const win of electron.BrowserWindow.getAllWindows()) {
+    for (const win of electron.BrowserWindow?.getAllWindows?.() ?? []) {
       win.webContents.send(IPC.TASK_STATUS_CHANGE, {
         taskId,
         oldStatus,
@@ -3296,6 +4183,7 @@ class ScannerService {
       aliyun: tmpMarker?.metadata.destinationPrefixes?.aliyun || currentSettings.oss.prefix || "",
       tencent: tmpMarker?.metadata.destinationPrefixes?.tencent || currentSettings.tencentS3.prefix || ""
     };
+    const uploadRelativePaths = tmpMarker?.metadata.destinationUploadRelativePaths || this.legacyDestinationUploadRelativePaths(mode, legacyUploadRelativePath);
     const task = this.ensureTaskRegistered(
       dirPath,
       folderName,
@@ -3303,7 +4191,9 @@ class ScannerService {
       legacyUploadRelativePath,
       {
         mode,
-        prefixes
+        prefixes,
+        uploadRelativePaths,
+        uploadRelativePath: legacyUploadRelativePath
       }
     );
     const taskRepo = getTaskRepo();
@@ -3340,7 +4230,8 @@ class ScannerService {
         date: dateName,
         uploadRelativePath: legacyUploadRelativePath,
         uploadTargetMode: mode,
-        destinationPrefixes: prefixes
+        destinationPrefixes: prefixes,
+        destinationUploadRelativePaths: uploadRelativePaths
       }
     });
     writeProcessTask(dirPath, {
@@ -3356,7 +4247,7 @@ class ScannerService {
     const taskRepo = getTaskRepo();
     const existing = taskRepo.getByFolderPath(dirPath);
     if (existing) {
-      this.attachTaskToDayFolder(existing, dayFolderId, uploadRelativePath);
+      this.attachTaskToDayFolder(existing, dayFolderId);
       return taskRepo.getById(existing.id);
     }
     const settings = getSettingsRepo().getAll();
@@ -3367,16 +4258,61 @@ class ScannerService {
       ossPrefix: snapshot.prefixes.aliyun,
       uploadTargetMode: snapshot.mode,
       destinationPrefixes: snapshot.prefixes,
+      destinationUploadRelativePaths: snapshot.uploadRelativePaths,
+      destinationPathModes: snapshot.pathModes,
+      destinationObjectKeyTemplates: snapshot.objectKeyTemplates,
       dayFolderId,
       uploadRelativePath,
-      sourceType: "local"
+      sourceType: "local",
+      profileId: snapshot.profileId,
+      profileName: snapshot.profileName,
+      profileSnapshot: snapshot.profileSnapshot
     });
   }
-  attachTaskToDayFolder(task, dayFolderId, uploadRelativePath) {
-    const targetUploadRelativePath = task.status === "completed" && task.uploadRelativePath === task.folderName ? task.uploadRelativePath : uploadRelativePath;
-    if (task.dayFolderId !== dayFolderId || task.uploadRelativePath !== targetUploadRelativePath) {
-      getTaskRepo().updateDayFolderMetadata(task.id, dayFolderId, targetUploadRelativePath);
+  pendingTargetSnapshot(providers, context, profile) {
+    const snapshot = resolveProfileUploadSnapshot(
+      profile,
+      context,
+      providers
+    );
+    return {
+      uploadTargetMode: snapshot.mode,
+      destinationPrefixes: snapshot.prefixes,
+      destinationUploadRelativePaths: snapshot.uploadRelativePaths,
+      uploadRelativePath: snapshot.uploadRelativePath,
+      mode: snapshot.mode,
+      prefixes: snapshot.prefixes,
+      uploadRelativePaths: snapshot.uploadRelativePaths,
+      profileId: snapshot.profileId,
+      profileName: snapshot.profileName,
+      profileSnapshot: snapshot.profileSnapshot,
+      pathModes: snapshot.pathModes,
+      objectKeyTemplates: snapshot.objectKeyTemplates
+    };
+  }
+  legacySnapshotForPendingDir(pending, settings) {
+    const snapshot = getUploadTargetSnapshot(settings);
+    return {
+      ...snapshot,
+      uploadRelativePath: pending.uploadRelativePath,
+      uploadRelativePaths: this.legacyDestinationUploadRelativePaths(
+        snapshot.mode,
+        pending.uploadRelativePath
+      )
+    };
+  }
+  attachTaskToDayFolder(task, dayFolderId) {
+    if (task.dayFolderId !== dayFolderId) {
+      getTaskRepo().updateDayFolderId(task.id, dayFolderId);
     }
+  }
+  legacyDestinationUploadRelativePaths(mode, uploadRelativePath) {
+    if (uploadRelativePath === void 0) return {};
+    const paths = {};
+    for (const provider of providersForMode(mode || "aliyun")) {
+      paths[provider] = uploadRelativePath;
+    }
+    return paths;
   }
   collectDataInfo(dirPath) {
     const settings = getSettingsRepo();
@@ -3385,7 +4321,7 @@ class ScannerService {
     try {
       const info = getDataCollectService().collectDataInfo(dirPath);
       if (info) {
-        for (const win of electron.BrowserWindow.getAllWindows()) {
+        for (const win of electron.BrowserWindow?.getAllWindows?.() ?? []) {
           win.webContents.send(IPC.DATA_COLLECT_RESULT, info);
         }
       }
@@ -3395,7 +4331,7 @@ class ScannerService {
   }
   broadcastStatus() {
     const status = this.getStatus();
-    for (const win of electron.BrowserWindow.getAllWindows()) {
+    for (const win of electron.BrowserWindow?.getAllWindows?.() ?? []) {
       win.webContents.send(IPC.SCANNER_EVENT, status);
     }
   }
@@ -3898,7 +4834,8 @@ class SSHRsyncService {
     if (this.runningProcesses.has(machine.id)) {
       throw new Error("该机器已有传输进程在运行");
     }
-    const providers = providersForMode(settings.cloud.targetMode);
+    const profile = getProfileById(settings, machine.profileId);
+    const providers = providersForMode(profile.targetMode);
     const uploaders = /* @__PURE__ */ new Map();
     try {
       for (const provider of providers) {
@@ -3974,7 +4911,12 @@ class SSHRsyncService {
   async sftpUploadDir(sftp, machine, settings, uploaders, onProgress) {
     const files = await this.sftpListFiles(sftp, machine.remoteDir, machine.remoteDir);
     log.info(`SFTP 发现 ${files.length} 个文件`);
-    const uploadRelativePath = resolveDirectoryUploadRelativePath(machine.remoteDir);
+    const providers = Array.from(uploaders.keys());
+    const snapshot = resolveProfileUploadSnapshot(
+      getProfileById(settings, machine.profileId),
+      { sourcePath: machine.remoteDir },
+      providers
+    );
     let uploadedCount = 0;
     const providerResults = /* @__PURE__ */ new Map();
     for (const provider of uploaders.keys()) {
@@ -4003,11 +4945,21 @@ class SSHRsyncService {
             });
             await Promise.all(
               active.map(async ([provider, uploader]) => {
-                const prefix = provider === "aliyun" ? settings.oss.prefix : settings.tencentS3.prefix;
-                const objectKey = buildOssKey(
-                  prefix,
-                  uploadRelativePath,
-                  relativePath
+                const objectKey = renderObjectKey(
+                  {
+                    provider,
+                    prefix: snapshot.prefixes[provider],
+                    uploadRelativePath: snapshot.uploadRelativePaths[provider] ?? "",
+                    pathMode: snapshot.pathModes[provider],
+                    objectKeyTemplate: snapshot.objectKeyTemplates[provider] ?? null
+                  },
+                  {
+                    sourcePath: machine.remoteDir,
+                    folderName: path.posix.basename(machine.remoteDir),
+                    relativePath,
+                    profileId: snapshot.profileId,
+                    profileName: snapshot.profileName
+                  }
                 );
                 try {
                   await uploader.uploadBuffer(buffer, objectKey);
@@ -4115,6 +5067,9 @@ function getSSHRsyncService() {
   if (!instance$3) instance$3 = new SSHRsyncService();
   return instance$3;
 }
+function shouldRestartScannerAfterSettingsSave(data) {
+  return data.scan !== void 0 || data.stability !== void 0 || data.profiles !== void 0 || data.activeProfileId !== void 0;
+}
 function rowToSSHMachine(row) {
   return {
     id: row.id,
@@ -4129,6 +5084,7 @@ function rowToSSHMachine(row) {
     bwLimit: row.bw_limit,
     cpuNice: row.cpu_nice,
     transferMode: row.transfer_mode || "rsync",
+    profileId: row.profile_id || null,
     enabled: Boolean(row.enabled),
     lastSyncAt: row.last_sync_at || null,
     createdAt: row.created_at
@@ -4157,17 +5113,26 @@ function registerAllIpc() {
   electron.ipcMain.handle(IPC.TASK_ADD_FOLDER, (_event, args) => {
     const taskRepo = getTaskRepo();
     const settingsRepo = getSettingsRepo();
-    const snapshot = getUploadTargetSnapshot(settingsRepo.getAll());
+    const settings = settingsRepo.getAll();
+    const profile = getProfileById(settings, args.profileId);
+    const snapshot = resolveProfileUploadSnapshot(profile, {
+      sourcePath: args.folderPath
+    });
     const folderName = path.basename(args.folderPath);
-    const uploadRelativePath = resolveDirectoryUploadRelativePath(args.folderPath);
     const task = taskRepo.create({
       folderPath: args.folderPath,
       folderName,
       ossPrefix: snapshot.prefixes.aliyun,
       uploadTargetMode: snapshot.mode,
       destinationPrefixes: snapshot.prefixes,
-      uploadRelativePath,
-      sourceType: "manual"
+      destinationUploadRelativePaths: snapshot.uploadRelativePaths,
+      destinationPathModes: snapshot.pathModes,
+      destinationObjectKeyTemplates: snapshot.objectKeyTemplates,
+      uploadRelativePath: snapshot.uploadRelativePath,
+      sourceType: "manual",
+      profileId: snapshot.profileId,
+      profileName: snapshot.profileName,
+      profileSnapshot: snapshot.profileSnapshot
     });
     getScannerService().queueReconcileTask(task);
     return getTaskRepo().getById(task.id);
@@ -4227,7 +5192,7 @@ function registerAllIpc() {
     return getDayFolderRepo().list(query);
   });
   electron.ipcMain.handle(IPC.DAY_FOLDER_DELETE, (_event, args) => {
-    getDayFolderRepo().deleteCompleted(args.id);
+    getDayFolderRepo().deleteCompleted(args.id, args.provider);
   });
   electron.ipcMain.handle(IPC.DAY_FOLDER_IGNORE, (_event, args) => {
     const repo = getDayFolderRepo();
@@ -4260,7 +5225,7 @@ function registerAllIpc() {
     if (data.cleanup !== void 0) {
       getCleanupService().scheduleCleanup();
     }
-    if (data.scan !== void 0 || data.stability !== void 0) {
+    if (shouldRestartScannerAfterSettingsSave(data)) {
       getScannerService().stop();
       getScannerService().start();
     }
@@ -4275,6 +5240,86 @@ function registerAllIpc() {
       return getTencentS3UploadService().testConnection(config);
     }
   );
+  electron.ipcMain.handle(
+    IPC.UPLOAD_PATH_PREVIEW,
+    (_event, args) => {
+      const settings = getSettingsRepo().getAll();
+      const profile = getProfileById(settings, args.profileId);
+      const folderName = path.basename(args.sourcePath);
+      const dateName = path.basename(path.dirname(args.sourcePath));
+      const context = {
+        sourcePath: args.sourcePath,
+        basePath: path.dirname(args.sourcePath),
+        dateName: isDateFolderName(dateName) ? dateName : void 0,
+        workDirName: folderName
+      };
+      const requestedProviders = args.provider ? [args.provider] : void 0;
+      const snapshot = resolveProfileUploadSnapshot(
+        profile,
+        context,
+        requestedProviders
+      );
+      const sampleFiles = (args.sampleFiles?.length ? args.sampleFiles : ["camera/0001.jpg", "data/sample.csv"]).slice(0, 20);
+      return {
+        profileId: profile.id,
+        profileName: profile.name,
+        sourcePath: args.sourcePath,
+        providers: Object.keys(snapshot.pathModes || {}).map((providerKey) => {
+          const provider = providerKey;
+          const pathMode = snapshot.pathModes?.[provider] || "target-root";
+          const objectKeyTemplate = snapshot.objectKeyTemplates?.[provider] ?? null;
+          const errors = objectKeyTemplate ? [...validateObjectKeyTemplate(objectKeyTemplate)] : [];
+          const keys = [];
+          for (const relativePath of sampleFiles) {
+            try {
+              const key = renderObjectKey(
+                {
+                  provider,
+                  prefix: snapshot.prefixes[provider],
+                  uploadRelativePath: snapshot.uploadRelativePaths[provider] ?? "",
+                  pathMode,
+                  objectKeyTemplate
+                },
+                {
+                  ...context,
+                  profileId: profile.id,
+                  profileName: profile.name,
+                  folderName,
+                  relativePath
+                }
+              );
+              const valueErrors = validateObjectKeyValue(key);
+              if (valueErrors.length > 0) errors.push(...valueErrors);
+              keys.push(key);
+            } catch (error) {
+              errors.push(error instanceof Error ? error.message : String(error));
+            }
+          }
+          const duplicateKeys = keys.filter(
+            (key, index) => keys.indexOf(key) !== index
+          );
+          const warnings = duplicateKeys.length > 0 ? [`存在重复对象 Key: ${Array.from(new Set(duplicateKeys)).join(", ")}`] : [];
+          return {
+            provider,
+            prefix: snapshot.prefixes[provider],
+            uploadRelativePath: snapshot.uploadRelativePaths[provider] ?? "",
+            pathMode,
+            objectKeyTemplate,
+            variables: buildObjectKeyVariables(provider, {
+              ...context,
+              profileId: profile.id,
+              profileName: profile.name,
+              folderName,
+              relativePath: sampleFiles[0] || ""
+            }),
+            keys,
+            errors: Array.from(new Set(errors)),
+            warnings
+          };
+        })
+      };
+    }
+  );
   electron.ipcMain.handle(IPC.SSH_LIST_MACHINES, () => {
     const db2 = getDb();
     const rows = db2.prepare("SELECT * FROM ssh_machines ORDER BY created_at DESC").all();
@@ -4284,18 +5329,19 @@ function registerAllIpc() {
     const db2 = getDb();
     const id = uuid.v4();
     const now = (/* @__PURE__ */ new Date()).toISOString();
+    const profileId = input.profileId || getSettingsRepo().getAll().activeProfileId;
     db2.prepare(
-      `INSERT INTO ssh_machines (id, name, host, port, username, auth_type, private_key_path, encrypted_password, remote_dir, local_dir, bw_limit, cpu_nice, transfer_mode, enabled, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-    ).run(id, input.name, input.host, input.port, input.username, input.authType, input.privateKeyPath || null, input.password || null, input.remoteDir, input.localDir, input.bwLimit, input.cpuNice, input.transferMode || "rsync", input.enabled ? 1 : 0, now);
+      `INSERT INTO ssh_machines (id, name, host, port, username, auth_type, private_key_path, encrypted_password, remote_dir, local_dir, bw_limit, cpu_nice, transfer_mode, profile_id, enabled, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(id, input.name, input.host, input.port, input.username, input.authType, input.privateKeyPath || null, input.password || null, input.remoteDir, input.localDir, input.bwLimit, input.cpuNice, input.transferMode || "rsync", profileId, input.enabled ? 1 : 0, now);
     const row = db2.prepare("SELECT * FROM ssh_machines WHERE id = ?").get(id);
     return rowToSSHMachine(row);
   });
   electron.ipcMain.handle(IPC.SSH_UPDATE_MACHINE, (_event, machine) => {
     const db2 = getDb();
     db2.prepare(
-      `UPDATE ssh_machines SET name=?, host=?, port=?, username=?, auth_type=?, private_key_path=?, remote_dir=?, local_dir=?, bw_limit=?, cpu_nice=?, enabled=? WHERE id=?`
-    ).run(machine.name, machine.host, machine.port, machine.username, machine.authType, machine.privateKeyPath, machine.remoteDir, machine.localDir, machine.bwLimit, machine.cpuNice, machine.enabled ? 1 : 0, machine.id);
+      `UPDATE ssh_machines SET name=?, host=?, port=?, username=?, auth_type=?, private_key_path=?, remote_dir=?, local_dir=?, bw_limit=?, cpu_nice=?, transfer_mode=?, profile_id=?, enabled=? WHERE id=?`
+    ).run(machine.name, machine.host, machine.port, machine.username, machine.authType, machine.privateKeyPath, machine.remoteDir, machine.localDir, machine.bwLimit, machine.cpuNice, machine.transferMode || "rsync", machine.profileId || null, machine.enabled ? 1 : 0, machine.id);
   });
   electron.ipcMain.handle(IPC.SSH_DELETE_MACHINE, (_event, args) => {
     const db2 = getDb();
@@ -4324,13 +5370,23 @@ function registerAllIpc() {
       db2.prepare("UPDATE ssh_machines SET last_sync_at = ? WHERE id = ?").run((/* @__PURE__ */ new Date()).toISOString(), args.machineId);
       const taskRepo = getTaskRepo();
       const settingsRepo = getSettingsRepo();
-      const snapshot = getUploadTargetSnapshot(settingsRepo.getAll());
+      const settings = settingsRepo.getAll();
+      const profile = getProfileById(settings, machine.profileId);
       const localDir = path.normalize(machine.localDir).replace(/[\\/]+$/, "");
-      const uploadRelativePath = resolveDirectoryUploadRelativePath(
-        machine.remoteDir,
-        localDir
-      );
+      const snapshot = resolveProfileUploadSnapshot(profile, {
+        sourcePath: machine.remoteDir,
+        fallbackDirectoryPath: localDir
+      });
       const existing = taskRepo.getByFolderPath(localDir);
+      let markerMode = snapshot.mode;
+      let markerPrefixes = snapshot.prefixes;
+      let markerUploadRelativePath = snapshot.uploadRelativePath;
+      let markerUploadRelativePaths = snapshot.uploadRelativePaths;
+      let markerPathModes = snapshot.pathModes;
+      let markerObjectKeyTemplates = snapshot.objectKeyTemplates;
+      let markerProfileId = snapshot.profileId;
+      let markerProfileName = snapshot.profileName;
+      let markerProfileSnapshot = snapshot.profileSnapshot;
       if (!existing || existing.status === "completed" || existing.status === "failed") {
         const task = taskRepo.create({
           folderPath: localDir,
@@ -4338,14 +5394,47 @@ function registerAllIpc() {
           ossPrefix: snapshot.prefixes.aliyun,
           uploadTargetMode: snapshot.mode,
           destinationPrefixes: snapshot.prefixes,
-          uploadRelativePath,
+          destinationUploadRelativePaths: snapshot.uploadRelativePaths,
+          destinationPathModes: snapshot.pathModes,
+          destinationObjectKeyTemplates: snapshot.objectKeyTemplates,
+          uploadRelativePath: snapshot.uploadRelativePath,
           sourceType: "rsync",
-          sourceMachineId: machine.id
+          sourceMachineId: machine.id,
+          profileId: snapshot.profileId,
+          profileName: snapshot.profileName,
+          profileSnapshot: snapshot.profileSnapshot
         });
         getScannerService().queueReconcileTask(task);
         log.info("rsync 完成, 自动创建上传任务:", localDir);
-      } else if (existing.uploadRelativePath !== uploadRelativePath) {
-        taskRepo.updateUploadRelativePath(existing.id, uploadRelativePath);
+      } else {
+        const current = taskRepo.getById(existing.id) || existing;
+        markerMode = current.uploadTargetMode;
+        markerPrefixes = {
+          aliyun: current.destinations.find((item) => item.provider === "aliyun")?.prefix || "",
+          tencent: current.destinations.find((item) => item.provider === "tencent")?.prefix || ""
+        };
+        markerUploadRelativePaths = Object.fromEntries(
+          current.destinations.map((destination) => [
+            destination.provider,
+            destination.uploadRelativePath
+          ])
+        );
+        markerPathModes = Object.fromEntries(
+          current.destinations.map((destination) => [
+            destination.provider,
+            destination.pathMode
+          ])
+        );
+        markerObjectKeyTemplates = Object.fromEntries(
+          current.destinations.map((destination) => [
+            destination.provider,
+            destination.objectKeyTemplate
+          ])
+        );
+        markerUploadRelativePath = current.uploadRelativePath;
+        markerProfileId = current.profileId || void 0;
+        markerProfileName = current.profileName || void 0;
+        markerProfileSnapshot = current.profileSnapshot || void 0;
       }
       writeTmpUpload(localDir, {
         version: 2,
@@ -4354,9 +5443,15 @@ function registerAllIpc() {
         metadata: {
           source: "rsync",
           machineId: machine.id,
-          uploadRelativePath,
-          uploadTargetMode: snapshot.mode,
-          destinationPrefixes: snapshot.prefixes
+          uploadRelativePath: markerUploadRelativePath,
+          uploadTargetMode: markerMode,
+          profileId: markerProfileId,
+          profileName: markerProfileName,
+          profileSnapshot: markerProfileSnapshot,
+          destinationPrefixes: markerPrefixes,
+          destinationUploadRelativePaths: markerUploadRelativePaths,
+          destinationPathModes: markerPathModes,
+          destinationObjectKeyTemplates: markerObjectKeyTemplates
         }
       });
     } catch (err) {
@@ -4371,11 +5466,11 @@ function registerAllIpc() {
     return getHistoryRepo().list(query);
   });
   electron.ipcMain.handle(IPC.HISTORY_CLEAR, (_event, args) => {
-    getHistoryRepo().clear(args?.before);
-    getDayFolderRepo().clearCompleted(args?.before);
+    getHistoryRepo().clear(args?.before, args?.provider);
+    getDayFolderRepo().clearCompleted(args?.before, args?.provider);
   });
   electron.ipcMain.handle(IPC.HISTORY_DELETE, (_event, args) => {
-    getHistoryRepo().deleteById(args.id);
+    getHistoryRepo().deleteById(args.id, args.provider);
   });
   electron.ipcMain.handle(IPC.DIALOG_SELECT_FOLDER, async () => {
     const win = getMainWindow();
@@ -4437,7 +5532,7 @@ function registerAllIpc() {
   });
   electron.ipcMain.handle(IPC.DISK_USAGE, async () => {
     const settingsRepo = getSettingsRepo();
-    const scanConfig = settingsRepo.get("scan");
+    const scanConfig = settingsRepo.getAll().scan;
     const db2 = getDb();
     const paths = /* @__PURE__ */ new Set();
     if (scanConfig?.directories) {
@@ -4574,11 +5669,6 @@ class TaskRunnerService {
       );
       return "skipped";
     }
-    const dateScopedUploadPath = deriveDateScopedUploadRelativePath(task.folderPath);
-    if (dateScopedUploadPath && task.uploadRelativePath !== dateScopedUploadPath && task.status !== "completed") {
-      taskRepo.updateUploadRelativePath(task.id, dateScopedUploadPath);
-      task.uploadRelativePath = dateScopedUploadPath;
-    }
     await this.reconcileBeforeUpload(task, stableChecks);
     const destinations = destinationRepo.listByTask(task.id);
     if (destinations.length === 0) {
@@ -4592,6 +5682,7 @@ class TaskRunnerService {
       taskRepo.recalculateProgress(task.id);
       return this.updateDestinationFinalStates(task);
     }
+    this.assertNoDuplicateObjectKeys(task, destinations, jobs);
     const jobProviders = new Set(jobs.map((job) => job.provider));
     for (const destination of destinations) {
       if (!jobProviders.has(destination.provider)) continue;
@@ -4719,7 +5810,7 @@ class TaskRunnerService {
   }
   async reconcileBeforeUpload(task, stableChecks) {
     const settings = getSettingsRepo().getAll();
-    const files = await new FileFilterService(settings.filter).scanFolderAsync(
+    const files = await new FileFilterService(task.profileSnapshot?.filter || settings.filter).scanFolderAsync(
       task.folderPath
     );
     getTaskRepo().reconcileFiles(
@@ -4731,6 +5822,75 @@ class TaskRunnerService {
       })),
       stableChecks
     );
+  }
+  assertNoDuplicateObjectKeys(task, destinations, jobs) {
+    const keysByProvider = /* @__PURE__ */ new Map();
+    for (const target of jobs) {
+      const destination = destinations.find(
+        (item) => item.provider === target.provider
+      );
+      if (!destination) continue;
+      const objectKey = this.renderTaskObjectKey(
+        task,
+        destination,
+        target.relativePath
+      );
+      const providerKeys = keysByProvider.get(target.provider) || /* @__PURE__ */ new Map();
+      const existing = providerKeys.get(objectKey);
+      if (existing && existing !== target.relativePath) {
+        throw new Error(
+          `${target.provider} 对象 Key 重复: ${objectKey} (${existing}, ${target.relativePath})`
+        );
+      }
+      providerKeys.set(objectKey, target.relativePath);
+      keysByProvider.set(target.provider, providerKeys);
+    }
+  }
+  renderTaskObjectKey(task, destination, relativePath) {
+    return renderObjectKey(
+      {
+        provider: destination.provider,
+        prefix: destination.prefix,
+        uploadRelativePath: destination.uploadRelativePath,
+        pathMode: destination.pathMode,
+        objectKeyTemplate: destination.objectKeyTemplate
+      },
+      this.buildObjectKeyContext(task, relativePath)
+    );
+  }
+  buildObjectKeyContext(task, relativePath) {
+    const dateContext = this.deriveDateContext(task.folderPath);
+    return {
+      sourcePath: task.folderPath,
+      basePath: this.findProfileBasePath(task),
+      dateName: dateContext.dateName,
+      workDirName: dateContext.workDirName || task.folderName,
+      folderName: task.folderName,
+      relativePath,
+      profileId: task.profileId,
+      profileName: task.profileName,
+      createdAt: task.createdAt
+    };
+  }
+  deriveDateContext(folderPath) {
+    const workDirName = path.basename(folderPath);
+    const dateName = path.basename(path.dirname(folderPath));
+    return {
+      dateName: isDateFolderName(dateName) ? dateName : void 0,
+      workDirName
+    };
+  }
+  findProfileBasePath(task) {
+    const profile = task.profileSnapshot;
+    if (!profile) return void 0;
+    for (const directories of Object.values(profile.scan.providerDirectories)) {
+      for (const directory of directories) {
+        if (task.folderPath === directory || task.folderPath.startsWith(`${directory}/`) || task.folderPath.startsWith(`${directory}\\`)) {
+          return directory;
+        }
+      }
+    }
+    return void 0;
   }
   async uploadTarget(task, target, destinations, runtimes, semaphore, logicalProgress, signal) {
     const taskRepo = getTaskRepo();
@@ -4780,11 +5940,7 @@ class TaskRunnerService {
         target.relativePath,
         true
       );
-      const objectKey = buildOssKey(
-        destination.prefix,
-        task.uploadRelativePath || task.folderName,
-        target.relativePath
-      );
+      const objectKey = this.renderTaskObjectKey(task, destination, target.relativePath);
       let previousLoaded = 0;
       const result = await runtime.uploader.uploadFile(
         localPath,
@@ -4969,6 +6125,9 @@ class TaskRunnerService {
             destination.provider,
             {
               status: destination.status,
+              uploadRelativePath: destination.uploadRelativePath,
+              pathMode: destination.pathMode,
+              objectKeyTemplate: destination.objectKeyTemplate,
               totalFiles: targets.length,
               uploadedFiles: targets.filter(
                 (target) => target.status === "completed"
@@ -5012,7 +6171,7 @@ class TaskRunnerService {
       skippedFiles: runtime.skippedFiles,
       transferredBytes: runtime.transferredBytes
     };
-    for (const win of electron.BrowserWindow.getAllWindows()) {
+    for (const win of electron.BrowserWindow?.getAllWindows?.() ?? []) {
       win.webContents.send(IPC.TASK_PROGRESS, progress);
     }
   }
@@ -5025,7 +6184,7 @@ class TaskRunnerService {
     }
   }
   broadcastDestinationStatus(taskId, provider, status, errorMessage) {
-    for (const win of electron.BrowserWindow.getAllWindows()) {
+    for (const win of electron.BrowserWindow?.getAllWindows?.() ?? []) {
       win.webContents.send(IPC.TASK_DESTINATION_CHANGE, {
         taskId,
         provider,
@@ -5216,7 +6375,7 @@ async function createStartupWindow() {
     minimizable: false,
     maximizable: false,
     show: false,
-    title: "数据采集上传工具正在启动",
+    title: "云桥上传器正在启动",
     backgroundColor: "#f8fafc",
     webPreferences: {
       sandbox: true,
@@ -5230,7 +6389,7 @@ async function createStartupWindow() {
       <head><meta charset="utf-8"><title>正在启动</title></head>
       <body style="margin:0;font-family:sans-serif;background:#f8fafc;color:#0f172a">
         <main style="height:220px;display:flex;flex-direction:column;align-items:center;justify-content:center">
-          <div style="font-size:18px;font-weight:600">数据采集上传工具正在启动</div>
+          <div style="font-size:18px;font-weight:600">云桥上传器正在启动</div>
           <div style="margin-top:14px;font-size:14px;color:#475569">正在检查和升级本地数据库，请勿重复启动或强制关机。</div>
           <div style="margin-top:8px;font-size:12px;color:#64748b">历史文件较多时首次升级可能需要几分钟。</div>
         </main>
@@ -5245,7 +6404,7 @@ function createWindow() {
     minWidth: 900,
     minHeight: 600,
     show: false,
-    title: "数据采集上传工具",
+    title: "云桥上传器",
     webPreferences: {
       preload: path.join(__dirname, "../preload/index.js"),
       sandbox: false,
@@ -5304,7 +6463,7 @@ function createTray() {
       }
     }
   ]);
-  tray.setToolTip("数据采集上传工具");
+  tray.setToolTip("云桥上传器");
   tray.setContextMenu(contextMenu);
   tray.on("click", () => {
     mainWindow?.show();
@@ -5440,8 +6599,8 @@ electron.app.whenReady().then(async () => {
   startupWindow?.destroy();
   startupWindow = null;
   electron.dialog.showErrorBox(
-    "数据采集上传工具启动失败",
-    message.includes("database is locked") ? "数据库正在被另一个程序进程使用。请结束旧的数据采集上传工具进程后重试。" : `${message}
+    "云桥上传器启动失败",
+    message.includes("database is locked") ? "数据库正在被另一个程序进程使用。请结束旧的云桥上传器进程后重试。" : `${message}
 
 请查看 ~/.config/electron-uploader/logs 下的日志。`
   );

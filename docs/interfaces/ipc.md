@@ -8,7 +8,7 @@
 | 通道 | 方向 | 说明 |
 | --- | --- | --- |
 | `task:list` / `task:get` | invoke | 查询包含 `destinations` 的逻辑任务 |
-| `task:add-folder` | invoke | 手动创建任务并锁定当前云端模式 |
+| `task:add-folder` | invoke | 手动创建任务，参数含 `folderPath` 和可选 `profileId`，并锁定 Profile 快照 |
 | `task:pause` / `task:resume` / `task:cancel` | invoke | 控制逻辑任务 |
 | `task:retry` | invoke | 接收 `taskId` 和可选 `provider`，支持单云重试 |
 | `task:progress` | push | 推送 `taskId + provider` 的进度 |
@@ -28,18 +28,19 @@
 | `settings:get-all` / `settings:save` | invoke | 读取或保存设置 |
 | `settings:test-oss` | invoke | 测试阿里云 OSS |
 | `settings:test-tencent-s3` | invoke | 测试腾讯云 TurboS3 |
+| `upload:path-preview` | invoke | 按 `profileId + sourcePath` 预览每个云端的对象 Key、变量、错误和警告 |
 
 ## 远程与历史
 
 | 通道 | 方向 | 说明 |
 | --- | --- | --- |
-| `ssh:*` | invoke | 远程机器 CRUD 和连接测试 |
+| `ssh:*` | invoke | 远程机器 CRUD、Profile 绑定和连接测试 |
 | `rsync:start/stop/progress` | invoke/push | rsync 拉取与进度 |
 | `sftp:start/stop/progress` | invoke/push | SFTP 多云直传与进度 |
 | `history:list` | invoke | 按 `provider` 分页查询历史 |
 | `history:clear` / `history:delete` | invoke | 删除历史 |
 
-`sftp:start` 返回 `MultiCloudOperationResult`，按当前上传模式返回一个或多个云端结果。
+`sftp:start` 返回 `MultiCloudOperationResult`，按机器绑定 Profile 返回一个或多个云端结果。
 
 ## 其他
 

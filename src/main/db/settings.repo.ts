@@ -1,8 +1,13 @@
 import { getDb } from './database'
 import { DEFAULT_SETTINGS } from '@shared/constants'
-import type { AppSettings } from '@shared/types'
-import { basename, dirname, normalize } from 'path'
-import { isDateFolderName } from '@shared/day-folder'
+import {
+  normalizeScanConfig,
+  normalizeScanDirectories,
+  normalizeProviderDirectories
+} from '@shared/scan-config'
+import { normalizeUploadPathConfig } from '@shared/upload-path'
+import { normalizeProfiles } from '@shared/upload-profile'
+import type { AppSettings, CloudConfig, ScanConfig } from '@shared/types'
 
 function normalizeSuffixes(suffixes: string[]): string[] {
   const normalized = suffixes
@@ -13,19 +18,6 @@ function normalizeSuffixes(suffixes: string[]): string[] {
   const unique = Array.from(new Set(normalized))
   if (!unique.includes('.csv')) unique.push('.csv')
   return unique
-}
-
-function normalizeScanDirectories(directories: string[]): string[] {
-  return Array.from(
-    new Set(
-      directories
-        .map((directory) => normalize(directory).replace(/[\\/]+$/, ''))
-        .filter(Boolean)
-        .map((directory) =>
-          isDateFolderName(basename(directory)) ? dirname(directory) : directory
-        )
-    )
-  )
 }
 
 export class SettingsRepo {
@@ -56,6 +48,24 @@ export class SettingsRepo {
       ) {
         const scan = parsed as Record<string, unknown>
         scan.directories = normalizeScanDirectories(scan.directories as string[])
+        if (
+          'providerDirectories' in scan &&
+          typeof scan.providerDirectories === 'object' &&
+          scan.providerDirectories !== null
+        ) {
+          scan.providerDirectories = normalizeProviderDirectories(
+            scan.providerDirectories as Partial<ScanConfig['providerDirectories']>
+          )
+        }
+      }
+      if (
+        (key === 'oss' || key === 'tencentS3') &&
+        typeof parsed === 'object' &&
+        parsed !== null
+      ) {
+        return normalizeUploadPathConfig(
+          parsed as unknown as Record<string, unknown>
+        ) as T
       }
       return parsed
     } catch {
@@ -89,10 +99,26 @@ export class SettingsRepo {
       Array.isArray((value as Record<string, unknown>).directories)
     ) {
       const scan = value as Record<string, unknown>
+      const cloud = this.get<CloudConfig>('cloud')
       persistedValue = {
         ...scan,
-        directories: normalizeScanDirectories(scan.directories as string[])
+        ...normalizeScanConfig(
+          {
+            ...(DEFAULT_SETTINGS.scan as ScanConfig),
+            ...(scan as Partial<ScanConfig>)
+          },
+          cloud?.targetMode || DEFAULT_SETTINGS.cloud.targetMode
+        )
       }
+    }
+    if (
+      (key === 'oss' || key === 'tencentS3') &&
+      typeof value === 'object' &&
+      value !== null
+    ) {
+      persistedValue = normalizeUploadPathConfig(
+        value as unknown as Record<string, unknown>
+      )
     }
 
     const serialized = typeof persistedValue === 'string' ? persistedValue : JSON.stringify(persistedValue)
@@ -102,7 +128,8 @@ export class SettingsRepo {
   }
 
   getAll(): AppSettings {
-    const settings = { ...DEFAULT_SETTINGS }
+    const settings = { ...DEFAULT_SETTINGS, profiles: [] } as AppSettings
+    const settingsRecord = settings as unknown as Record<string, unknown>
 
     const keys: Array<{ section: keyof AppSettings; key: string }> = [
       { section: 'scan', key: 'scan' },
@@ -110,6 +137,8 @@ export class SettingsRepo {
       { section: 'cloud', key: 'cloud' },
       { section: 'oss', key: 'oss' },
       { section: 'tencentS3', key: 'tencentS3' },
+      { section: 'profiles', key: 'profiles' },
+      { section: 'activeProfileId', key: 'activeProfileId' },
       { section: 'filter', key: 'filter' },
       { section: 'webhook', key: 'webhook' },
       { section: 'stability', key: 'stability' },
@@ -121,19 +150,21 @@ export class SettingsRepo {
     for (const { section, key } of keys) {
       const val = this.get(key)
       if (val !== null) {
-        const defaultSection = (settings as Record<string, unknown>)[section]
+        const defaultSection = settingsRecord[section]
         if (
           typeof defaultSection === 'object' &&
           defaultSection !== null &&
           typeof val === 'object' &&
-          val !== null
+          val !== null &&
+          !Array.isArray(defaultSection) &&
+          !Array.isArray(val)
         ) {
-          ; (settings as Record<string, unknown>)[section] = {
+          ; settingsRecord[section] = {
             ...(defaultSection as Record<string, unknown>),
             ...(val as Record<string, unknown>)
           }
         } else {
-          ; (settings as Record<string, unknown>)[section] = val
+          ; settingsRecord[section] = val
         }
       }
     }
@@ -144,6 +175,19 @@ export class SettingsRepo {
     if (settings.filter && Array.isArray(settings.filter.suffixes)) {
       settings.filter.suffixes = normalizeSuffixes(settings.filter.suffixes)
     }
+    settings.oss = normalizeUploadPathConfig(
+      settings.oss as unknown as Record<string, unknown>
+    ) as unknown as AppSettings['oss']
+    settings.tencentS3 = normalizeUploadPathConfig(
+      settings.tencentS3 as unknown as Record<string, unknown>
+    ) as unknown as AppSettings['tencentS3']
+    settings.scan = normalizeScanConfig(
+      settings.scan,
+      settings.cloud.targetMode
+    )
+    const normalizedProfiles = normalizeProfiles(settings)
+    settings.profiles = normalizedProfiles.profiles
+    settings.activeProfileId = normalizedProfiles.activeProfileId
 
     return settings
   }
