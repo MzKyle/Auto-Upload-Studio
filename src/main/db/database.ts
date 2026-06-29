@@ -70,6 +70,9 @@ export function runMigrations(db: Database.Database): void {
       error_message TEXT,
       source_type TEXT NOT NULL DEFAULT 'local',
       source_machine_id TEXT,
+      profile_id TEXT,
+      profile_name TEXT,
+      profile_snapshot_json TEXT,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL,
       completed_at TEXT,
@@ -103,6 +106,8 @@ export function runMigrations(db: Database.Database): void {
       status TEXT NOT NULL DEFAULT 'pending',
       prefix TEXT NOT NULL DEFAULT '',
       upload_relative_path TEXT NOT NULL DEFAULT '',
+      path_mode TEXT NOT NULL DEFAULT 'target-root',
+      object_key_template TEXT,
       total_files INTEGER NOT NULL DEFAULT 0,
       uploaded_files INTEGER NOT NULL DEFAULT 0,
       total_bytes INTEGER NOT NULL DEFAULT 0,
@@ -153,6 +158,7 @@ export function runMigrations(db: Database.Database): void {
       bw_limit INTEGER NOT NULL DEFAULT 5000,
       cpu_nice INTEGER NOT NULL DEFAULT 19,
       transfer_mode TEXT NOT NULL DEFAULT 'rsync',
+      profile_id TEXT,
       enabled INTEGER NOT NULL DEFAULT 1,
       last_sync_at TEXT,
       created_at TEXT NOT NULL
@@ -178,6 +184,18 @@ export function runMigrations(db: Database.Database): void {
     db.exec(`ALTER TABLE tasks ADD COLUMN upload_target_mode TEXT NOT NULL DEFAULT 'aliyun'`)
     log.info('迁移: tasks 表添加 upload_target_mode 列')
   }
+  if (!taskColumns.some((c) => c.name === 'profile_id')) {
+    db.exec(`ALTER TABLE tasks ADD COLUMN profile_id TEXT`)
+    log.info('迁移: tasks 表添加 profile_id 列')
+  }
+  if (!taskColumns.some((c) => c.name === 'profile_name')) {
+    db.exec(`ALTER TABLE tasks ADD COLUMN profile_name TEXT`)
+    log.info('迁移: tasks 表添加 profile_name 列')
+  }
+  if (!taskColumns.some((c) => c.name === 'profile_snapshot_json')) {
+    db.exec(`ALTER TABLE tasks ADD COLUMN profile_snapshot_json TEXT`)
+    log.info('迁移: tasks 表添加 profile_snapshot_json 列')
+  }
   db.exec(`CREATE INDEX IF NOT EXISTS idx_tasks_day_folder_id ON tasks(day_folder_id)`)
 
   const taskDestinationColumns = db.pragma('table_info(task_destinations)') as Array<{ name: string }>
@@ -187,6 +205,14 @@ export function runMigrations(db: Database.Database): void {
   if (addedDestinationUploadPath) {
     db.exec(`ALTER TABLE task_destinations ADD COLUMN upload_relative_path TEXT NOT NULL DEFAULT ''`)
     log.info('迁移: task_destinations 表添加 upload_relative_path 列')
+  }
+  if (!taskDestinationColumns.some((c) => c.name === 'path_mode')) {
+    db.exec(`ALTER TABLE task_destinations ADD COLUMN path_mode TEXT NOT NULL DEFAULT 'target-root'`)
+    log.info('迁移: task_destinations 表添加 path_mode 列')
+  }
+  if (!taskDestinationColumns.some((c) => c.name === 'object_key_template')) {
+    db.exec(`ALTER TABLE task_destinations ADD COLUMN object_key_template TEXT`)
+    log.info('迁移: task_destinations 表添加 object_key_template 列')
   }
 
   const dayFolderColumns = db.pragma('table_info(day_folders)') as Array<{ name: string }>
@@ -280,11 +306,12 @@ export function runMigrations(db: Database.Database): void {
     `INSERT OR IGNORE INTO task_destinations (
       id, task_id, provider, status, prefix, total_files, uploaded_files,
       total_bytes, uploaded_bytes, error_message, created_at, updated_at,
-      completed_at, upload_relative_path
+      completed_at, upload_relative_path, path_mode, object_key_template
     )
     SELECT lower(hex(randomblob(16))), id, 'aliyun', status, COALESCE(oss_prefix, ''),
       total_files, uploaded_files, total_bytes, uploaded_bytes, error_message,
-      created_at, updated_at, completed_at, COALESCE(upload_relative_path, '')
+      created_at, updated_at, completed_at, COALESCE(upload_relative_path, ''),
+      'target-root', NULL
     FROM tasks t
     WHERE NOT EXISTS (
       SELECT 1 FROM task_destinations existing WHERE existing.task_id = t.id
@@ -322,6 +349,11 @@ export function runMigrations(db: Database.Database): void {
   if (!hasTransferMode) {
     db.exec(`ALTER TABLE ssh_machines ADD COLUMN transfer_mode TEXT NOT NULL DEFAULT 'rsync'`)
     log.info('迁移: ssh_machines 表添加 transfer_mode 列')
+  }
+  const sshColumnsAfterTransfer = db.pragma('table_info(ssh_machines)') as Array<{ name: string }>
+  if (!sshColumnsAfterTransfer.some((c) => c.name === 'profile_id')) {
+    db.exec(`ALTER TABLE ssh_machines ADD COLUMN profile_id TEXT`)
+    log.info('迁移: ssh_machines 表添加 profile_id 列')
   }
 }
 

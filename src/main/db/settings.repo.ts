@@ -6,6 +6,7 @@ import {
   normalizeProviderDirectories
 } from '@shared/scan-config'
 import { normalizeUploadPathConfig } from '@shared/upload-path'
+import { normalizeProfiles } from '@shared/upload-profile'
 import type { AppSettings, CloudConfig, ScanConfig } from '@shared/types'
 
 function normalizeSuffixes(suffixes: string[]): string[] {
@@ -127,7 +128,7 @@ export class SettingsRepo {
   }
 
   getAll(): AppSettings {
-    const settings = { ...DEFAULT_SETTINGS } as AppSettings
+    const settings = { ...DEFAULT_SETTINGS, profiles: [] } as AppSettings
     const settingsRecord = settings as unknown as Record<string, unknown>
 
     const keys: Array<{ section: keyof AppSettings; key: string }> = [
@@ -136,6 +137,8 @@ export class SettingsRepo {
       { section: 'cloud', key: 'cloud' },
       { section: 'oss', key: 'oss' },
       { section: 'tencentS3', key: 'tencentS3' },
+      { section: 'profiles', key: 'profiles' },
+      { section: 'activeProfileId', key: 'activeProfileId' },
       { section: 'filter', key: 'filter' },
       { section: 'webhook', key: 'webhook' },
       { section: 'stability', key: 'stability' },
@@ -180,6 +183,9 @@ export class SettingsRepo {
       settings.scan,
       settings.cloud.targetMode
     )
+    const normalizedProfiles = normalizeProfiles(settings)
+    settings.profiles = normalizedProfiles.profiles
+    settings.activeProfileId = normalizedProfiles.activeProfileId
 
     return settings
   }

@@ -1,10 +1,15 @@
 import { isDateFolderName } from './day-folder'
 import { modeForProviders, providersForMode } from './cloud-upload'
-import type { CloudProvider, ScanConfig, UploadTargetMode } from './types'
+import type { CloudProvider, ScanConfig, UploadProfile, UploadTargetMode } from './types'
 
 export interface ActiveScanRoot {
   directory: string
   providers: CloudProvider[]
+}
+
+export interface ActiveProfileScanRoot extends ActiveScanRoot {
+  profileId: string
+  profileName: string
 }
 
 export const CLOUD_PROVIDERS: CloudProvider[] = ['aliyun', 'tencent']
@@ -123,6 +128,60 @@ export function getWatchedDirectoriesByProvider(
     aliyun: activeProviders.has('aliyun') ? providerDirectories.aliyun : [],
     tencent: activeProviders.has('tencent') ? providerDirectories.tencent : []
   }
+}
+
+export function getActiveProfileScanRoots(
+  profiles: UploadProfile[],
+): ActiveProfileScanRoot[] {
+  const roots = new Map<string, ActiveProfileScanRoot>()
+
+  for (const profile of profiles) {
+    if (!profile.enabled) continue
+    const activeProviders = new Set(providersForMode(profile.targetMode))
+    const providerDirectories = normalizeProviderDirectories(
+      profile.scan.providerDirectories
+    )
+
+    for (const provider of CLOUD_PROVIDERS) {
+      if (!activeProviders.has(provider)) continue
+      for (const directory of providerDirectories[provider]) {
+        const key = scanDirectoryKey(directory)
+        const current = roots.get(key)
+        if (current) {
+          if (
+            current.profileId === profile.id &&
+            !current.providers.includes(provider)
+          ) {
+            current.providers.push(provider)
+            current.providers = providersForMode(modeForProviders(current.providers))
+          }
+          continue
+        }
+        roots.set(key, {
+          directory,
+          providers: [provider],
+          profileId: profile.id,
+          profileName: profile.name
+        })
+      }
+    }
+  }
+
+  return Array.from(roots.values())
+}
+
+export function getProfileWatchedDirectoriesByProvider(
+  profiles: UploadProfile[],
+): Record<CloudProvider, string[]> {
+  const result = emptyProviderDirectories()
+  for (const root of getActiveProfileScanRoots(profiles)) {
+    for (const provider of root.providers) {
+      if (!result[provider].includes(root.directory)) {
+        result[provider].push(root.directory)
+      }
+    }
+  }
+  return result
 }
 
 export function scanDirectoryKey(directory: string): string {

@@ -14,7 +14,8 @@ const UPLOAD_PATH_MODES = new Set<UploadPathMode>([
   'target-root',
   'date-workdir',
   'keep-source',
-  'last-segments'
+  'last-segments',
+  'template'
 ])
 
 export interface UploadPathResolveContext {
@@ -102,7 +103,7 @@ export function resolveUploadRelativePath(
   )
   const sourcePath = context.sourcePath
 
-  if (normalized.pathMode === 'target-root') return ''
+  if (normalized.pathMode === 'target-root' || normalized.pathMode === 'template') return ''
 
   if (normalized.pathMode === 'date-workdir') {
     if (context.dateName && context.workDirName) {

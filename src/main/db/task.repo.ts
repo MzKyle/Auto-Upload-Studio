@@ -8,6 +8,8 @@ import type {
   TaskFileDetail,
   TaskStatus,
   SourceType,
+  UploadPathMode,
+  UploadProfile,
   UploadTargetMode
 } from '@shared/types'
 import { getTaskDestinationRepo } from './task-destination.repo'
@@ -18,6 +20,10 @@ function normalizeFolderPath(p: string): string {
 }
 
 function rowToTask(row: Record<string, unknown>): Task {
+  const profileSnapshot =
+    typeof row.profile_snapshot_json === 'string' && row.profile_snapshot_json
+      ? safeParseProfile(row.profile_snapshot_json)
+      : null
   return {
     id: row.id as string,
     folderPath: row.folder_path as string,
@@ -35,9 +41,20 @@ function rowToTask(row: Record<string, unknown>): Task {
     errorMessage: (row.error_message as string) || null,
     sourceType: row.source_type as SourceType,
     sourceMachineId: (row.source_machine_id as string) || null,
+    profileId: (row.profile_id as string) || null,
+    profileName: (row.profile_name as string) || null,
+    profileSnapshot,
     createdAt: row.created_at as string,
     updatedAt: row.updated_at as string,
     completedAt: (row.completed_at as string) || null
+  }
+}
+
+function safeParseProfile(value: string): UploadProfile | null {
+  try {
+    return JSON.parse(value) as UploadProfile
+  } catch {
+    return null
   }
 }
 
@@ -135,10 +152,15 @@ export class TaskRepo {
     uploadTargetMode?: UploadTargetMode
     destinationPrefixes?: Partial<Record<CloudProvider, string>>
     destinationUploadRelativePaths?: Partial<Record<CloudProvider, string>>
+    destinationPathModes?: Partial<Record<CloudProvider, UploadPathMode>>
+    destinationObjectKeyTemplates?: Partial<Record<CloudProvider, string | null>>
     dayFolderId?: string
     uploadRelativePath?: string
     sourceType?: SourceType
     sourceMachineId?: string
+    profileId?: string | null
+    profileName?: string | null
+    profileSnapshot?: UploadProfile | null
   }): Task {
     const db = getDb()
     const id = uuid()
@@ -158,8 +180,8 @@ export class TaskRepo {
       `INSERT INTO tasks (
         id, folder_path, folder_name, status, oss_prefix, upload_target_mode,
         day_folder_id, upload_relative_path, source_type, source_machine_id,
-        created_at, updated_at
-      ) VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?)`
+        profile_id, profile_name, profile_snapshot_json, created_at, updated_at
+      ) VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     ).run(
       id,
       normalizedPath,
@@ -170,6 +192,9 @@ export class TaskRepo {
       uploadRelativePath,
       params.sourceType || 'local',
       params.sourceMachineId || null,
+      params.profileId || null,
+      params.profileName || null,
+      params.profileSnapshot ? JSON.stringify(params.profileSnapshot) : null,
       now,
       now
     )
@@ -178,7 +203,9 @@ export class TaskRepo {
       uploadTargetMode,
       params.destinationPrefixes || { aliyun: params.ossPrefix || '' },
       'pending',
-      destinationUploadRelativePaths
+      destinationUploadRelativePaths,
+      params.destinationPathModes,
+      params.destinationObjectKeyTemplates
     )
     return this.getById(id)!
   }

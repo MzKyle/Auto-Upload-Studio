@@ -5,6 +5,7 @@ import type {
   DayFolderSummary, DayFolderListQuery, CloudProvider, MultiCloudOperationResult,
   TaskDetail
 } from '@shared/types'
+import type { UploadPathPreview } from '@shared/upload-profile'
 
 const api = window.api
 
@@ -21,8 +22,8 @@ export async function fetchTaskDetail(taskId: string): Promise<TaskDetail> {
   return (await api.invoke(IPC.TASK_DETAIL, { taskId })) as TaskDetail
 }
 
-export async function addFolder(folderPath: string): Promise<Task> {
-  return (await api.invoke(IPC.TASK_ADD_FOLDER, { folderPath })) as Task
+export async function addFolder(folderPath: string, profileId?: string): Promise<Task> {
+  return (await api.invoke(IPC.TASK_ADD_FOLDER, { folderPath, profileId })) as Task
 }
 
 export async function pauseTask(taskId: string): Promise<void> {
@@ -98,6 +99,15 @@ export async function testOSS(config: AppSettings['oss']): Promise<{ ok: boolean
 
 export async function testTencentS3(config: AppSettings['tencentS3']): Promise<{ ok: boolean; error?: string }> {
   return (await api.invoke(IPC.SETTINGS_TEST_TENCENT_S3, config)) as { ok: boolean; error?: string }
+}
+
+export async function previewUploadPath(input: {
+  profileId?: string
+  sourcePath: string
+  provider?: CloudProvider
+  sampleFiles?: string[]
+}): Promise<UploadPathPreview> {
+  return (await api.invoke(IPC.UPLOAD_PATH_PREVIEW, input)) as UploadPathPreview
 }
 
 // ---- SSH ----

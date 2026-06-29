@@ -13,8 +13,11 @@ import type {
   CloudProvider
 } from '@shared/types'
 import { providersForMode } from '@shared/cloud-upload'
-import { buildOssKey } from '@shared/day-folder'
-import { resolveProviderUploadRelativePaths } from '@shared/upload-path'
+import {
+  getProfileById,
+  renderObjectKey,
+  resolveProfileUploadSnapshot
+} from '@shared/upload-profile'
 import { getCloudUploadService } from './cloud-upload.service'
 import type { CloudTaskUploader } from './cloud-upload.types'
 
@@ -147,7 +150,8 @@ export class SSHRsyncService {
       throw new Error('该机器已有传输进程在运行')
     }
 
-    const providers = providersForMode(settings.cloud.targetMode)
+    const profile = getProfileById(settings, machine.profileId)
+    const providers = providersForMode(profile.targetMode)
     const uploaders = new Map<CloudProvider, CloudTaskUploader>()
     try {
       for (const provider of providers) {
@@ -240,10 +244,10 @@ export class SSHRsyncService {
     log.info(`SFTP 发现 ${files.length} 个文件`)
 
     const providers = Array.from(uploaders.keys())
-    const uploadRelativePaths = resolveProviderUploadRelativePaths(
-      settings,
-      providers,
-      { sourcePath: machine.remoteDir }
+    const snapshot = resolveProfileUploadSnapshot(
+      getProfileById(settings, machine.profileId),
+      { sourcePath: machine.remoteDir },
+      providers
     )
     let uploadedCount = 0
     const providerResults = new Map<string, CloudOperationResult>()
@@ -278,14 +282,21 @@ export class SSHRsyncService {
             })
             await Promise.all(
               active.map(async ([provider, uploader]) => {
-                const prefix =
-                  provider === 'aliyun'
-                    ? settings.oss.prefix
-                    : settings.tencentS3.prefix
-                const objectKey = buildOssKey(
-                  prefix,
-                  uploadRelativePaths[provider] ?? '',
-                  relativePath
+                const objectKey = renderObjectKey(
+                  {
+                    provider,
+                    prefix: snapshot.prefixes[provider],
+                    uploadRelativePath: snapshot.uploadRelativePaths[provider] ?? '',
+                    pathMode: snapshot.pathModes[provider],
+                    objectKeyTemplate: snapshot.objectKeyTemplates[provider] ?? null
+                  },
+                  {
+                    sourcePath: machine.remoteDir,
+                    folderName: posix.basename(machine.remoteDir),
+                    relativePath,
+                    profileId: snapshot.profileId,
+                    profileName: snapshot.profileName
+                  }
                 )
                 try {
                   await uploader.uploadBuffer(buffer, objectKey)

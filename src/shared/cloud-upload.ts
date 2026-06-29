@@ -3,6 +3,8 @@ import type {
   CloudProvider,
   FileStatus,
   TaskStatus,
+  UploadPathMode,
+  UploadProfile,
   UploadTargetMode
 } from './types'
 import {
@@ -16,6 +18,11 @@ export interface UploadTargetSnapshot {
   prefixes: Record<CloudProvider, string>
   uploadRelativePaths: Partial<Record<CloudProvider, string>>
   uploadRelativePath: string
+  profileId?: string
+  profileName?: string
+  profileSnapshot?: UploadProfile
+  pathModes?: Partial<Record<CloudProvider, UploadPathMode>>
+  objectKeyTemplates?: Partial<Record<CloudProvider, string | null>>
 }
 
 export function providersForMode(mode: UploadTargetMode): CloudProvider[] {
@@ -60,7 +67,12 @@ export function getUploadTargetSnapshotForProviders(
       providers,
       uploadRelativePaths,
       ''
-    )
+    ),
+    pathModes: {
+      aliyun: settings.oss.pathMode,
+      tencent: settings.tencentS3.pathMode
+    },
+    objectKeyTemplates: {}
   }
 }
 

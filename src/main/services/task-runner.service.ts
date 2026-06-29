@@ -1,9 +1,13 @@
 import { existsSync, statSync } from 'fs'
-import { join } from 'path'
+import { basename, dirname, join } from 'path'
 import { BrowserWindow } from 'electron'
 import log from 'electron-log'
 import { IPC } from '@shared/ipc-channels'
-import { buildOssKey } from '@shared/day-folder'
+import { isDateFolderName } from '@shared/day-folder'
+import {
+  renderObjectKey,
+  type ObjectKeyRenderContext
+} from '@shared/upload-profile'
 import { getTaskRepo } from '../db/task.repo'
 import {
   getTaskDestinationRepo,
@@ -79,6 +83,7 @@ export class TaskRunnerService {
       taskRepo.recalculateProgress(task.id)
       return this.updateDestinationFinalStates(task)
     }
+    this.assertNoDuplicateObjectKeys(task, destinations, jobs)
     const jobProviders = new Set(jobs.map((job) => job.provider))
     for (const destination of destinations) {
       if (!jobProviders.has(destination.provider)) continue
@@ -220,7 +225,7 @@ export class TaskRunnerService {
     stableChecks: number
   ): Promise<void> {
     const settings = getSettingsRepo().getAll()
-    const files = await new FileFilterService(settings.filter).scanFolderAsync(
+    const files = await new FileFilterService(task.profileSnapshot?.filter || settings.filter).scanFolderAsync(
       task.folderPath
     )
     getTaskRepo().reconcileFiles(
@@ -232,6 +237,98 @@ export class TaskRunnerService {
       })),
       stableChecks
     )
+  }
+
+  private assertNoDuplicateObjectKeys(
+    task: Task,
+    destinations: Task['destinations'],
+    jobs: FileDestinationUploadTarget[]
+  ): void {
+    const keysByProvider = new Map<CloudProvider, Map<string, string>>()
+    for (const target of jobs) {
+      const destination = destinations.find(
+        (item) => item.provider === target.provider
+      )
+      if (!destination) continue
+      const objectKey = this.renderTaskObjectKey(
+        task,
+        destination,
+        target.relativePath
+      )
+      const providerKeys = keysByProvider.get(target.provider) || new Map()
+      const existing = providerKeys.get(objectKey)
+      if (existing && existing !== target.relativePath) {
+        throw new Error(
+          `${target.provider} 对象 Key 重复: ${objectKey} (${existing}, ${target.relativePath})`
+        )
+      }
+      providerKeys.set(objectKey, target.relativePath)
+      keysByProvider.set(target.provider, providerKeys)
+    }
+  }
+
+  private renderTaskObjectKey(
+    task: Task,
+    destination: Task['destinations'][number],
+    relativePath: string
+  ): string {
+    return renderObjectKey(
+      {
+        provider: destination.provider,
+        prefix: destination.prefix,
+        uploadRelativePath: destination.uploadRelativePath,
+        pathMode: destination.pathMode,
+        objectKeyTemplate: destination.objectKeyTemplate
+      },
+      this.buildObjectKeyContext(task, relativePath)
+    )
+  }
+
+  private buildObjectKeyContext(
+    task: Task,
+    relativePath: string
+  ): ObjectKeyRenderContext {
+    const dateContext = this.deriveDateContext(task.folderPath)
+    return {
+      sourcePath: task.folderPath,
+      basePath: this.findProfileBasePath(task),
+      dateName: dateContext.dateName,
+      workDirName: dateContext.workDirName || task.folderName,
+      folderName: task.folderName,
+      relativePath,
+      profileId: task.profileId,
+      profileName: task.profileName,
+      createdAt: task.createdAt
+    }
+  }
+
+  private deriveDateContext(folderPath: string): {
+    dateName?: string
+    workDirName?: string
+  } {
+    const workDirName = basename(folderPath)
+    const dateName = basename(dirname(folderPath))
+    return {
+      dateName: isDateFolderName(dateName) ? dateName : undefined,
+      workDirName
+    }
+  }
+
+  private findProfileBasePath(task: Task): string | undefined {
+    const profile = task.profileSnapshot
+    if (!profile) return undefined
+    for (const directories of Object.values(profile.scan.providerDirectories)) {
+      for (const directory of directories) {
+        if (
+          task.folderPath === directory ||
+          task.folderPath.startsWith(`${directory}/`) ||
+          task.folderPath.startsWith(`${directory}\\`)
+        ) {
+          return directory
+        }
+      }
+    }
+    return undefined
   }
 
   private async uploadTarget(
@@ -297,11 +394,7 @@ export class TaskRunnerService {
         true
       )
 
-      const objectKey = buildOssKey(
-        destination.prefix,
-        destination.uploadRelativePath,
-        target.relativePath
-      )
+      const objectKey = this.renderTaskObjectKey(task, destination, target.relativePath)
       let previousLoaded = 0
       const result = await runtime.uploader.uploadFile(
         localPath,
@@ -518,6 +611,8 @@ export class TaskRunnerService {
             {
               status: destination.status,
               uploadRelativePath: destination.uploadRelativePath,
+              pathMode: destination.pathMode,
+              objectKeyTemplate: destination.objectKeyTemplate,
               totalFiles: targets.length,
               uploadedFiles: targets.filter(
                 (target) => target.status === 'completed'

@@ -5,6 +5,7 @@ import type {
   TaskDestination,
   TaskFileDestination,
   TaskStatus,
+  UploadPathMode,
   UploadTargetMode
 } from '@shared/types'
 import { providersForMode } from '@shared/cloud-upload'
@@ -37,6 +38,8 @@ function rowToDestination(row: Record<string, unknown>): TaskDestination {
     status: row.status as TaskStatus,
     prefix: (row.prefix as string) || '',
     uploadRelativePath: (row.upload_relative_path as string | null | undefined) ?? '',
+    pathMode: (row.path_mode as UploadPathMode) || 'target-root',
+    objectKeyTemplate: (row.object_key_template as string | null | undefined) || null,
     totalFiles: row.total_files as number,
     uploadedFiles: row.uploaded_files as number,
     totalBytes: row.total_bytes as number,
@@ -69,15 +72,18 @@ export class TaskDestinationRepo {
     mode: UploadTargetMode,
     prefixes: Partial<Record<CloudProvider, string>>,
     initialStatus: TaskStatus = 'pending',
-    uploadRelativePaths: Partial<Record<CloudProvider, string>> = {}
+    uploadRelativePaths: Partial<Record<CloudProvider, string>> = {},
+    pathModes: Partial<Record<CloudProvider, UploadPathMode>> = {},
+    objectKeyTemplates: Partial<Record<CloudProvider, string | null>> = {}
   ): TaskDestination[] {
     const db = getDb()
     const now = new Date().toISOString()
     const stmt = db.prepare(
       `INSERT OR IGNORE INTO task_destinations (
         id, task_id, provider, status, prefix, upload_relative_path,
+        path_mode, object_key_template,
         created_at, updated_at, completed_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
     const completedAt =
       initialStatus === 'completed' ||
@@ -94,6 +100,8 @@ export class TaskDestinationRepo {
           initialStatus,
           prefixes[provider] || '',
           uploadRelativePaths[provider] ?? '',
+          pathModes[provider] || 'target-root',
+          objectKeyTemplates[provider] ?? null,
           now,
           now,
           completedAt

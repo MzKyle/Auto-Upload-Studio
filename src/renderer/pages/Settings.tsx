@@ -1,5 +1,5 @@
 import { useEffect, useState, useCallback, useMemo } from "react";
-import { TestTube, Plus, X, FolderOpen } from "lucide-react";
+import { TestTube, Plus, X, FolderOpen, Copy, Trash2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -7,19 +7,21 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { PathTree } from "@/components/PathTree";
 import { useSettingsStore } from "@/stores/settings.store";
-import { testOSS, testTencentS3, selectFolder } from "@/lib/ipc-client";
+import { testOSS, testTencentS3, selectFolder, previewUploadPath } from "@/lib/ipc-client";
 import { buildPathTreeFromPaths } from "@/lib/path-tree";
 import { showToast } from "@/components/ui/toast";
 import { CLOUD_PROVIDER_LABELS } from "@shared/constants";
-import type { AppSettings, CloudProvider, UploadPathMode } from "@shared/types";
+import type { AppSettings, CloudProvider, UploadPathMode, UploadProfile } from "@shared/types";
+import type { UploadPathPreview } from "@shared/upload-profile";
 
-type SettingsSection = "global" | CloudProvider;
+type SettingsSection = "global" | "profiles" | CloudProvider;
 
 const uploadPathModeOptions: Array<{ value: UploadPathMode; label: string }> = [
   { value: "target-root", label: "上传到目标路径" },
   { value: "date-workdir", label: "日期/工作次" },
   { value: "keep-source", label: "保持本地结构" },
   { value: "last-segments", label: "保留末 N 级" },
+  { value: "template", label: "对象 Key 模板" },
 ];
 
 export default function Settings() {
@@ -40,6 +42,10 @@ export default function Settings() {
   const [suffixInput, setSuffixInput] = useState("");
   const [activeSection, setActiveSection] =
     useState<SettingsSection>("global");
+  const [editingProfileId, setEditingProfileId] = useState(settings.activeProfileId);
+  const [profilePreviewSource, setProfilePreviewSource] = useState("");
+  const [profilePreview, setProfilePreview] = useState<UploadPathPreview | null>(null);
+  const [profilePreviewLoading, setProfilePreviewLoading] = useState(false);
   const scanDirectoryTrees = useMemo(
     () => ({
       aliyun: buildPathTreeFromPaths(
@@ -51,6 +57,23 @@ export default function Settings() {
     }),
     [local.scan.providerDirectories],
   );
+  const editingProfile = useMemo(
+    () =>
+      local.profiles.find((profile) => profile.id === editingProfileId) ||
+      local.profiles[0],
+    [editingProfileId, local.profiles],
+  );
+  const profileDirectoryTrees = useMemo(
+    () => ({
+      aliyun: buildPathTreeFromPaths(
+        editingProfile?.scan.providerDirectories.aliyun ?? [],
+      ),
+      tencent: buildPathTreeFromPaths(
+        editingProfile?.scan.providerDirectories.tencent ?? [],
+      ),
+    }),
+    [editingProfile],
+  );
 
   useEffect(() => {
     loadSettings();
@@ -58,6 +81,7 @@ export default function Settings() {
 
   useEffect(() => {
     setLocal(settings);
+    setEditingProfileId(settings.activeProfileId);
   }, [settings]);
 
   useEffect(() => {
@@ -182,6 +206,125 @@ export default function Settings() {
     }
   }, []);
 
+  const updateProfile = useCallback((
+    profileId: string,
+    updater: (profile: UploadProfile) => UploadProfile,
+  ) => {
+    setLocal((prev) => ({
+      ...prev,
+      profiles: prev.profiles.map((profile) =>
+        profile.id === profileId ? updater(profile) : profile,
+      ),
+    }));
+  }, []);
+
+  const handleAddProfile = useCallback(() => {
+    const base = editingProfile || local.profiles[0];
+    const id = `profile-${Date.now()}`;
+    const profile: UploadProfile = {
+      ...base,
+      id,
+      name: `${base.name} 副本`,
+      enabled: true,
+      scan: {
+        ...base.scan,
+        providerDirectories: {
+          aliyun: [...base.scan.providerDirectories.aliyun],
+          tencent: [...base.scan.providerDirectories.tencent],
+        },
+      },
+      filter: {
+        whitelist: [...base.filter.whitelist],
+        blacklist: [...base.filter.blacklist],
+        regex: [...base.filter.regex],
+        suffixes: [...base.filter.suffixes],
+      },
+      providers: {
+        aliyun: { ...base.providers.aliyun },
+        tencent: { ...base.providers.tencent },
+      },
+    };
+    setLocal((prev) => ({
+      ...prev,
+      profiles: [...prev.profiles, profile],
+      activeProfileId: prev.activeProfileId || id,
+    }));
+    setEditingProfileId(id);
+  }, [editingProfile, local.profiles]);
+
+  const handleDeleteProfile = useCallback((profileId: string) => {
+    setLocal((prev) => {
+      if (prev.profiles.length <= 1) return prev;
+      const profiles = prev.profiles.filter((profile) => profile.id !== profileId);
+      const activeProfileId =
+        prev.activeProfileId === profileId ? profiles[0].id : prev.activeProfileId;
+      setEditingProfileId(activeProfileId);
+      return { ...prev, profiles, activeProfileId };
+    });
+  }, []);
+
+  const updateProfileProvider = useCallback((
+    profileId: string,
+    provider: CloudProvider,
+    patch: Partial<UploadProfile["providers"][CloudProvider]>,
+  ) => {
+    updateProfile(profileId, (profile) => ({
+      ...profile,
+      providers: {
+        ...profile.providers,
+        [provider]: {
+          ...profile.providers[provider],
+          ...patch,
+        },
+      },
+    }));
+  }, [updateProfile]);
+
+  const updateProfileDirectories = useCallback((
+    profileId: string,
+    provider: CloudProvider,
+    updater: (directories: string[]) => string[],
+  ) => {
+    updateProfile(profileId, (profile) => ({
+      ...profile,
+      scan: {
+        ...profile.scan,
+        providerDirectories: {
+          ...profile.scan.providerDirectories,
+          [provider]: updater(profile.scan.providerDirectories[provider] ?? []),
+        },
+      },
+    }));
+  }, [updateProfile]);
+
+  const handleAddProfileScanDir = useCallback(async (
+    profileId: string,
+    provider: CloudProvider,
+  ) => {
+    const dir = await selectFolder();
+    if (!dir) return;
+    updateProfileDirectories(profileId, provider, (directories) =>
+      directories.includes(dir) ? directories : [...directories, dir],
+    );
+  }, [updateProfileDirectories]);
+
+  const handlePreviewProfile = useCallback(async () => {
+    if (!editingProfile || !profilePreviewSource.trim()) return;
+    setProfilePreviewLoading(true);
+    try {
+      const preview = await previewUploadPath({
+        profileId: editingProfile.id,
+        sourcePath: profilePreviewSource.trim(),
+      });
+      setProfilePreview(preview);
+    } catch (err) {
+      showToast(`预览失败: ${err}`, "error");
+      setProfilePreview(null);
+    } finally {
+      setProfilePreviewLoading(false);
+    }
+  }, [editingProfile, profilePreviewSource]);
+
   const updateProviderCloudConfig = useCallback(
     (
       provider: CloudProvider,
@@ -293,6 +436,333 @@ export default function Settings() {
     );
   };
 
+  const renderProfileDirectories = (
+    profile: UploadProfile,
+    provider: CloudProvider,
+  ) => {
+    const directories = profile.scan.providerDirectories[provider] ?? [];
+
+    return (
+      <div className="rounded-md border p-3">
+        <div className="flex items-center justify-between gap-2">
+          <div>
+            <div className="text-sm font-medium">
+              {CLOUD_PROVIDER_LABELS[provider]}监控目录 ({directories.length})
+            </div>
+            <div className="text-xs text-muted-foreground">
+              自动扫描仍只识别当天日期目录下的工作次
+            </div>
+          </div>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => handleAddProfileScanDir(profile.id, provider)}
+          >
+            <FolderOpen className="h-3.5 w-3.5 mr-1" />
+            添加
+          </Button>
+        </div>
+        {directories.length > 0 && (
+          <PathTree
+            nodes={profileDirectoryTrees[provider]}
+            className="mt-2 rounded-md border bg-muted/20 p-1"
+            rowClassName="text-xs"
+            renderActions={({ node }) => {
+              const originalPath = node.items[0]?.originalPath;
+              if (!originalPath) return null;
+              return (
+                <button
+                  type="button"
+                  title={`删除 ${originalPath}`}
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    updateProfileDirectories(profile.id, provider, (items) =>
+                      items.filter((item) => item !== originalPath),
+                    );
+                  }}
+                  className="flex h-6 w-6 items-center justify-center rounded-sm text-muted-foreground hover:bg-background hover:text-destructive"
+                >
+                  <X className="h-3.5 w-3.5" />
+                </button>
+              );
+            }}
+          />
+        )}
+      </div>
+    );
+  };
+
+  const renderProfileProviderControls = (
+    profile: UploadProfile,
+    provider: CloudProvider,
+  ) => {
+    const config = profile.providers[provider];
+
+    return (
+      <div className="rounded-md border p-3 space-y-3">
+        <div className="text-sm font-medium">
+          {CLOUD_PROVIDER_LABELS[provider]}路径规则
+        </div>
+        <div className="grid grid-cols-2 gap-4">
+          <div>
+            <Label>固定前缀</Label>
+            <Input
+              value={config.prefix}
+              onChange={(event) =>
+                updateProfileProvider(profile.id, provider, {
+                  prefix: event.target.value,
+                })
+              }
+              className="mt-1"
+              placeholder="可为空，例如 upload/project-a/"
+            />
+          </div>
+          <div>
+            <Label>上传路径模式</Label>
+            <select
+              value={config.pathMode}
+              onChange={(event) =>
+                updateProfileProvider(profile.id, provider, {
+                  pathMode: event.target.value as UploadPathMode,
+                })
+              }
+              className="mt-1 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+            >
+              {uploadPathModeOptions.map((option) => (
+                <option key={option.value} value={option.value}>
+                  {option.label}
+                </option>
+              ))}
+            </select>
+          </div>
+          <div>
+            <Label>保留末 N 级</Label>
+            <Input
+              type="number"
+              min={0}
+              max={20}
+              value={config.pathSegmentCount}
+              disabled={config.pathMode !== "last-segments"}
+              onChange={(event) =>
+                updateProfileProvider(profile.id, provider, {
+                  pathSegmentCount: Number(event.target.value),
+                })
+              }
+              className="mt-1"
+            />
+          </div>
+          <div className="col-span-2">
+            <Label>对象 Key 模板</Label>
+            <Input
+              value={config.objectKeyTemplate}
+              disabled={config.pathMode !== "template"}
+              onChange={(event) =>
+                updateProfileProvider(profile.id, provider, {
+                  objectKeyTemplate: event.target.value,
+                })
+              }
+              className="mt-1 font-mono"
+              placeholder="{date}/{workDir}/{relativePath}"
+            />
+          </div>
+        </div>
+      </div>
+    );
+  };
+
+  const renderProfilesSection = () => {
+    if (!editingProfile) return null;
+
+    return (
+      <Card>
+        <CardHeader>
+          <div className="flex items-center justify-between gap-2">
+            <CardTitle className="text-base">项目 Profile</CardTitle>
+            <Button size="sm" onClick={handleAddProfile}>
+              <Plus className="h-3.5 w-3.5 mr-1" />
+              新建/复制
+            </Button>
+          </div>
+        </CardHeader>
+        <CardContent className="grid gap-4 lg:grid-cols-[220px,1fr]">
+          <div className="space-y-2">
+            {local.profiles.map((profile) => (
+              <button
+                key={profile.id}
+                type="button"
+                onClick={() => setEditingProfileId(profile.id)}
+                className={`w-full rounded-md border px-3 py-2 text-left text-sm ${
+                  editingProfile.id === profile.id
+                    ? "border-primary bg-primary/10"
+                    : "hover:bg-muted/50"
+                }`}
+              >
+                <div className="flex items-center justify-between gap-2">
+                  <span className="font-medium">{profile.name}</span>
+                  {local.activeProfileId === profile.id && (
+                    <Badge>默认</Badge>
+                  )}
+                </div>
+                <div className="mt-1 text-xs text-muted-foreground">
+                  {profile.enabled ? "启用" : "停用"} · {profile.targetMode}
+                </div>
+              </button>
+            ))}
+          </div>
+
+          <div className="space-y-4">
+            <div className="grid grid-cols-2 gap-4">
+              <div>
+                <Label>Profile 名称</Label>
+                <Input
+                  value={editingProfile.name}
+                  onChange={(event) =>
+                    updateProfile(editingProfile.id, (profile) => ({
+                      ...profile,
+                      name: event.target.value,
+                    }))
+                  }
+                  className="mt-1"
+                />
+              </div>
+              <div>
+                <Label>上传目标</Label>
+                <select
+                  value={editingProfile.targetMode}
+                  onChange={(event) =>
+                    updateProfile(editingProfile.id, (profile) => ({
+                      ...profile,
+                      targetMode: event.target.value as AppSettings["cloud"]["targetMode"],
+                    }))
+                  }
+                  className="mt-1 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+                >
+                  <option value="aliyun">仅阿里云</option>
+                  <option value="tencent">仅腾讯云</option>
+                  <option value="both">阿里云 + 腾讯云</option>
+                </select>
+              </div>
+            </div>
+
+            <div className="flex flex-wrap items-center gap-3">
+              <label className="flex items-center gap-2 text-sm">
+                <input
+                  type="checkbox"
+                  checked={editingProfile.enabled}
+                  onChange={(event) =>
+                    updateProfile(editingProfile.id, (profile) => ({
+                      ...profile,
+                      enabled: event.target.checked,
+                    }))
+                  }
+                  className="rounded"
+                />
+                启用 Profile
+              </label>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() =>
+                  setLocal((prev) => ({
+                    ...prev,
+                    activeProfileId: editingProfile.id,
+                  }))
+                }
+              >
+                <Copy className="h-3.5 w-3.5 mr-1" />
+                设为默认
+              </Button>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => handleDeleteProfile(editingProfile.id)}
+                disabled={local.profiles.length <= 1}
+              >
+                <Trash2 className="h-3.5 w-3.5 mr-1" />
+                删除
+              </Button>
+            </div>
+
+            <div>
+              <Label>文件后缀过滤</Label>
+              <Input
+                value={editingProfile.filter.suffixes.join(", ")}
+                onChange={(event) =>
+                  updateProfile(editingProfile.id, (profile) => ({
+                    ...profile,
+                    filter: {
+                      ...profile.filter,
+                      suffixes: event.target.value
+                        .split(",")
+                        .map((item) => item.trim())
+                        .filter(Boolean),
+                    },
+                  }))
+                }
+                className="mt-1"
+                placeholder=".jpg, .csv, .json"
+              />
+            </div>
+
+            <div className="grid gap-3">
+              {renderProfileDirectories(editingProfile, "aliyun")}
+              {renderProfileDirectories(editingProfile, "tencent")}
+            </div>
+
+            <div className="grid gap-3">
+              {renderProfileProviderControls(editingProfile, "aliyun")}
+              {renderProfileProviderControls(editingProfile, "tencent")}
+            </div>
+
+            <div className="rounded-md border p-3 space-y-3">
+              <div>
+                <div className="text-sm font-medium">模板预览</div>
+                <div className="mt-1 text-xs text-muted-foreground">
+                  可用变量：{"{profile} {provider} {date} {yy} {yyyy} {MM} {dd} {workDir} {HH} {mm} {ss} {folderName} {sourceRelativePath} {sourceLast1} {sourceLast2} {sourceLast3} {relativePath} {filename} {stem} {ext}"}
+                </div>
+              </div>
+              <div className="flex gap-2">
+                <Input
+                  value={profilePreviewSource}
+                  onChange={(event) => setProfilePreviewSource(event.target.value)}
+                  placeholder="/data/2026-06-27/20-46-05"
+                />
+                <Button
+                  variant="outline"
+                  onClick={handlePreviewProfile}
+                  disabled={!profilePreviewSource.trim() || profilePreviewLoading}
+                >
+                  预览
+                </Button>
+              </div>
+              {profilePreview && (
+                <div className="space-y-2">
+                  {profilePreview.providers.map((item) => (
+                    <div key={item.provider} className="rounded-md bg-muted/30 p-2">
+                      <div className="text-xs font-medium">
+                        {CLOUD_PROVIDER_LABELS[item.provider]}
+                      </div>
+                      {item.keys.map((key) => (
+                        <div key={key} className="break-all font-mono text-xs">
+                          {key}
+                        </div>
+                      ))}
+                      {[...item.errors, ...item.warnings].length > 0 && (
+                        <div className="mt-1 text-xs text-destructive">
+                          {[...item.errors, ...item.warnings].join("；")}
+                        </div>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+        </CardContent>
+      </Card>
+    );
+  };
+
   if (loading)
     return <div className="p-6 text-muted-foreground">加载中...</div>;
 
@@ -311,6 +781,7 @@ export default function Settings() {
       <div className="inline-flex rounded-md border p-1 bg-muted/30">
         {[
           { id: "global" as const, label: "全局配置" },
+          { id: "profiles" as const, label: "项目 Profile" },
           { id: "aliyun" as const, label: "阿里云" },
           { id: "tencent" as const, label: "腾讯云" },
         ].map((item) => (
@@ -324,6 +795,8 @@ export default function Settings() {
           </Button>
         ))}
       </div>
+
+      {activeSection === "profiles" && renderProfilesSection()}
 
       {/* 扫描配置 */}
       {activeSection === "global" && (

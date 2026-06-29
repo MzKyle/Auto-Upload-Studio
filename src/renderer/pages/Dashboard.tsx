@@ -25,6 +25,7 @@ import {
   ignoreDayFolder,
   restoreDayFolder,
   fetchSettings,
+  previewUploadPath,
 } from "@/lib/ipc-client";
 import { IPC } from "@shared/ipc-channels";
 import type {
@@ -33,6 +34,7 @@ import type {
   DayFolderSummary,
   Task,
 } from "@shared/types";
+import type { UploadPathPreview } from "@shared/upload-profile";
 import { progressKey } from "@shared/cloud-upload";
 
 type DashboardTreeItem =
@@ -45,6 +47,11 @@ export default function Dashboard() {
   const [dayFolders, setDayFolders] = useState<DayFolderSummary[]>([]);
   const [provider, setProvider] = useState<CloudProvider>("aliyun");
   const [providerReady, setProviderReady] = useState(false);
+  const [profiles, setProfiles] = useState<Array<{ id: string; name: string; enabled: boolean }>>([]);
+  const [pendingFolder, setPendingFolder] = useState<string | null>(null);
+  const [selectedProfileId, setSelectedProfileId] = useState("");
+  const [pathPreview, setPathPreview] = useState<UploadPathPreview | null>(null);
+  const [previewLoading, setPreviewLoading] = useState(false);
 
   useTaskProgress();
 
@@ -52,6 +59,12 @@ export default function Dashboard() {
     fetchSettings()
       .then((settings) => {
         setProvider(settings.cloud.targetMode === "tencent" ? "tencent" : "aliyun");
+        setProfiles(settings.profiles.map((profile) => ({
+          id: profile.id,
+          name: profile.name,
+          enabled: profile.enabled,
+        })));
+        setSelectedProfileId(settings.activeProfileId);
       })
       .catch(() => {})
       .finally(() => setProviderReady(true));
@@ -101,10 +114,39 @@ export default function Dashboard() {
   const handleAddFolder = useCallback(async () => {
     const folder = await selectFolder();
     if (folder) {
-      await addFolderApi(folder);
-      loadTasks();
+      const settings = await fetchSettings();
+      setProfiles(settings.profiles.map((profile) => ({
+        id: profile.id,
+        name: profile.name,
+        enabled: profile.enabled,
+      })));
+      setSelectedProfileId(settings.activeProfileId);
+      setPendingFolder(folder);
     }
-  }, [loadTasks]);
+  }, []);
+
+  useEffect(() => {
+    if (!pendingFolder || !selectedProfileId) return;
+    setPreviewLoading(true);
+    previewUploadPath({
+      sourcePath: pendingFolder,
+      profileId: selectedProfileId,
+    })
+      .then(setPathPreview)
+      .catch((err) => {
+        setPathPreview(null);
+        showToast(`路径预览失败: ${err}`, "error");
+      })
+      .finally(() => setPreviewLoading(false));
+  }, [pendingFolder, selectedProfileId]);
+
+  const handleConfirmAddFolder = useCallback(async () => {
+    if (!pendingFolder) return;
+    await addFolderApi(pendingFolder, selectedProfileId);
+    setPendingFolder(null);
+    setPathPreview(null);
+    loadTasks();
+  }, [loadTasks, pendingFolder, selectedProfileId]);
 
   const handleScan = useCallback(async () => {
     await triggerScan();
@@ -372,6 +414,97 @@ export default function Dashboard() {
             </div>
           )}
         </section>
+      )}
+
+      {pendingFolder && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 p-4">
+          <div className="w-full max-w-2xl rounded-lg border bg-background p-5 shadow-lg">
+            <div className="flex items-start justify-between gap-4">
+              <div>
+                <h2 className="text-base font-semibold">添加上传任务</h2>
+                <p className="mt-1 text-xs text-muted-foreground break-all">
+                  {pendingFolder}
+                </p>
+              </div>
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={() => {
+                  setPendingFolder(null);
+                  setPathPreview(null);
+                }}
+              >
+                取消
+              </Button>
+            </div>
+
+            <div className="mt-4">
+              <label className="text-sm font-medium">项目 Profile</label>
+              <select
+                value={selectedProfileId}
+                onChange={(event) => setSelectedProfileId(event.target.value)}
+                className="mt-1 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+              >
+                {profiles
+                  .filter((profile) => profile.enabled)
+                  .map((profile) => (
+                    <option key={profile.id} value={profile.id}>
+                      {profile.name}
+                    </option>
+                  ))}
+              </select>
+            </div>
+
+            <div className="mt-4 rounded-md border bg-muted/20 p-3">
+              <div className="text-sm font-medium">上传路径预览</div>
+              {previewLoading && (
+                <div className="mt-2 text-xs text-muted-foreground">生成预览中...</div>
+              )}
+              {!previewLoading && pathPreview && (
+                <div className="mt-3 space-y-3">
+                  {pathPreview.providers.map((item) => (
+                    <div key={item.provider} className="rounded-md border bg-background p-3">
+                      <div className="flex items-center justify-between text-sm">
+                        <span>{item.provider === "aliyun" ? "阿里云" : "腾讯云"}</span>
+                        <span className="text-xs text-muted-foreground">{item.pathMode}</span>
+                      </div>
+                      <div className="mt-2 space-y-1">
+                        {item.keys.slice(0, 5).map((key) => (
+                          <div key={key} className="break-all font-mono text-xs">
+                            {key}
+                          </div>
+                        ))}
+                      </div>
+                      {[...item.errors, ...item.warnings].length > 0 && (
+                        <div className="mt-2 text-xs text-destructive">
+                          {[...item.errors, ...item.warnings].join("；")}
+                        </div>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            <div className="mt-4 flex justify-end gap-2">
+              <Button
+                variant="outline"
+                onClick={() => {
+                  setPendingFolder(null);
+                  setPathPreview(null);
+                }}
+              >
+                取消
+              </Button>
+              <Button
+                onClick={handleConfirmAddFolder}
+                disabled={!selectedProfileId || previewLoading}
+              >
+                创建任务
+              </Button>
+            </div>
+          </div>
+        </div>
       )}
 
     </div>

@@ -66,6 +66,25 @@ function createLegacyDatabase(): Database.Database {
   return db
 }
 
+test('migration adds profile and object key template columns', () => {
+  const db = createLegacyDatabase()
+  runMigrations(db)
+
+  const taskColumns = (db.pragma('table_info(tasks)') as Array<{ name: string }>)
+    .map((column) => column.name)
+  const destinationColumns = (db.pragma('table_info(task_destinations)') as Array<{ name: string }>)
+    .map((column) => column.name)
+  const sshColumns = (db.pragma('table_info(ssh_machines)') as Array<{ name: string }>)
+    .map((column) => column.name)
+
+  assert.ok(taskColumns.includes('profile_id'))
+  assert.ok(taskColumns.includes('profile_name'))
+  assert.ok(taskColumns.includes('profile_snapshot_json'))
+  assert.ok(destinationColumns.includes('path_mode'))
+  assert.ok(destinationColumns.includes('object_key_template'))
+  assert.ok(sshColumns.includes('profile_id'))
+})
+
 test('legacy migration skips completed file details and preserves unfinished progress', () => {
   const db = createLegacyDatabase()
   const now = new Date().toISOString()

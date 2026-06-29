@@ -31,6 +31,7 @@ export type UploadPathMode =
   | 'date-workdir'
   | 'keep-source'
   | 'last-segments'
+  | 'template'
 
 export interface Task {
   id: string
@@ -49,6 +50,9 @@ export interface Task {
   errorMessage: string | null
   sourceType: SourceType
   sourceMachineId: string | null
+  profileId: string | null
+  profileName: string | null
+  profileSnapshot: UploadProfile | null
   createdAt: string
   updatedAt: string
   completedAt: string | null
@@ -89,6 +93,8 @@ export interface TaskDestination {
   status: TaskStatus
   prefix: string
   uploadRelativePath: string
+  pathMode: UploadPathMode
+  objectKeyTemplate: string | null
   totalFiles: number
   uploadedFiles: number
   totalBytes: number
@@ -180,6 +186,7 @@ export interface SSHMachine {
   bwLimit: number
   cpuNice: number
   transferMode: TransferMode
+  profileId: string | null
   enabled: boolean
   lastSyncAt: string | null
   createdAt: string
@@ -198,6 +205,7 @@ export interface SSHMachineInput {
   bwLimit: number
   cpuNice: number
   transferMode: TransferMode
+  profileId?: string | null
   enabled: boolean
 }
 
@@ -241,6 +249,28 @@ export interface TencentS3Config {
 
 export interface CloudConfig {
   targetMode: UploadTargetMode
+}
+
+export interface UploadProfileProviderConfig {
+  prefix: string
+  pathMode: UploadPathMode
+  pathSegmentCount: number
+  objectKeyTemplate: string
+}
+
+export interface UploadProfileScanConfig {
+  providerDirectories: Record<CloudProvider, string[]>
+  workDirNamePattern?: string
+}
+
+export interface UploadProfile {
+  id: string
+  name: string
+  enabled: boolean
+  targetMode: UploadTargetMode
+  filter: FilterRules
+  scan: UploadProfileScanConfig
+  providers: Record<CloudProvider, UploadProfileProviderConfig>
 }
 
 export interface WebhookConfig {
@@ -290,6 +320,8 @@ export interface AppSettings {
   cloud: CloudConfig
   oss: OSSConfig
   tencentS3: TencentS3Config
+  profiles: UploadProfile[]
+  activeProfileId: string
   filter: FilterRules
   webhook: WebhookConfig
   hotkey: string
@@ -396,14 +428,21 @@ export interface TmpUploadMarker {
     date?: string
     uploadRelativePath?: string
     uploadTargetMode?: UploadTargetMode
+    profileId?: string
+    profileName?: string
+    profileSnapshot?: UploadProfile
     destinationPrefixes?: Partial<Record<CloudProvider, string>>
     destinationUploadRelativePaths?: Partial<Record<CloudProvider, string>>
+    destinationPathModes?: Partial<Record<CloudProvider, UploadPathMode>>
+    destinationObjectKeyTemplates?: Partial<Record<CloudProvider, string | null>>
   }
 }
 
 export interface ProcessTaskDestinationMarker {
   status: TaskStatus
   uploadRelativePath?: string
+  pathMode?: UploadPathMode
+  objectKeyTemplate?: string | null
   totalFiles: number
   uploadedFiles: number
   files?: Record<string, FileStatus>
